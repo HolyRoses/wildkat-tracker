@@ -22,19 +22,23 @@ WorkingDirectory=/opt/tracker
 # Adjust ports, cert paths, and domain to match your deployment.
 # Remove --https-port / --cert / --key if you are not using TLS.
 # Remove --redirect-http if you want plain HTTP on --http-port instead of a redirect.
+# --web-https-port serves the stats page on standard HTTPS (443).
+# --web-redirect-http redirects HTTP (80) to the stats HTTPS page.
 ExecStart=/usr/bin/python3 /opt/tracker/tracker_server.py \
-    --host          ""                                              \
-    --http-port     80                                              \
-    --https-port    443                                             \
-    --udp-port      6969                                            \
-    --cert          /etc/ssl/acme/tracker.example.com/fullchain.cer \
-    --key           /etc/ssl/acme/tracker.example.com/tracker.example.com.key \
-    --redirect-http                                                 \
-    --domain        tracker.example.com                             \
-    --interval      1800                                            \
-    --min-interval  60                                              \
-    --peer-ttl      3600                                            \
-    --max-peers     200
+    --host             ""                                              \
+    --http-port        8080                                            \
+    --https-port       8443                                            \
+    --udp-port         6969                                            \
+    --web-https-port   443                                             \
+    --web-redirect-http                                                \
+    --cert             /etc/ssl/acme/tracker.example.com/fullchain.cer \
+    --key              /etc/ssl/acme/tracker.example.com/tracker.example.com.key \
+    --redirect-http                                                    \
+    --domain           tracker.example.com:8443                        \
+    --interval         1800                                            \
+    --min-interval     60                                              \
+    --peer-ttl         3600                                            \
+    --max-peers        200
 
 # ── Restart policy ───────────────────────────────────────────────────────────
 Restart=on-failure

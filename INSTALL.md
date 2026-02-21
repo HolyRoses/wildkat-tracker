@@ -137,6 +137,8 @@ ExecStart=/usr/bin/python3 /opt/tracker/tracker_server.py \
   --http-port 8080 \
   --https-port 8443 \
   --udp-port 6969 \
+  --web-https-port 443 \
+  --web-redirect-http \
   --cert /etc/ssl/acme/tracker.example.net/fullchain.cer \
   --key /etc/ssl/acme/tracker.example.net/tracker.example.net.key \
   --ipv6 \
@@ -236,12 +238,15 @@ After doing this, all port access is controlled exclusively by the OCI Security 
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--http-port` | 6969 | HTTP listen port (0 to disable) |
-| `--https-port` | disabled | HTTPS listen port (requires --cert and --key) |
-| `--udp-port` | 6969 | UDP listen port (0 to disable) |
+| `--http-port` | 6969 | Tracker HTTP listen port (0 to disable) |
+| `--https-port` | disabled | Tracker HTTPS listen port (requires --cert and --key) |
+| `--udp-port` | 6969 | Tracker UDP listen port (0 to disable) |
+| `--redirect-http` | off | Redirect tracker HTTP → HTTPS (requires --https-port) |
+| `--domain` | localhost | Public domain for redirect Location header (include port if not 443) |
 | `--ipv6` | off | Also listen on IPv6 (:: for HTTP and UDP) |
-| `--redirect-http` | off | Redirect HTTP → HTTPS (requires --https-port) |
-| `--domain` | localhost | Public domain for redirect Location header |
+| `--web-http-port` | 80 | Stats page HTTP port (0 to disable) |
+| `--web-https-port` | disabled | Stats page HTTPS port (uses same cert/key as tracker) |
+| `--web-redirect-http` | off | Redirect stats HTTP → HTTPS (requires --web-https-port) |
 | `--tracker-id` | Wildkat | Tracker ID returned in HTTP announce responses |
 | `--interval` | 1800 | Announce interval in seconds |
 | `--min-interval` | 60 | Minimum re-announce interval in seconds |

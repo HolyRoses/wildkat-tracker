@@ -33,6 +33,7 @@ Usage examples:
 """
 
 import argparse
+import datetime
 import gzip
 import ipaddress
 import json
@@ -235,6 +236,173 @@ class PeerRegistry:
 REGISTRY = PeerRegistry()
 
 # ─────────────────────────────────────────────────────────────
+# Statistics tracker
+# ─────────────────────────────────────────────────────────────
+
+class StatsTracker:
+    """Thread-safe statistics with today / yesterday / all-time buckets."""
+
+    def __init__(self):
+        self._lock   = threading.Lock()
+        self.start_time = time.time()
+        self._today  = datetime.date.today()
+
+        # ── All-time ──────────────────────────────────────────
+        self.all_announces       = 0
+        self.all_http_announces  = 0
+        self.all_https_announces = 0
+        self.all_udp_announces   = 0
+        self.all_ipv4_clients    = 0
+        self.all_ipv6_clients    = 0
+        self.all_unique_ips      = set()
+        self.all_bytes_sent      = 0   # after compression
+        self.all_bytes_raw       = 0   # before compression
+        self.all_gzip_count      = 0
+        self.all_plain_count     = 0
+        self.daily_totals        = {}  # date_str -> announce count
+
+        # ── Today ─────────────────────────────────────────────
+        self.today_announces       = 0
+        self.today_http_announces  = 0
+        self.today_https_announces = 0
+        self.today_udp_announces   = 0
+        self.today_ipv4_clients    = 0
+        self.today_ipv6_clients    = 0
+        self.today_unique_ips      = set()
+        self.today_bytes_sent      = 0
+        self.today_bytes_raw       = 0
+        self.today_gzip_count      = 0
+        self.today_plain_count     = 0
+        self.today_hourly          = [0] * 24
+
+        # ── Yesterday snapshot ────────────────────────────────
+        self.yesterday = {}
+
+    def _rollover(self):
+        yesterday_str = self._today.isoformat()
+        self.yesterday = {
+            'date':            yesterday_str,
+            'announces':       self.today_announces,
+            'http':            self.today_http_announces,
+            'https':           self.today_https_announces,
+            'udp':             self.today_udp_announces,
+            'ipv4':            self.today_ipv4_clients,
+            'ipv6':            self.today_ipv6_clients,
+            'unique_ips':      len(self.today_unique_ips),
+            'bytes_sent':      self.today_bytes_sent,
+            'bytes_raw':       self.today_bytes_raw,
+            'gzip_count':      self.today_gzip_count,
+            'plain_count':     self.today_plain_count,
+            'hourly':          list(self.today_hourly),
+        }
+        self.daily_totals[yesterday_str] = self.today_announces
+        self._today                = datetime.date.today()
+        self.today_announces       = 0
+        self.today_http_announces  = 0
+        self.today_https_announces = 0
+        self.today_udp_announces   = 0
+        self.today_ipv4_clients    = 0
+        self.today_ipv6_clients    = 0
+        self.today_unique_ips      = set()
+        self.today_bytes_sent      = 0
+        self.today_bytes_raw       = 0
+        self.today_gzip_count      = 0
+        self.today_plain_count     = 0
+        self.today_hourly          = [0] * 24
+
+    def check_rollover(self):
+        with self._lock:
+            if datetime.date.today() != self._today:
+                self._rollover()
+
+    def record_announce(self, protocol: str, ip: str, is_ipv6: bool):
+        hour = datetime.datetime.now().hour
+        with self._lock:
+            self.all_announces   += 1
+            self.today_announces += 1
+            self.today_hourly[hour] += 1
+            self.all_unique_ips.add(ip)
+            self.today_unique_ips.add(ip)
+            if protocol == 'http':
+                self.all_http_announces   += 1
+                self.today_http_announces += 1
+            elif protocol == 'https':
+                self.all_https_announces   += 1
+                self.today_https_announces += 1
+            elif protocol == 'udp':
+                self.all_udp_announces   += 1
+                self.today_udp_announces += 1
+            if is_ipv6:
+                self.all_ipv6_clients   += 1
+                self.today_ipv6_clients += 1
+            else:
+                self.all_ipv4_clients   += 1
+                self.today_ipv4_clients += 1
+
+    def record_http_bytes(self, raw: int, sent: int, used_gzip: bool):
+        with self._lock:
+            self.all_bytes_raw    += raw
+            self.all_bytes_sent   += sent
+            self.today_bytes_raw  += raw
+            self.today_bytes_sent += sent
+            if used_gzip:
+                self.all_gzip_count   += 1
+                self.today_gzip_count += 1
+            else:
+                self.all_plain_count   += 1
+                self.today_plain_count += 1
+
+    def record_udp_bytes(self, sent: int):
+        with self._lock:
+            self.all_bytes_sent   += sent
+            self.all_bytes_raw    += sent
+            self.today_bytes_sent += sent
+            self.today_bytes_raw  += sent
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                'uptime':    time.time() - self.start_time,
+                'torrents':  len(REGISTRY.all_hashes()),
+                'live_peers': sum(len(v) for v in REGISTRY._torrents.values()),
+                'all': {
+                    'announces':   self.all_announces,
+                    'http':        self.all_http_announces,
+                    'https':       self.all_https_announces,
+                    'udp':         self.all_udp_announces,
+                    'ipv4':        self.all_ipv4_clients,
+                    'ipv6':        self.all_ipv6_clients,
+                    'unique_ips':  len(self.all_unique_ips),
+                    'bytes_sent':  self.all_bytes_sent,
+                    'bytes_raw':   self.all_bytes_raw,
+                    'gzip_count':  self.all_gzip_count,
+                    'plain_count': self.all_plain_count,
+                    'daily_totals': dict(sorted(self.daily_totals.items())[-30:]),
+                },
+                'today': {
+                    'date':        self._today.isoformat(),
+                    'announces':   self.today_announces,
+                    'http':        self.today_http_announces,
+                    'https':       self.today_https_announces,
+                    'udp':         self.today_udp_announces,
+                    'ipv4':        self.today_ipv4_clients,
+                    'ipv6':        self.today_ipv6_clients,
+                    'unique_ips':  len(self.today_unique_ips),
+                    'bytes_sent':  self.today_bytes_sent,
+                    'bytes_raw':   self.today_bytes_raw,
+                    'gzip_count':  self.today_gzip_count,
+                    'plain_count': self.today_plain_count,
+                    'hourly':      list(self.today_hourly),
+                },
+                'yesterday': dict(self.yesterday),
+            }
+
+
+STATS = StatsTracker()
+
+
+
+# ─────────────────────────────────────────────────────────────
 # HTTP Handler
 # ─────────────────────────────────────────────────────────────
 
@@ -371,6 +539,8 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
             len(ipv4_mapped_compact) // 18, client_is_ipv6,
             DEFAULT_INTERVAL
         )
+        protocol = 'https' if self.server.socket.__class__.__name__ == 'SSLSocket' else 'http'
+        STATS.record_announce(protocol, ip, client_is_ipv6)
         self._send_bencode(200, response)
 
     # ── Scrape ───────────────────────────────────────────────
@@ -464,6 +634,8 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
                 log.debug('HTTP response gzip skipped  original=%d  compressed=%d bytes (no benefit)',
                           len(body), len(compressed))
 
+        raw_len = len(bencode(obj))
+        STATS.record_http_bytes(raw_len, len(body), use_gzip)
         self.send_response(code)
         self.send_header('Content-Type', 'text/plain')
         self.send_header('Content-Length', str(len(body)))
@@ -638,7 +810,10 @@ def _handle_udp_packet(sock: socket.socket, data: bytes, addr):
             resp_header = struct.pack('!IIIII',
                 UDP_ACT_ANNOUNCE, transaction_id,
                 DEFAULT_INTERVAL, leechers, seeds)
-            sock.sendto(resp_header + udp_peers, addr)
+            udp_response = resp_header + udp_peers
+            sock.sendto(udp_response, addr)
+            STATS.record_announce('udp', client_ip, client_is_ipv6)
+            STATS.record_udp_bytes(len(udp_response))
             log.info('UDP announce from %s  ih=%s  event=%s  seeds=%d  leechers=%d',
                      client_ip, ih_hex[:8], event, seeds, leechers)
             return
@@ -674,6 +849,691 @@ def _handle_udp_packet(sock: socket.socket, data: bytes, addr):
 def _udp_send_error(sock: socket.socket, addr, transaction_id: int, msg: bytes):
     resp = struct.pack('!II', UDP_ACT_ERROR, transaction_id) + msg
     sock.sendto(resp, addr)
+
+
+# ─────────────────────────────────────────────────────────────
+# Stats web page HTML generator
+# ─────────────────────────────────────────────────────────────
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024:
+            return f'{n:.1f} {unit}' if unit != 'B' else f'{n} B'
+        n /= 1024
+    return f'{n:.1f} PB'
+
+def _fmt_uptime(seconds: float) -> str:
+    s = int(seconds)
+    days, s    = divmod(s, 86400)
+    hours, s   = divmod(s, 3600)
+    minutes, _ = divmod(s, 60)
+    parts = []
+    if days:    parts.append(f'{days}d')
+    if hours:   parts.append(f'{hours}h')
+    parts.append(f'{minutes}m')
+    return ' '.join(parts)
+
+def _fmt_num(n: int) -> str:
+    return f'{n:,}'
+
+def _pct(a: int, b: int) -> float:
+    return round(100 * a / b, 1) if b else 0.0
+
+def _savings_pct(raw: int, sent: int) -> float:
+    return round(100 * (raw - sent) / raw, 1) if raw > 0 else 0.0
+
+def generate_stats_html(snap: dict, web_config: dict) -> str:
+    uptime_str   = _fmt_uptime(snap['uptime'])
+    torrents     = snap['torrents']
+    live_peers   = snap['live_peers']
+
+    a   = snap['all']
+    tod = snap['today']
+    yes = snap.get('yesterday', {})
+
+    announce_urls = web_config.get('announce_urls', [])
+    domain        = web_config.get('domain', '')
+
+    # Build announce URL rows
+    url_rows = ''
+    for proto, url in announce_urls:
+        proto_class = proto.lower()
+        url_rows += f'''
+        <div class="url-row">
+          <span class="url-badge {proto_class}">{proto}</span>
+          <span class="url-text" id="url-{proto_class}">{url}</span>
+          <button class="copy-btn" onclick="copyUrl('{url}', this)">Copy</button>
+        </div>'''
+
+    # ── Hourly chart (today) ──────────────────────────────────
+    hourly   = tod['hourly']
+    max_h    = max(hourly) or 1
+    cur_hour = datetime.datetime.now().hour
+    hourly_bars = ''
+    for i, val in enumerate(hourly):
+        h      = int(val * 100 / max_h)
+        active = ' active' if i == cur_hour else ''
+        label  = f'{i:02d}'
+        hourly_bars += f'<div class="bar-wrap"><div class="bar{active}" style="height:{h}%" title="{val} announces"></div><div class="bar-label">{label}</div></div>'
+
+    # ── Daily chart (all-time) ────────────────────────────────
+    daily   = a['daily_totals']
+    max_d   = max(daily.values()) if daily else 1
+    daily_bars = ''
+    for date_str, val in list(daily.items())[-30:]:
+        h     = int(val * 100 / max_d) if max_d else 0
+        short = date_str[5:]  # MM-DD
+        daily_bars += f'<div class="bar-wrap"><div class="bar" style="height:{h}%" title="{date_str}: {val}"></div><div class="bar-label">{short}</div></div>'
+    if not daily_bars:
+        daily_bars = '<div class="no-data">No historical data yet</div>'
+
+    # ── Protocol bars helper ──────────────────────────────────
+    def proto_bars(d):
+        total = d['announces'] or 1
+        rows  = ''
+        for label, key, cls in [('UDP', 'udp', 'udp'), ('HTTPS', 'https', 'https'), ('HTTP', 'http', 'http')]:
+            val = d.get(key, 0)
+            pct = _pct(val, total)
+            rows += f'''<div class="proto-row">
+              <span class="proto-label">{label}</span>
+              <div class="proto-bar-bg"><div class="proto-bar {cls}" style="width:{pct}%"></div></div>
+              <span class="proto-val">{_fmt_num(val)} <small>({pct}%)</small></span>
+            </div>'''
+        return rows
+
+    def ipv_bars(d):
+        total = (d.get('ipv4', 0) + d.get('ipv6', 0)) or 1
+        v4    = d.get('ipv4', 0)
+        v6    = d.get('ipv6', 0)
+        p4    = _pct(v4, total)
+        p6    = _pct(v6, total)
+        return f'''
+        <div class="proto-row">
+          <span class="proto-label">IPv4</span>
+          <div class="proto-bar-bg"><div class="proto-bar ipv4" style="width:{p4}%"></div></div>
+          <span class="proto-val">{_fmt_num(v4)} <small>({p4}%)</small></span>
+        </div>
+        <div class="proto-row">
+          <span class="proto-label">IPv6</span>
+          <div class="proto-bar-bg"><div class="proto-bar ipv6" style="width:{p6}%"></div></div>
+          <span class="proto-val">{_fmt_num(v6)} <small>({p6}%)</small></span>
+        </div>'''
+
+    # ── Stat cards helper ─────────────────────────────────────
+    def cards(d, is_alltime=False):
+        ann     = d['announces']
+        ips     = d['unique_ips']
+        sent    = d['bytes_sent']
+        raw     = d['bytes_raw']
+        saved   = raw - sent
+        sav_pct = _savings_pct(raw, sent)
+        gzip_c  = d['gzip_count']
+        plain_c = d['plain_count']
+        total_r = gzip_c + plain_c
+        gzip_pct= _pct(gzip_c, total_r)
+        return f'''
+        <div class="stat-card">
+          <div class="stat-value">{_fmt_num(ann)}</div>
+          <div class="stat-label">ANNOUNCES</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">{_fmt_num(ips)}</div>
+          <div class="stat-label">UNIQUE IPs</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">{_fmt_bytes(sent)}</div>
+          <div class="stat-label">DATA SENT</div>
+        </div>
+        <div class="stat-card {'highlight' if sav_pct > 0 else ''}">
+          <div class="stat-value">{_fmt_bytes(saved)}</div>
+          <div class="stat-label">SAVED BY GZIP <small>({sav_pct}% / {gzip_pct}% of responses)</small></div>
+        </div>'''
+
+    # ── Yesterday panel ───────────────────────────────────────
+    if yes:
+        yes_hourly     = yes.get('hourly', [0]*24)
+        max_yh         = max(yes_hourly) or 1
+        yes_hourly_bars= ''
+        for i, val in enumerate(yes_hourly):
+            h = int(val * 100 / max_yh)
+            yes_hourly_bars += f'<div class="bar-wrap"><div class="bar" style="height:{h}%" title="{val} announces"></div><div class="bar-label">{i:02d}</div></div>'
+        yes_panel = f'''
+        <div class="panel" id="panel-yesterday">
+          <div class="stat-grid">{cards(yes)}</div>
+          <div class="section-title">Protocol Breakdown</div>
+          <div class="proto-breakdown">{proto_bars(yes)}</div>
+          <div class="section-title">IPv4 / IPv6</div>
+          <div class="proto-breakdown">{ipv_bars(yes)}</div>
+          <div class="section-title">Hourly Activity — {yes.get('date','')}</div>
+          <div class="chart">{yes_hourly_bars}</div>
+        </div>'''
+    else:
+        yes_panel = '<div class="panel" id="panel-yesterday"><div class="no-data">No data for yesterday yet — check back after midnight.</div></div>'
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wildkat Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=JetBrains+Mono:wght@400;600&family=DM+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --bg:       #0a0b10;
+    --card:     #12141c;
+    --card2:    #191b26;
+    --border:   #1e2133;
+    --accent:   #f5a623;
+    --accent2:  #e05b30;
+    --green:    #3ecf8e;
+    --blue:     #4f8ef7;
+    --purple:   #9b7fe8;
+    --text:     #e8eaf2;
+    --muted:    #555878;
+    --mono:     'JetBrains Mono', monospace;
+    --sans:     'DM Sans', sans-serif;
+    --display:  'Orbitron', sans-serif;
+  }}
+  @media (prefers-color-scheme: light) {{
+    :root {{
+      --bg:       #f5f4ef;
+      --card:     #ffffff;
+      --card2:    #eeede8;
+      --border:   #d8d6cc;
+      --accent:   #c97d0a;
+      --accent2:  #c04820;
+      --green:    #1a9e65;
+      --blue:     #2c6fd4;
+      --purple:   #6b4fc2;
+      --text:     #1a1a2a;
+      --muted:    #888070;
+    }}
+    body::before {{
+      background:
+        radial-gradient(ellipse 80% 50% at 50% -10%, rgba(201,125,10,0.06) 0%, transparent 70%),
+        radial-gradient(ellipse 40% 30% at 85% 80%, rgba(44,111,212,0.04) 0%, transparent 60%);
+    }}
+    .logo {{
+      text-shadow: 0 0 40px rgba(201,125,10,0.25), 0 0 80px rgba(201,125,10,0.08);
+    }}
+  }}
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  html {{ scroll-behavior: smooth; }}
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }}
+
+  /* ── Background texture ── */
+  body::before {{
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 80% 50% at 50% -10%, rgba(245,166,35,0.08) 0%, transparent 70%),
+      radial-gradient(ellipse 40% 30% at 85% 80%, rgba(79,142,247,0.05) 0%, transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }}
+
+  .container {{
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 0 24px;
+    position: relative;
+    z-index: 1;
+  }}
+
+  /* ── Header ── */
+  .header {{
+    padding: 60px 0 40px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 40px;
+  }}
+  .logo {{
+    font-family: var(--display);
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    font-weight: 900;
+    letter-spacing: 0.12em;
+    color: var(--accent);
+    text-shadow: 0 0 40px rgba(245,166,35,0.4), 0 0 80px rgba(245,166,35,0.15);
+    margin-bottom: 6px;
+  }}
+  .logo span {{ color: var(--text); }}
+  .tagline {{
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    color: var(--muted);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin-bottom: 28px;
+  }}
+  .uptime-banner {{
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 40px;
+    padding: 10px 24px;
+    font-size: 0.9rem;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }}
+  .uptime-banner strong {{ color: var(--text); }}
+  .live-stats {{
+    display: flex;
+    justify-content: center;
+    gap: 32px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }}
+  .live-stat {{
+    text-align: center;
+  }}
+  .live-stat .num {{
+    font-family: var(--mono);
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: var(--accent);
+    display: block;
+    line-height: 1;
+  }}
+  .live-stat .lbl {{
+    font-size: 0.7rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }}
+
+  /* ── Announce URLs ── */
+  .announce-card {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 28px;
+    margin-bottom: 32px;
+  }}
+  .announce-title {{
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 16px;
+  }}
+  .url-row {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }}
+  .url-row:last-child {{ border-bottom: none; }}
+  .url-badge {{
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    padding: 3px 10px;
+    border-radius: 4px;
+    min-width: 52px;
+    text-align: center;
+  }}
+  .url-badge.udp   {{ background: rgba(79,142,247,0.15); color: var(--blue); border: 1px solid rgba(79,142,247,0.3); }}
+  .url-badge.https {{ background: rgba(62,207,142,0.12); color: var(--green); border: 1px solid rgba(62,207,142,0.3); }}
+  .url-text {{
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    color: var(--text);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .copy-btn {{
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    padding: 5px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }}
+  .copy-btn:hover  {{ border-color: var(--accent); color: var(--accent); }}
+  .copy-btn.copied {{ border-color: var(--green); color: var(--green); }}
+
+  /* ── Tabs ── */
+  .tabs {{
+    display: flex;
+    gap: 4px;
+    margin-bottom: 28px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 4px;
+    width: fit-content;
+  }}
+  .tab {{
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 8px 22px;
+    border-radius: 7px;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    transition: all 0.15s;
+  }}
+  .tab:hover  {{ color: var(--text); }}
+  .tab.active {{ background: var(--card2); color: var(--accent); border: 1px solid var(--border); }}
+
+  /* ── Panels ── */
+  .panel {{ display: none; }}
+  .panel.visible {{ display: block; }}
+
+  /* ── Stat cards ── */
+  .stat-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+  }}
+  .stat-card {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 22px;
+    transition: border-color 0.2s;
+  }}
+  .stat-card:hover {{ border-color: rgba(245,166,35,0.3); }}
+  .stat-card.highlight {{ border-color: rgba(62,207,142,0.25); }}
+  .stat-value {{
+    font-family: var(--mono);
+    font-size: 1.9rem;
+    font-weight: 600;
+    color: var(--accent);
+    line-height: 1;
+    margin-bottom: 6px;
+  }}
+  .stat-card.highlight .stat-value {{ color: var(--green); }}
+  .stat-label {{
+    font-size: 0.7rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }}
+  .stat-label small {{ font-size: 0.65rem; display: block; margin-top: 2px; }}
+
+  /* ── Section title ── */
+  .section-title {{
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 28px 0 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }}
+
+  /* ── Protocol bars ── */
+  .proto-breakdown {{ display: flex; flex-direction: column; gap: 10px; margin-bottom: 8px; }}
+  .proto-row {{ display: flex; align-items: center; gap: 12px; }}
+  .proto-label {{
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--muted);
+    width: 44px;
+    text-align: right;
+    flex-shrink: 0;
+  }}
+  .proto-bar-bg {{
+    flex: 1;
+    background: var(--card2);
+    border-radius: 4px;
+    height: 10px;
+    overflow: hidden;
+  }}
+  .proto-bar {{
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.4s ease;
+    min-width: 2px;
+  }}
+  .proto-bar.udp   {{ background: var(--blue); }}
+  .proto-bar.https {{ background: var(--green); }}
+  .proto-bar.http  {{ background: var(--muted); }}
+  .proto-bar.ipv4  {{ background: var(--accent); }}
+  .proto-bar.ipv6  {{ background: var(--purple); }}
+  .proto-val {{
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--text);
+    min-width: 130px;
+    text-align: right;
+  }}
+  .proto-val small {{ color: var(--muted); }}
+
+  /* ── Bar chart ── */
+  .chart {{
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 100px;
+    padding: 8px 0 0;
+  }}
+  .bar-wrap {{
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    height: 100%;
+    justify-content: flex-end;
+  }}
+  .bar {{
+    width: 100%;
+    background: rgba(245,166,35,0.35);
+    border-radius: 3px 3px 0 0;
+    min-height: 2px;
+    transition: background 0.2s;
+  }}
+  .bar:hover {{ background: var(--accent); }}
+  .bar.active {{ background: rgba(245,166,35,0.7); }}
+  .bar-label {{
+    font-family: var(--mono);
+    font-size: 0.55rem;
+    color: var(--muted);
+    margin-top: 4px;
+    white-space: nowrap;
+  }}
+
+  /* ── Bragging points ── */
+  .brag-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }}
+  .brag-card {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 16px 20px;
+    font-size: 0.88rem;
+    color: var(--muted);
+  }}
+  .brag-card strong {{ color: var(--text); display: block; margin-bottom: 2px; font-size: 0.95rem; }}
+
+  /* ── No data ── */
+  .no-data {{
+    text-align: center;
+    padding: 48px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 0.85rem;
+  }}
+
+  /* ── Footer ── */
+  .footer {{
+    margin-top: 56px;
+    padding: 28px 0 40px;
+    border-top: 1px solid var(--border);
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.82rem;
+    line-height: 1.8;
+  }}
+  .footer a {{ color: var(--muted); text-decoration: underline; }}
+  .footer .stateless {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 20px;
+    margin: 16px auto;
+    max-width: 640px;
+    font-size: 0.8rem;
+    line-height: 1.7;
+    color: var(--muted);
+  }}
+
+  @media (max-width: 600px) {{
+    .live-stats {{ gap: 20px; }}
+    .url-text {{ font-size: 0.75rem; }}
+    .proto-val {{ min-width: 80px; font-size: 0.72rem; }}
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">&#128008; WILD<span>KAT</span></div>
+    <div class="tagline">BitTorrent Tracker &nbsp;&#183;&nbsp; HTTP &nbsp;&#183;&nbsp; HTTPS &nbsp;&#183;&nbsp; UDP &nbsp;&#183;&nbsp; IPv4/IPv6</div>
+    <div class="uptime-banner">
+      &#9679; Running for <strong>&nbsp;{uptime_str}</strong>
+    </div>
+    <div class="live-stats">
+      <div class="live-stat">
+        <span class="num">{_fmt_num(torrents)}</span>
+        <span class="lbl">Active Torrents</span>
+      </div>
+      <div class="live-stat">
+        <span class="num">{_fmt_num(live_peers)}</span>
+        <span class="lbl">Live Peers</span>
+      </div>
+      <div class="live-stat">
+        <span class="num">{_fmt_num(a['announces'])}</span>
+        <span class="lbl">All-Time Announces</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Announce URLs -->
+  <div class="announce-card">
+    <div class="announce-title">&#10148; Add this tracker to your torrent client</div>
+    {url_rows}
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" onclick="showTab('today',this)">Today</button>
+    <button class="tab" onclick="showTab('yesterday',this)">Yesterday</button>
+    <button class="tab" onclick="showTab('alltime',this)">All Time</button>
+  </div>
+
+  <!-- Today panel -->
+  <div class="panel visible" id="panel-today">
+    <div class="stat-grid">{cards(tod)}</div>
+    <div class="section-title">Protocol Breakdown</div>
+    <div class="proto-breakdown">{proto_bars(tod)}</div>
+    <div class="section-title">IPv4 / IPv6</div>
+    <div class="proto-breakdown">{ipv_bars(tod)}</div>
+    <div class="section-title">Hourly Activity &mdash; {tod['date']}</div>
+    <div class="chart">{hourly_bars}</div>
+  </div>
+
+  <!-- Yesterday panel -->
+  {yes_panel}
+
+  <!-- All-time panel -->
+  <div class="panel" id="panel-alltime">
+    <div class="stat-grid">{cards(a, is_alltime=True)}</div>
+    <div class="section-title">Protocol Breakdown</div>
+    <div class="proto-breakdown">{proto_bars(a)}</div>
+    <div class="section-title">IPv4 / IPv6</div>
+    <div class="proto-breakdown">{ipv_bars(a)}</div>
+    <div class="section-title">Daily Announces &mdash; Last 30 Days</div>
+    <div class="chart">{daily_bars}</div>
+    <div class="section-title">About This Tracker</div>
+    <div class="brag-grid">
+      <div class="brag-card"><strong>BEP 3 &mdash; Core Protocol</strong>HTTP announce with tracker ID, failure reason, warning message</div>
+      <div class="brag-card"><strong>BEP 7 &mdash; IPv6 Extension</strong>peers6 compact response, IPv4-mapped ::ffff: addresses for dual-stack swarms</div>
+      <div class="brag-card"><strong>BEP 15 &mdash; UDP Protocol</strong>Full connect / announce / scrape / error over UDP</div>
+      <div class="brag-card"><strong>BEP 23 &mdash; Compact Peers</strong>Compact IPv4 and dict model with no_peer_id support</div>
+      <div class="brag-card"><strong>BEP 24 &mdash; External IP</strong>Reflects client external IP in every announce response</div>
+      <div class="brag-card"><strong>BEP 48 &mdash; Scrape Extension</strong>Multi-hash scrape with flags.min_request_interval</div>
+      <div class="brag-card"><strong>gzip Compression</strong>Automatic compression when clients advertise support — only applied when it actually saves bytes</div>
+      <div class="brag-card"><strong>Pure Python</strong>No external dependencies. Runs anywhere Python 3.10+ is available</div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <div class="stateless">
+      &#128274; This tracker is <strong>stateless</strong>. No peer data, activity logs, or personal
+      information is stored to disk. All statistics shown are held in memory only and reset
+      when the service restarts.
+    </div>
+    Powered by <strong>Wildkat Tracker</strong> &nbsp;&#183;&nbsp;
+    <a href="https://github.com/HolyRoses/wildkat-tracker" target="_blank">github.com/HolyRoses/wildkat-tracker</a>
+  </div>
+
+</div>
+
+<script>
+function showTab(name, btn) {{
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('visible'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('visible');
+  btn.classList.add('active');
+}}
+
+function copyUrl(url, btn) {{
+  navigator.clipboard.writeText(url).then(() => {{
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('copied'); }}, 2000);
+  }}).catch(() => {{
+    // Fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = url;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('copied'); }}, 2000);
+  }});
+}}
+</script>
+</body>
+</html>'''
 
 
 # ─────────────────────────────────────────────────────────────
@@ -762,6 +1622,69 @@ def start_redirect_server(host: str, port: int, target_host: str):
     return server
 
 
+
+# ─────────────────────────────────────────────────────────────
+# Stats web server
+# ─────────────────────────────────────────────────────────────
+
+WEB_CONFIG: dict = {}   # populated at startup by main()
+
+
+class StatsWebHandler(BaseHTTPRequestHandler):
+    """Serves the stats page at / and nothing else."""
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == '/' or path == '':
+            snap = STATS.snapshot()
+            html = generate_stats_html(snap, WEB_CONFIG)
+            body = html.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', '9')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def log_message(self, fmt, *args):
+        log.debug('WEB %s %s', self.address_string(), fmt % args)
+
+
+class IPv6StatsWebServer(HTTPServer):
+    """IPv6 variant of the stats web server."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        super().server_bind()
+
+
+def start_web_server(host: str, port: int, ssl_ctx=None, label='WEB'):
+    server = HTTPServer((host, port), StatsWebHandler)
+    if ssl_ctx:
+        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+    log.info('%s stats page listening on %s:%d', label, host or '0.0.0.0', port)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+
+def start_web6_server(host6: str, port: int, ssl_ctx=None, label='WEB'):
+    server = IPv6StatsWebServer((host6, port, 0, 0), StatsWebHandler)
+    if ssl_ctx:
+        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+    log.info('%s stats page listening on [%s]:%d (IPv6)', label, host6 or '::', port)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+
 def main():
     global DEFAULT_INTERVAL, DEFAULT_MIN_INTERVAL, PEER_TTL, MAX_PEERS_PER_REPLY, DEFAULT_TRACKER_ID, MAX_SCRAPE_HASHES, ALLOW_FULL_SCRAPE
 
@@ -799,6 +1722,12 @@ def main():
                         help='Maximum number of info_hashes allowed per scrape request')
     parser.add_argument('--full-scrape', action='store_true',
                         help='Allow full scrape (no info_hash returns all torrents). Disabled by default.')
+    parser.add_argument('--web-http-port', type=int, default=80,
+                        help='Stats web page HTTP port (0 to disable)')
+    parser.add_argument('--web-https-port', type=int, default=0,
+                        help='Stats web page HTTPS port (0 to disable, uses same cert/key as tracker)')
+    parser.add_argument('--web-redirect-http', action='store_true',
+                        help='Redirect stats HTTP → HTTPS (requires --web-https-port)')
     parser.add_argument('--ipv6', action='store_true',
                         help='Also listen on IPv6 (binds :: for HTTP and UDP in addition to IPv4)')
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -875,6 +1804,42 @@ def main():
         )
         t.start()
 
+    # ── Stats web page ──────────────────────────────────────
+    # Build announce URL list (only advertise UDP and HTTPS)
+    announce_urls = []
+    _pub_domain = args.domain.split(':')[0] if args.domain else 'localhost'
+    if args.udp_port:
+        announce_urls.append(('UDP', f'udp://{_pub_domain}:{args.udp_port}/announce'))
+    if args.https_port:
+        _https_url = f'https://{_pub_domain}'
+        if args.https_port != 443:
+            _https_url += f':{args.https_port}'
+        announce_urls.append(('HTTPS', f'{_https_url}/announce'))
+
+    WEB_CONFIG['announce_urls'] = announce_urls
+    WEB_CONFIG['domain']        = _pub_domain
+
+    if args.web_https_port:
+        if not ssl_ctx:
+            print('Error: --web-https-port requires --cert and --key', file=sys.stderr)
+            sys.exit(1)
+        servers.append(start_web_server(args.host, args.web_https_port, ssl_ctx, 'HTTPS'))
+        if args.ipv6:
+            servers.append(start_web6_server('::', args.web_https_port, ssl_ctx, 'HTTPS'))
+
+    if args.web_http_port:
+        if ssl_ctx and args.web_redirect_http and args.web_https_port:
+            _web_redirect = _pub_domain
+            if args.web_https_port != 443:
+                _web_redirect += f':{args.web_https_port}'
+            servers.append(start_redirect_server(args.host, args.web_http_port, _web_redirect))
+            if args.ipv6:
+                servers.append(start_redirect_server('::', args.web_http_port, _web_redirect))
+        else:
+            servers.append(start_web_server(args.host, args.web_http_port, None, 'HTTP'))
+            if args.ipv6:
+                servers.append(start_web6_server('::', args.web_http_port, None, 'HTTP'))
+
     if not servers and not args.udp_port:
         print('Error: all listeners disabled.', file=sys.stderr)
         sys.exit(1)
@@ -885,6 +1850,7 @@ def main():
     try:
         while True:
             time.sleep(60)
+            STATS.check_rollover()
             hashes = REGISTRY.all_hashes()
             total_peers = sum(
                 len(REGISTRY._torrents.get(h, {})) for h in hashes
