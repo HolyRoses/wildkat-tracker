@@ -1,0 +1,78 @@
+[Unit]
+Description=BitTorrent Tracker Server (HTTP + HTTPS + UDP)
+Documentation=https://github.com/yourusername/tracker
+After=network-online.target
+Wants=network-online.target
+# If using acme.sh cert renewal via a timer, optionally depend on it:
+# After=acme.sh.timer
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+# ── Identity ─────────────────────────────────────────────────────────────────
+# Run as a dedicated low-privilege user for security.
+# Create with: useradd --system --no-create-home --shell /sbin/nologin tracker
+User=tracker
+Group=tracker
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+WorkingDirectory=/opt/tracker
+
+# ── Command ──────────────────────────────────────────────────────────────────
+# Adjust ports, cert paths, and domain to match your deployment.
+# Remove --https-port / --cert / --key if you are not using TLS.
+# Remove --redirect-http if you want plain HTTP on --http-port instead of a redirect.
+ExecStart=/usr/bin/python3 /opt/tracker/tracker_server.py \
+    --host          ""                                              \
+    --http-port     80                                              \
+    --https-port    443                                             \
+    --udp-port      6969                                            \
+    --cert          /etc/ssl/acme/tracker.example.com/fullchain.cer \
+    --key           /etc/ssl/acme/tracker.example.com/tracker.example.com.key \
+    --redirect-http                                                 \
+    --domain        tracker.example.com                             \
+    --interval      1800                                            \
+    --min-interval  60                                              \
+    --peer-ttl      3600                                            \
+    --max-peers     200
+
+# ── Restart policy ───────────────────────────────────────────────────────────
+Restart=on-failure
+RestartSec=5s
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Output goes to journald. View with: journalctl -u tracker -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tracker
+
+# ── Capabilities ─────────────────────────────────────────────────────────────
+# Needed to bind to privileged ports (80, 443) as a non-root user.
+# Remove if you are using ports >= 1024 only.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# ── Hardening ────────────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+# Allow read access to the cert/key files and the script directory.
+# Adjust paths if your layout differs.
+ReadOnlyPaths=/etc/ssl/acme
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target
