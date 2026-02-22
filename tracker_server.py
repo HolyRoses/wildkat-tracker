@@ -882,6 +882,35 @@ def _pct(a: int, b: int) -> float:
 def _savings_pct(raw: int, sent: int) -> float:
     return round(100 * (raw - sent) / raw, 1) if raw > 0 else 0.0
 
+FAVICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <radialGradient id="gl" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffe066"/>
+      <stop offset="60%" stop-color="#f5a623"/>
+      <stop offset="100%" stop-color="#e05b30" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gr" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffe066"/>
+      <stop offset="60%" stop-color="#f5a623"/>
+      <stop offset="100%" stop-color="#e05b30" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <ellipse cx="10" cy="16" rx="7" ry="6" fill="url(#gl)" opacity="0.5"/>
+  <ellipse cx="22" cy="16" rx="7" ry="6" fill="url(#gr)" opacity="0.5"/>
+  <ellipse cx="10" cy="16" rx="5" ry="4" fill="#f5a623"/>
+  <ellipse cx="22" cy="16" rx="5" ry="4" fill="#f5a623"/>
+  <ellipse cx="10" cy="16" rx="1.2" ry="3.6" fill="#0d0e14"/>
+  <ellipse cx="22" cy="16" rx="1.2" ry="3.6" fill="#0d0e14"/>
+  <ellipse cx="11.5" cy="14.5" rx="0.9" ry="0.6" fill="rgba(255,255,255,0.6)" transform="rotate(-20,11.5,14.5)"/>
+  <ellipse cx="23.5" cy="14.5" rx="0.9" ry="0.6" fill="rgba(255,255,255,0.6)" transform="rotate(-20,23.5,14.5)"/>
+</svg>'''
+
+FAVICON_ICO = bytes.fromhex(
+    '000001000101000101000001002000280000001600000028000000'
+    '010000000200000001002000000000000000000000000000000000'
+    '000000000000000000000000000000000000000000000000'
+)
+
 def generate_stats_html(snap: dict, web_config: dict) -> str:
     uptime_str   = _fmt_uptime(snap['uptime'])
     torrents     = snap['torrents']
@@ -1016,6 +1045,7 @@ def generate_stats_html(snap: dict, web_config: dict) -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Wildkat Tracker</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,{urllib.parse.quote(FAVICON_SVG.strip())}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=JetBrains+Mono:wght@400;600&family=DM+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
@@ -1645,6 +1675,13 @@ class StatsWebHandler(BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-cache')
             self.end_headers()
             self.wfile.write(body)
+        elif path == '/favicon.ico':
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/x-icon')
+            self.send_header('Content-Length', str(len(FAVICON_ICO)))
+            self.send_header('Cache-Control', 'max-age=86400')
+            self.end_headers()
+            self.wfile.write(FAVICON_ICO)
         else:
             self.send_response(404)
             self.send_header('Content-Type', 'text/plain')
