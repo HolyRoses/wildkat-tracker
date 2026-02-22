@@ -39,6 +39,7 @@ A lightweight, self-hosted BitTorrent tracker with full HTTP, HTTPS, and UDP sup
 | `tracker_server.py` | The tracker server |
 | `tracker_query.py` | The query and diagnostic tool |
 | `tracker.service` | systemd service unit |
+| `deploy.sh` | Auto-deploy script — polls GitHub and deploys updates |
 | `INSTALL.md` | Full installation guide |
 
 ## Quick Start

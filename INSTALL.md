@@ -271,12 +271,12 @@ cd ~/wildkat-tracker
 git fetch origin main
 ```
 
-### 9.2 Install the Deploy Script
+### 9.2 Make the Deploy Script Executable
+
+The script lives in the repository clone — no copying needed.
 
 ```bash
-sudo cp deploy.sh /opt/tracker/deploy.sh
-sudo chown ubuntu:ubuntu /opt/tracker/deploy.sh
-sudo chmod 750 /opt/tracker/deploy.sh
+chmod 750 ~/wildkat-tracker/deploy.sh
 ```
 
 ### 9.3 Create the Log File
@@ -297,7 +297,7 @@ crontab -e
 Add this line:
 
 ```
-*/5 * * * * /opt/tracker/deploy.sh >> /var/log/tracker-deploy.log 2>&1
+*/5 * * * * /home/ubuntu/wildkat-tracker/deploy.sh >> /var/log/tracker-deploy.log 2>&1
 ```
 
 ### 9.5 Verify

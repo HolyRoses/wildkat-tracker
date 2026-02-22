@@ -1,19 +1,20 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────
 # wildkat-tracker auto-deploy script
-# Run via cron as the ubuntu user to detect pushes to master and deploy updates.
+# Run via cron as the ubuntu user to detect pushes to main and deploy updates.
+# Only restarts the tracker if tracker_server.py actually changed.
 #
 # Crontab entry (checks every 5 minutes):
 #   */5 * * * * /opt/tracker/deploy.sh >> /var/log/tracker-deploy.log 2>&1
 # ─────────────────────────────────────────────────────────────
 
 # ── Configuration ────────────────────────────────────────────
-REPO_DIR="/home/ubuntu/wildkat-tracker"   # local clone of the repo
-REPO_BRANCH="main"                         # branch to track
-DEPLOY_FILE="tracker_server.py"            # file to deploy from repo
+REPO_DIR="/home/ubuntu/wildkat-tracker"       # local clone of the repo
+REPO_BRANCH="main"                             # branch to track
+DEPLOY_FILE="tracker_server.py"               # file to deploy from repo
 DEPLOY_DEST="/opt/tracker/tracker_server.py"  # destination on server
-SERVICE_NAME="tracker"                     # systemd service to restart
-LOCK_FILE="/tmp/tracker-deploy.lock"       # prevent concurrent runs
+SERVICE_NAME="tracker"                         # systemd service to restart
+LOCK_FILE="/tmp/tracker-deploy.lock"           # prevent concurrent runs
 
 # ─────────────────────────────────────────────────────────────
 
@@ -39,24 +40,33 @@ LOCAL_SHA="$(git rev-parse HEAD)"
 REMOTE_SHA="$(git rev-parse "origin/$REPO_BRANCH")"
 
 if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
-    # No changes — exit silently (keeps cron log clean)
+    # No changes at all — exit silently
     exit 0
 fi
 
-# ── Changes detected ─────────────────────────────────────────
-echo "[$TIMESTAMP] Change detected on $REPO_BRANCH"
+# ── Repo has changed — pull it ────────────────────────────────
+echo "[$TIMESTAMP] Changes detected on $REPO_BRANCH — pulling"
 echo "[$TIMESTAMP]   local:  $LOCAL_SHA"
 echo "[$TIMESTAMP]   remote: $REMOTE_SHA"
 
-# ── Pull latest code ──────────────────────────────────────────
-echo "[$TIMESTAMP] Pulling..."
 git pull origin "$REPO_BRANCH" --quiet
 
 NEW_SHA="$(git rev-parse HEAD)"
 echo "[$TIMESTAMP] Updated to $NEW_SHA"
 
-# ── Verify the script parses cleanly before deploying ─────────
-if ! python3 -c "import ast; ast.parse(open('$DEPLOY_FILE').read())"; then
+# ── Check if tracker_server.py actually changed ───────────────
+MD5_REPO="$(md5sum "$REPO_DIR/$DEPLOY_FILE" | awk '{print $1}')"
+MD5_LIVE="$(md5sum "$DEPLOY_DEST"           | awk '{print $1}')"
+
+if [ "$MD5_REPO" = "$MD5_LIVE" ]; then
+    echo "[$TIMESTAMP] $DEPLOY_FILE unchanged — no restart needed"
+    exit 0
+fi
+
+echo "[$TIMESTAMP] $DEPLOY_FILE changed (md5 $MD5_LIVE → $MD5_REPO)"
+
+# ── Syntax check before deploying ────────────────────────────
+if ! python3 -c "import ast; ast.parse(open('$REPO_DIR/$DEPLOY_FILE').read())"; then
     echo "[$TIMESTAMP] ERROR: $DEPLOY_FILE failed syntax check — aborting deploy"
     exit 1
 fi
