@@ -130,4 +130,4 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 ## Requirements
 
 - Python 3.10+
-- No external packages — standard library only.
+- No external packages — standard library only
