@@ -258,12 +258,91 @@ After doing this, all port access is controlled exclusively by the OCI Security 
 
 ---
 
-## 9. Updating
+## 9. Auto-Deploy from GitHub
 
-To deploy a new version of the tracker script:
+The included `deploy.sh` script polls GitHub every 5 minutes and automatically deploys updates when a push to `main` is detected. It performs a syntax check before deploying so a broken push cannot take down the running tracker.
+
+### 9.1 Prerequisites
+
+The server must have a local clone of the repository. Verify git access works before proceeding:
 
 ```bash
-cp tracker_server.py /opt/tracker/
-chown tracker:tracker /opt/tracker/tracker_server.py
-systemctl restart tracker
+cd ~/wildkat-tracker
+git fetch origin main
+```
+
+### 9.2 Install the Deploy Script
+
+```bash
+sudo cp deploy.sh /opt/tracker/deploy.sh
+sudo chown ubuntu:ubuntu /opt/tracker/deploy.sh
+sudo chmod 750 /opt/tracker/deploy.sh
+```
+
+### 9.3 Create the Log File
+
+```bash
+sudo touch /var/log/tracker-deploy.log
+sudo chown ubuntu:ubuntu /var/log/tracker-deploy.log
+```
+
+### 9.4 Wire Up the Cron Job
+
+Add the cron job to the `ubuntu` user's crontab:
+
+```bash
+crontab -e
+```
+
+Add this line:
+
+```
+*/5 * * * * /opt/tracker/deploy.sh >> /var/log/tracker-deploy.log 2>&1
+```
+
+### 9.5 Verify
+
+Watch the log after a push is made to GitHub:
+
+```bash
+tail -f /var/log/tracker-deploy.log
+```
+
+A successful deploy looks like:
+
+```
+[2026-02-22 00:20:01] Change detected on main
+[2026-02-22 00:20:01]   local:  be658e3d...
+[2026-02-22 00:20:01]   remote: c5e91ea6...
+[2026-02-22 00:20:01] Pulling...
+[2026-02-22 00:20:01] Updated to c5e91ea6...
+[2026-02-22 00:20:01] Deploying tracker_server.py → /opt/tracker/tracker_server.py
+[2026-02-22 00:20:01] Restarting tracker...
+[2026-02-22 00:20:01] tracker is running — deploy successful
+```
+
+When no changes are detected the script exits silently — the log will only contain entries when a deploy actually occurred.
+
+### 9.6 Deploy Script Configuration
+
+The variables at the top of `deploy.sh` can be adjusted if your layout differs:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REPO_DIR` | `/home/ubuntu/wildkat-tracker` | Local git clone path |
+| `REPO_BRANCH` | `main` | Branch to track |
+| `DEPLOY_FILE` | `tracker_server.py` | File to deploy from repo |
+| `DEPLOY_DEST` | `/opt/tracker/tracker_server.py` | Destination on server |
+| `SERVICE_NAME` | `tracker` | systemd service to restart |
+
+---
+
+## 10. Manual Update
+
+To deploy a new version of the tracker script without the auto-deploy system:
+
+```bash
+sudo cp tracker_server.py /opt/tracker/
+sudo chown tracker:tracker /opt/tracker/tracker_server.py
+sudo systemctl restart tracker
 ```
