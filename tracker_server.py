@@ -3970,6 +3970,9 @@ _MANAGE_CSS = '''
     border-radius: 6px; color: var(--text); font-family: var(--mono); font-size: 0.88rem;
     outline: none; transition: border-color 0.15s; }
   input:focus { border-color: var(--accent); }
+  .skip-link { position:absolute;left:-9999px;top:auto;width:1px;height:1px;overflow:hidden; }
+  .skip-link:focus { position:fixed;top:12px;left:12px;width:auto;height:auto;padding:10px 18px;background:var(--accent);color:#000;font-weight:600;border-radius:6px;z-index:99999;text-decoration:none; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
   .alert { padding: 12px 16px; border-radius: 8px; margin-bottom: 18px;
            font-size: 0.88rem; font-family: var(--mono); }
   .alert-error { background: rgba(224,91,48,0.12); border: 1px solid rgba(224,91,48,0.3); color: var(--red); }
@@ -4029,15 +4032,19 @@ _MANAGE_HEAD = '''<!DOCTYPE html>
 <style>{css}</style>
 </head>
 <body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
 <div class="container">'''
 
 _MANAGE_HEADER = '''
+  <header>
   <div class="header">
     <a class="logo" href="/">&#128008; WILD<span>KAT</span></a>
-    <div class="nav">
+    <nav aria-label="Site navigation">
       {nav_items}
-    </div>
-  </div>'''
+    </nav>
+  </div>
+  </header>
+  <main id="main-content">'''
 
 _MANAGE_FOOT = '''
 </div>
@@ -4124,6 +4131,7 @@ function copyMagnet(btn, url) {
   });
 }
 </script>
+</main>
 </body></html>'''
 
 
@@ -4143,7 +4151,8 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
     alert = ''
     if msg:
         cls = 'alert-error' if msg_type == 'error' else 'alert-success'
-        alert = f'<div class="alert {cls}">{msg}</div>'
+        prefix = '⚠ ' if msg_type == 'error' else '✓ '
+        alert = f'<div class="alert {cls}" role="alert">{prefix}{msg}</div>'
 
     head = _MANAGE_HEAD.format(title=title, favicon=fav, css=_MANAGE_CSS)
     header = _MANAGE_HEADER.format(nav_items=nav)
@@ -4180,17 +4189,17 @@ def _render_signup(msg: str = '', pw_settings: dict | None = None,
       {invite_note}
       <form method="POST" action="{action}">
         <div class="form-group">
-          <label>Username</label>
-          <input type="text" name="username" autocomplete="username" autofocus required>
+          <label for="signup-username">Username</label>
+          <input id="signup-username" type="text" name="username" autocomplete="username" autofocus required>
         </div>
         {pw_req_html}
         <div class="form-group">
-          <label>Password</label>
-          <input type="password" name="password" autocomplete="new-password" required>
+          <label for="signup-password">Password</label>
+          <input id="signup-password" type="password" name="password" autocomplete="new-password" required>
         </div>
         <div class="form-group">
-          <label>Confirm Password</label>
-          <input type="password" name="confirm_password" required>
+          <label for="signup-confirm">Confirm Password</label>
+          <input id="signup-confirm" type="password" name="confirm_password" required>
         </div>
         <button type="submit" class="btn btn-primary" style="width:100%;margin-top:8px">Create Account</button>
       </form>
@@ -4217,12 +4226,12 @@ def _render_login(msg: str = '') -> str:
     <div class="card">
       <form method="POST" action="/manage/login">
         <div class="form-group">
-          <label>Username</label>
-          <input type="text" name="username" autocomplete="username" autofocus required>
+          <label for="login-username">Username</label>
+          <input id="login-username" type="text" name="username" autocomplete="username" autofocus required>
         </div>
         <div class="form-group">
-          <label>Password</label>
-          <input type="password" name="password" autocomplete="current-password" required>
+          <label for="login-password">Password</label>
+          <input id="login-password" type="password" name="password" autocomplete="current-password" required>
         </div>
         <button type="submit" class="btn btn-primary" style="width:100%;margin-top:8px">Sign In</button>
       </form>
@@ -4245,22 +4254,22 @@ def _torrent_header(show_owner: bool = False) -> str:
         # 6 cols: 33+27+10+8+10+12 = 100%
         return (
             '<tr>'
-            '<th style="width:33%">Name</th>'
-            '<th style="width:27%">Info Hash</th>'
-            '<th style="width:10%">Owner</th>'
-            '<th style="width:8%;white-space:nowrap">Size</th>'
-            '<th style="width:10%;white-space:nowrap">Registered</th>'
-            '<th style="width:12%;min-width:100px">Action</th>'
+            '<th scope="col" style="width:33%">Name</th>'
+            '<th scope="col" style="width:27%">Info Hash</th>'
+            '<th scope="col" style="width:10%">Owner</th>'
+            '<th scope="col" style="width:8%;white-space:nowrap">Size</th>'
+            '<th scope="col" style="width:10%;white-space:nowrap">Registered</th>'
+            '<th scope="col" style="width:12%;min-width:100px">Action</th>'
             '</tr>'
         )
     # 5 cols: 36+36+8+8+12 = 100%
     return (
         '<tr>'
-        '<th style="width:36%">Name</th>'
-        '<th style="width:36%">Info Hash</th>'
-        '<th style="width:8%;white-space:nowrap">Size</th>'
-        '<th style="width:8%;white-space:nowrap">Registered</th>'
-        '<th style="width:12%;min-width:100px">Action</th>'
+        '<th scope="col" style="width:36%">Name</th>'
+        '<th scope="col" style="width:36%">Info Hash</th>'
+        '<th scope="col" style="width:8%;white-space:nowrap">Size</th>'
+        '<th scope="col" style="width:8%;white-space:nowrap">Registered</th>'
+        '<th scope="col" style="width:12%;min-width:100px">Action</th>'
         '</tr>'
     )
 
@@ -4299,7 +4308,7 @@ def _torrent_row(t, viewer_role: str, viewer_id: int,
         f'<td class="hash" style="white-space:nowrap">{size_str}</td>'
         f'<td class="hash">{reg_date}</td>'
         f'<td><div class="actions">'
-        f'<button class="btn btn-sm btn-green" onclick="copyMagnet(this,{repr(magnet)})" title="Copy magnet">&#x1F9F2; Magnet</button>'
+        f'<button class="btn btn-sm btn-green" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Magnet</button>'
         f' {del_btn}'
         f'</div></td>'
         f'</tr>'
@@ -4444,12 +4453,12 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             <form method="POST" action="/manage/admin/tracker-move" style="display:inline">
               <input type="hidden" name="tid" value="{tid}">
               <input type="hidden" name="direction" value="-1">
-              <button class="btn btn-sm" title="Move up">&#8593;</button>
+              <button class="btn btn-sm">&#8593;</button>
             </form>
             <form method="POST" action="/manage/admin/tracker-move" style="display:inline">
               <input type="hidden" name="tid" value="{tid}">
               <input type="hidden" name="direction" value="1">
-              <button class="btn btn-sm" title="Move down">&#8595;</button>
+              <button class="btn btn-sm">&#8595;</button>
             </form>
             <form method="POST" action="/manage/admin/tracker-toggle" style="display:inline">
               <input type="hidden" name="tid" value="{tid}">
@@ -4613,7 +4622,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             invite_url = f'/manage/invite/{ic["code"]}'
             status = '<span style="color:var(--green)">Pending</span>'
             actions = (
-                f'<button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(invite_url)})" title="Copy invite URL">&#128279; Copy URL</button>'
+                f'<button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(invite_url)})">&#128279; Copy URL</button>'
                 + f'<form method="POST" action="/manage/admin/delete-invite" style="display:inline"'
                 + f' data-confirm="Delete this invite code?">'
                 + f'<input type="hidden" name="code" value="{code_h}">'
@@ -4642,7 +4651,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     <div class="card">
       <table>
         <tr>
-          <th>Code</th><th>Created By</th><th>Created At</th><th>Status</th><th>Actions</th>
+          <th scope="col">Code</th><th scope="col">Created By</th><th scope="col">Created At</th><th scope="col">Status</th><th scope="col">Actions</th>
         </tr>
         {_inv_rows}
       </table>
@@ -4863,7 +4872,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         </form>
       </div>
       <div class="table-wrap"><table>
-        <tr><th>Username</th><th>Role / Status</th><th>Created By</th><th>Last Login</th><th>Actions</th></tr>
+        <tr><th scope="col">Username</th><th scope="col">Role / Status</th><th scope="col">Created By</th><th scope="col">Last Login</th><th scope="col">Actions</th></tr>
         {u_rows}
       </table></div>
       {_pagination_html(upage, utotal_pages, '/manage/admin' + (f'?uq={uquery}' if uquery else ''), page_param='upage')}
@@ -4902,7 +4911,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     <div class="card">
       <div class="card-title">Magnet Link Trackers</div>
       <div class="table-wrap"><table>
-        <tr><th>URL</th><th style="text-align:center">Status</th><th>Actions</th></tr>
+        <tr><th scope="col">URL</th><th scope="col" style="text-align:center">Status</th><th scope="col">Actions</th></tr>
         {tr_rows}
       </table></div>
     </div>
@@ -4926,7 +4935,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     <div class="card">
       <div class="card-title">Recent Events (last 100)</div>
       <div class="table-wrap"><table>
-        <tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr>
+        <tr><th scope="col">Time</th><th scope="col">Actor</th><th scope="col">Action</th><th scope="col">Target</th><th scope="col">Detail</th></tr>
         {ev_rows}
       </table></div>
     </div>
@@ -4960,7 +4969,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard') -> st
         files_html = (
             '<div class="card-title">Files (' + str(len(files)) + ')</div>'
             '<div class="table-wrap"><table>'
-            '<tr><th>Path</th><th style="text-align:right">Size</th></tr>'
+            '<tr><th scope="col">Path</th><th scope="col" style="text-align:right">Size</th></tr>'
             + file_rows + '</table></div>'
         )
     else:
@@ -5216,9 +5225,9 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + '<form id="ip-lock-form" method="POST" action="/manage/admin/ip-lock">'
             + '<input type="hidden" name="user_id" value="' + str(target_user['id']) + '">'
             + '<div style="overflow-x:auto"><table style="table-layout:fixed;width:100%;border-collapse:collapse">'
-            + '<tr><th style="width:28px;padding:6px 8px"></th>'
-            + '<th style="width:36%;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">TIME</th>'
-            + '<th style="padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">IP ADDRESS</th></tr>'
+            + '<tr><th scope="col" style="width:28px;padding:6px 8px"></th>'
+            + '<th scope="col" style="width:36%;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">TIME</th>'
+            + '<th scope="col" style="padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">IP ADDRESS</th></tr>'
             + ip_rows
             + '</table></div>'
             + '<div style="margin-top:12px">'
@@ -5228,9 +5237,9 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + '<div class="card-title">IP Allowlist</div>'
             + '<div style="overflow-x:auto"><table style="table-layout:fixed;width:100%;border-collapse:collapse">'
             + '<tr>'
-            + '<th style="padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">IP ADDRESS</th>'
-            + '<th style="width:50%;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">ADDED</th>'
-            + '<th style="width:120px;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">ACTION</th>'
+            + '<th scope="col" style="padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">IP ADDRESS</th>'
+            + '<th scope="col" style="width:50%;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">ADDED</th>'
+            + '<th scope="col" style="width:120px;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">ACTION</th>'
             + '</tr>'
             + al_rows
             + '</table></div>'
@@ -5450,7 +5459,7 @@ def _render_invite_section(viewer, target_user, is_own_profile: bool, db) -> str
             + f'<td class="hash">{_h((c["created_at"] or "")[:10])}</td>'
             + '<td><span style="color:var(--green)">Pending</span></td>'
             + f'<td><div class="actions">'
-            + f'<button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(invite_path)})" title="Copy invite URL">&#128279; Copy URL</button>'
+            + f'<button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(invite_path)})">&#128279; Copy URL</button>'
             + '</div></td>'
             + '</tr>'
         )
@@ -5473,7 +5482,7 @@ def _render_invite_section(viewer, target_user, is_own_profile: bool, db) -> str
         + '<div class="card-title" style="margin:0">Invite Codes</div>'
         + gen_btn
         + '</div>'
-        + '<table><tr><th>Code</th><th>Created</th><th>Status</th><th>Actions</th></tr>'
+        + '<table><tr><th scope="col">Code</th><th scope="col">Created</th><th scope="col">Status</th><th scope="col">Actions</th></tr>'
         + rows
         + '</table></div>'
     )
