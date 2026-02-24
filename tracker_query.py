@@ -471,9 +471,15 @@ def format_scrape_table_output(data):
 # HTTP Tracker Functions
 # ────────────────────────────────────────────────
 
+def percent_encode_bytes(data: bytes) -> str:
+    """
+    Strict BitTorrent-safe percent encoding.
+    Encodes EVERY byte as %XX (uppercase).
+    """
+    return ''.join(f'%{b:02X}' for b in data)
+
 def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want, left=1000000000):
     params = {
-        'info_hash':   info_hash_bytes,
         'peer_id':     peer_id,
         'port':        '6881',
         'uploaded':    '0',
@@ -489,8 +495,13 @@ def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want, l
         params['event'] = event
     # else: omit entirely → means "none" / regular announce
 
+    # Encode everything except info_hash normally
     query = urllib.parse.urlencode(params, doseq=False, safe='~')
-    return f"{tracker_url}?{query}"
+
+    # Strictly encode info_hash
+    info_hash_encoded = percent_encode_bytes(info_hash_bytes)
+
+    return f"{tracker_url}?info_hash={info_hash_encoded}&{query}"
 
 def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=1000000000):
     """Test HTTP/HTTPS tracker and return response time in milliseconds"""
@@ -715,8 +726,9 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
                 sys.exit(2)
         params_list = []
         for hash_bytes in info_hash_list:
-            params = {'info_hash': hash_bytes}
-            params_list.append(urllib.parse.urlencode(params, doseq=False, safe='~'))
+            encoded = percent_encode_bytes(hash_bytes)
+            params_list.append(f"info_hash={encoded}")
+
         query_string = '&'.join(params_list)
         separator = '&' if '?' in scrape_url else '?'
         full_url = f"{scrape_url}{separator}{query_string}"
@@ -730,8 +742,8 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
         except ValueError as e:
             print(f"Error: Invalid info hash — {e}", file=sys.stderr)
             sys.exit(2)
-        params = {'info_hash': info_hash_list[0]}
-        query_string = urllib.parse.urlencode(params, doseq=False, safe='~')
+        encoded = percent_encode_bytes(info_hash_list[0])
+        query_string = f"info_hash={encoded}"
         separator = '&' if '?' in scrape_url else '?'
         full_url = f"{scrape_url}{separator}{query_string}"
 
