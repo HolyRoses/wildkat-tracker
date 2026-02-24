@@ -5018,7 +5018,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard') -> st
     <div class="card">
       <div class="card-title">Actions</div>
       <div style="display:flex;flex-direction:column;gap:12px;align-items:flex-start">
-        <button class="btn btn-primary btn-green" onclick="copyMagnet(this,{repr(magnet)})" style="color:#000">&#x1F9F2; Copy Magnet Link</button>
+        <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet Link</button>
         {del_btn}
       </div>
     </div>
