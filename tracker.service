@@ -1,6 +1,6 @@
 [Unit]
 Description=BitTorrent Tracker Server (HTTP + HTTPS + UDP)
-Documentation=https://github.com/yourusername/tracker
+Documentation=https://github.com/HolyRoses/wildkat-tracker
 After=network-online.target
 Wants=network-online.target
 # If using acme.sh cert renewal via a timer, optionally depend on it:
@@ -76,7 +76,7 @@ RemoveIPC=yes
 # Allow read access to the cert/key files and the script directory.
 # Adjust paths if your layout differs.
 ReadOnlyPaths=/etc/ssl/acme
-ReadWritePaths=/tmp
+ReadWritePaths=/tmp /opt/tracker /var/crash
 
 [Install]
 WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-# BitTorrent Tracker — Installation Guide
+# Wildkat Tracker — Installation Guide
 
 ## Requirements
 
@@ -11,7 +11,7 @@
 
 ## 1. Create the Dedicated Service User
 
-The tracker runs as a low-privilege system user for security. It has no home directory and cannot log in.
+The tracker runs as a low-privilege system user. It has no home directory and cannot log in interactively.
 
 ```bash
 useradd --system --no-create-home --shell /sbin/nologin tracker
@@ -26,14 +26,12 @@ mkdir -p /opt/tracker
 cp tracker_server.py /opt/tracker/
 chown -R tracker:tracker /opt/tracker
 chmod 750 /opt/tracker
-chmod 640 /opt/tracker/tracker_server.py
+chmod 750 /opt/tracker/tracker_server.py
 ```
 
 ---
 
 ## 3. Obtain a TLS Certificate with acme.sh
-
-This section covers obtaining a free Let's Encrypt certificate using acme.sh in standalone mode.
 
 ### 3.1 Install acme.sh
 
@@ -45,17 +43,17 @@ This installs acme.sh to `~/.acme.sh/` and adds a daily cron job for renewals.
 
 ### 3.2 Open Port 80 Temporarily
 
-acme.sh needs port 80 to complete the HTTP challenge. Ensure it is open in your firewall/security group before proceeding. It can be closed again after issuance if desired, but must be open for the few seconds of each renewal.
+acme.sh needs port 80 to complete the HTTP challenge. Ensure it is open in your firewall/security group before proceeding.
 
 ### 3.3 Issue the Certificate
 
-Run as root so acme.sh can bind to port 80. Switch to root first — do not use `sudo` directly with acme.sh.
+Run as root. Switch to root first — do not use `sudo` directly with acme.sh.
 
 ```bash
 sudo -i
 ```
 
-Issue a certificate for your domain. You may include additional SANs (Subject Alternative Names) for testing IPv4/IPv6 separately:
+Issue a certificate for your domain. You may include additional SANs for testing IPv4/IPv6 separately:
 
 ```bash
 /home/<your-user>/.acme.sh/acme.sh --issue \
@@ -67,13 +65,13 @@ Issue a certificate for your domain. You may include additional SANs (Subject Al
   --listen-v4
 ```
 
-> **Note:** `--listen-v4` forces the standalone HTTP server to bind IPv4 only. Use `--listen-v6` if your server is IPv6-only, or both flags together for dual-stack.
+> **Note:** `--listen-v4` forces the standalone HTTP server to bind IPv4 only. Use `--listen-v6` if your server is IPv6-only, or both flags for dual-stack.
 
-> **Note:** The `ipv4-tracker` and `ipv6-tracker` SANs are optional. They are useful for testing by pointing each subdomain to only an A record or only an AAAA record respectively.
+> **Note:** The `ipv4-tracker` and `ipv6-tracker` SANs are optional. Useful for testing by pointing each subdomain to only an A or AAAA record respectively.
 
 ### 3.4 Install the Certificate
 
-Create the destination directory and install the cert. Using `--fullchain-file` (not `--cert-file`) is critical — it ensures both the leaf certificate and intermediate CA are included, which is required by strict TLS clients such as qBittorrent.
+Using `--fullchain-file` (not `--cert-file`) is critical — it includes both the leaf certificate and intermediate CA, which is required by strict TLS clients such as qBittorrent.
 
 ```bash
 mkdir -p /etc/ssl/acme/tracker.example.net
@@ -100,13 +98,13 @@ This must return `2` or more. If it returns `1`, repeat step 3.4 — you have on
 
 ### 3.6 Set Up Root's Renewal Cron Job
 
-Because the cert was issued as root, the renewal must also run as root. Add a crontab entry:
+Because the cert was issued as root, the renewal must also run as root:
 
 ```bash
 sudo crontab -e
 ```
 
-Add the following line (adjust the path to acme.sh and the home directory):
+Add:
 
 ```
 16 5 * * * /home/<your-user>/.acme.sh/acme.sh --cron --home "/root/.acme.sh" > /dev/null
@@ -119,7 +117,7 @@ sudo -i
 /home/<your-user>/.acme.sh/acme.sh --cron --home "/root/.acme.sh"
 ```
 
-Expected output includes: `Skipping. Next renewal time is: ...` — this confirms the cron command is correct.
+Expected output includes: `Skipping. Next renewal time is: ...`
 
 ---
 
@@ -130,7 +128,9 @@ cp tracker.service /etc/systemd/system/
 systemctl daemon-reload
 ```
 
-Edit the `ExecStart` line in `/etc/systemd/system/tracker.service` to match your deployment. A typical production configuration using non-privileged ports:
+Edit the `ExecStart` line in `/etc/systemd/system/tracker.service` to match your deployment.
+
+### Tracker only (no registration mode)
 
 ```
 ExecStart=/usr/bin/python3 /opt/tracker/tracker_server.py \
@@ -151,20 +151,40 @@ ExecStart=/usr/bin/python3 /opt/tracker/tracker_server.py \
   --max-peers 200
 ```
 
+### With registration mode enabled
+
+```
+ExecStart=/usr/bin/python3 /opt/tracker/tracker_server.py \
+  --http-port 8080 \
+  --https-port 8443 \
+  --udp-port 6969 \
+  --web-https-port 443 \
+  --web-redirect-http \
+  --cert /etc/ssl/acme/tracker.example.net/fullchain.cer \
+  --key /etc/ssl/acme/tracker.example.net/tracker.example.net.key \
+  --ipv6 \
+  --redirect-http \
+  --domain tracker.example.net:8443 \
+  --tracker-id MyTracker \
+  --interval 1800 \
+  --min-interval 60 \
+  --peer-ttl 3600 \
+  --max-peers 200 \
+  --registration \
+  --super-user youradminusername \
+  --db /opt/tracker/tracker.db
+```
+
 ### The --domain Flag and HTTP Redirect
 
-When `--redirect-http` is enabled, the tracker responds to HTTP requests with a `301 Moved Permanently` redirect to HTTPS. The `--domain` flag controls the `Location` header in that redirect.
-
-**This is a common source of confusion.** The `--domain` value must include the port if you are not running on standard port 443. If you omit the port, clients will be redirected to port 443 and fail to connect.
+When `--redirect-http` is enabled, HTTP requests receive a `301 Moved Permanently` redirect to HTTPS. The `--domain` value must include the port if you are not running on standard port 443.
 
 | HTTPS port | Correct --domain value |
 |------------|----------------------|
 | 443 (standard) | `tracker.example.net` |
 | 8443 (non-standard) | `tracker.example.net:8443` |
 
-For example, with `--https-port 8443` you must pass `--domain tracker.example.net:8443` — otherwise an HTTP request to port 8080 will redirect to `https://tracker.example.net/` (port 443) instead of `https://tracker.example.net:8443/` and clients will get a connection refused error.
-
-> **Note:** When using non-privileged ports (8080/8443), the `AmbientCapabilities` and `CapabilityBoundingSet` lines in the service unit are not needed and can be removed. They are only required when binding to ports below 1024 (80/443) as a non-root user.
+> **Note:** When using non-privileged ports (8080/8443), the `AmbientCapabilities` and `CapabilityBoundingSet` lines in the service unit are not needed and can be removed. They are only required when binding to ports below 1024 as a non-root user.
 
 ---
 
@@ -178,8 +198,6 @@ systemctl start tracker
 ---
 
 ## 6. Verify
-
-Check service status and live logs:
 
 ```bash
 systemctl status tracker
@@ -213,28 +231,138 @@ Ensure the following ports are open for inbound TCP and UDP traffic:
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 80   | TCP      | HTTP (redirect to HTTPS) / Let's Encrypt renewal |
-| 443  | TCP      | HTTPS announce + scrape |
+| 80   | TCP      | HTTP redirect to HTTPS / Let's Encrypt renewal |
+| 443  | TCP      | HTTPS announce + scrape + management interface |
 | 6969 | UDP      | UDP announce + scrape |
 
 If running on non-standard ports (e.g. 8080/8443) adjust accordingly.
 
->  **Oracle Cloud note:** OCI blocks ports at two levels — the Security List in the VCN console AND iptables on the instance. Both must be configured.
+> **Oracle Cloud note:** OCI blocks ports at two levels — the Security List in the VCN console AND iptables on the instance. Both must be configured.
 
 ### Simplifying Firewall Management on Ubuntu (OCI)
 
-On Ubuntu instances in Oracle Cloud, the local iptables rules are managed by `netfilter-persistent`. If you prefer to rely solely on the OCI VCN Security List to control access (simpler for single-instance deployments), you can disable the local firewall entirely:
+On Ubuntu instances in Oracle Cloud, local iptables rules are managed by `netfilter-persistent`. To rely solely on the OCI VCN Security List (simpler for single-instance deployments):
 
 ```bash
 sudo systemctl stop netfilter-persistent
 sudo systemctl disable netfilter-persistent
 ```
 
-After doing this, all port access is controlled exclusively by the OCI Security List in the VCN console. Make sure your Security List rules are correct before disabling local filtering, as there will be no secondary layer of protection on the instance itself.
+Make sure your OCI Security List rules are correct before doing this — there will be no secondary layer of protection on the instance itself.
 
 ---
 
-## 8. Notable Server Options
+## 8. Memory Considerations and Swap
+
+The tracker is lightweight at idle, but **bulk torrent uploads are memory-intensive**. Parsing hundreds or thousands of `.torrent` files simultaneously requires Python to hold all the raw file data, parsed metadata, piece hash tables, and result strings in memory at once. On low-memory servers this can exhaust available RAM entirely, causing the kernel swap daemon (`kswapd0`) to spike, the server to freeze, and browser connections to time out.
+
+### How Much Memory Do You Need?
+
+As a rough guide, bulk uploading 1000–1200 `.torrent` files simultaneously can consume 400–500MB of RAM at peak. On a server with less than 1GB of total RAM (such as Oracle Cloud's free tier micro instance at ~954MB), this will exhaust available memory under normal operating conditions.
+
+Check your current memory situation:
+
+```bash
+free -h
+cat /proc/meminfo | grep -E "MemTotal|MemAvailable|SwapTotal"
+```
+
+If `MemAvailable` is below 200MB at idle, or `SwapTotal` is 0, you should add swap before doing any large bulk uploads.
+
+### Adding a Swapfile
+
+A 2GB swapfile gives the kernel a safety valve — instead of freezing when RAM is exhausted it pages to disk and recovers. This is strongly recommended on any server with less than 2GB of RAM.
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+Verify swap is active:
+
+```bash
+free -h
+```
+
+You should see `2.0Gi` under the Swap row. The `/etc/fstab` entry ensures it is re-enabled automatically after a reboot.
+
+> **Note:** With swap in place, large bulk uploads will still temporarily hit swap and be somewhat slower than on a higher-memory server, but they will complete successfully instead of timing out. The tracker and announce handling remain functional throughout.
+
+---
+
+## 9. Registration Mode — First-Run Setup
+
+When `--registration` is enabled the management interface is available at `https://your-domain/manage`.
+
+### 9.1 Set the Superuser Password
+
+On first run the superuser account is created automatically. To set its password, stop the service and run the server directly with `--super-user-password`:
+
+```bash
+systemctl stop tracker
+python3 /opt/tracker/tracker_server.py \
+  --registration \
+  --super-user youradminusername \
+  --super-user-password 'YourStrongP@ssw0rd!' \
+  --db /opt/tracker/tracker.db
+```
+
+The server sets the password and exits immediately. Then restart:
+
+```bash
+systemctl start tracker
+```
+
+### 9.2 Log In
+
+Visit `https://your-domain/manage` and log in with your superuser credentials.
+
+### 9.3 Initial Configuration
+
+After logging in, go to **Admin Panel → Settings** tab and configure:
+
+- **Password Complexity** — minimum length and character requirements
+- **Free Signup** — whether new users can self-register, or must use an invite or be created by an admin
+- **Reward System** — whether users earn credits for uploading torrents, and the threshold per credit
+- **Auto-Promote** — automatically promote Basic users to Standard after a set torrent count
+- **Open Tracker** — whether to accept announces for unregistered torrents
+- **Torrents Per Page** — pagination size for all torrent listings
+- **robots.txt** — content served to web crawlers
+
+Then go to the **Trackers** tab and add the tracker URLs to include in generated magnet links.
+
+### 9.4 Creating the First Users
+
+With free signup off (the default), go to **Admin Panel → Add User** to create accounts manually, or use the **Invites** tab to generate invite links and send them to your users.
+
+### 9.5 Database Location
+
+The database is created automatically at the path given by `--db`. The service unit's `ReadWritePaths` must include the directory containing the database file — the default service unit already includes `/opt/tracker`.
+
+SQLite WAL mode requires write access to the directory (not just the `.db` file), since WAL creates `-wal` and `-shm` sidecar files alongside the database.
+
+### 9.6 Resetting the Superuser Password
+
+If you are locked out of the superuser account:
+
+```bash
+systemctl stop tracker
+python3 /opt/tracker/tracker_server.py \
+  --registration \
+  --super-user youradminusername \
+  --super-user-password 'NewStrongP@ssw0rd!' \
+  --db /opt/tracker/tracker.db
+systemctl start tracker
+```
+
+---
+
+## 10. Notable Server Options
+
+### Core Tracker
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -256,51 +384,58 @@ After doing this, all port access is controlled exclusively by the OCI Security 
 | `--full-scrape` | off | Allow scrape with no info_hash (exposes all torrents) |
 | `--verbose` | off | Enable debug logging |
 
+### Registration Mode
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--registration` | off | Enable registration mode and the `/manage` web interface |
+| `--super-user` | — | Superuser username — required when `--registration` is set |
+| `--super-user-password` | — | Set or reset the superuser password (process exits after setting) |
+| `--db` | `/opt/tracker/tracker.db` | Path to the SQLite database file |
+| `--manage-port` | same as `--web-https-port` | HTTPS port for the management interface if different from stats port |
+| `--manage-http-port` | 80 | HTTP redirect port for management interface (0 to disable) |
+
 ---
 
-## 9. Auto-Deploy from GitHub
+## 11. Auto-Deploy from GitHub
 
 The included `deploy.sh` script polls GitHub every 5 minutes and automatically deploys updates when a push to `main` is detected. It performs a syntax check before deploying so a broken push cannot take down the running tracker.
 
-### 9.1 Prerequisites
+### 11.1 Prerequisites
 
-The server must have a local clone of the repository. Verify git access works before proceeding:
+The server must have a local clone of the repository:
 
 ```bash
 cd ~/wildkat-tracker
 git fetch origin main
 ```
 
-### 9.2 Make the Deploy Script Executable
-
-The script lives in the repository clone — no copying needed.
+### 11.2 Make the Deploy Script Executable
 
 ```bash
 chmod 750 ~/wildkat-tracker/deploy.sh
 ```
 
-### 9.3 Create the Log File
+### 11.3 Create the Log File
 
 ```bash
 sudo touch /var/log/tracker-deploy.log
 sudo chown ubuntu:ubuntu /var/log/tracker-deploy.log
 ```
 
-### 9.4 Wire Up the Cron Job
-
-Add the cron job to the `ubuntu` user's crontab:
+### 11.4 Wire Up the Cron Job
 
 ```bash
 crontab -e
 ```
 
-Add this line:
+Add:
 
 ```
 */5 * * * * /home/ubuntu/wildkat-tracker/deploy.sh >> /var/log/tracker-deploy.log 2>&1
 ```
 
-### 9.5 Verify
+### 11.5 Verify
 
 Watch the log after a push is made to GitHub:
 
@@ -311,21 +446,19 @@ tail -f /var/log/tracker-deploy.log
 A successful deploy looks like:
 
 ```
-[2026-02-22 00:20:01] Change detected on main
-[2026-02-22 00:20:01]   local:  be658e3d...
-[2026-02-22 00:20:01]   remote: c5e91ea6...
-[2026-02-22 00:20:01] Pulling...
-[2026-02-22 00:20:01] Updated to c5e91ea6...
-[2026-02-22 00:20:01] Deploying tracker_server.py → /opt/tracker/tracker_server.py
-[2026-02-22 00:20:01] Restarting tracker...
-[2026-02-22 00:20:01] tracker is running — deploy successful
+[2026-02-24 00:20:01] Change detected on main
+[2026-02-24 00:20:01]   local:  be658e3d...
+[2026-02-24 00:20:01]   remote: c5e91ea6...
+[2026-02-24 00:20:01] Pulling...
+[2026-02-24 00:20:01] Updated to c5e91ea6...
+[2026-02-24 00:20:01] Deploying tracker_server.py → /opt/tracker/tracker_server.py
+[2026-02-24 00:20:01] Restarting tracker...
+[2026-02-24 00:20:01] tracker is running — deploy successful
 ```
 
-When no changes are detected the script exits silently — the log will only contain entries when a deploy actually occurred.
+When no changes are detected the script exits silently.
 
-### 9.6 Deploy Script Configuration
-
-The variables at the top of `deploy.sh` can be adjusted if your layout differs:
+### 11.6 Deploy Script Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -337,9 +470,7 @@ The variables at the top of `deploy.sh` can be adjusted if your layout differs:
 
 ---
 
-## 10. Manual Update
-
-To deploy a new version of the tracker script without the auto-deploy system:
+## 12. Manual Update
 
 ```bash
 sudo cp tracker_server.py /opt/tracker/

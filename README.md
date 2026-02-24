@@ -19,6 +19,41 @@ A lightweight, self-hosted BitTorrent tracker with full HTTP, HTTPS, and UDP sup
 - **systemd service unit** — hardened with `CAP_NET_BIND_SERVICE`, `NoNewPrivileges`, `ProtectSystem`, and related security directives
 - **No external dependencies** — pure Python 3.10+ standard library only
 
+### Registration Mode
+
+Enable with `--registration`. Adds a full user and torrent management web interface at `/manage`.
+
+- **Four-tier role system** — Super, Admin, Standard, Basic — with granular permission boundaries at each level
+- **Superuser account** — designated at startup via `--super-user`; cannot be deleted or demoted; full unrestricted access
+- **User registration** — open signup (configurable), invite-only via invite codes, or admin-created accounts
+- **Invite code system** — admins generate single-use invite URLs from the Invites tab; users can spend reward credits to generate their own; consumed invites record who was invited and by whom
+- **Reward/credits system** — users earn 1 credit per N torrents uploaded (threshold configurable, default 200); credits are spent to generate invite links; admins can manually adjust any user's credit balance; recurring — credits keep accumulating at every threshold milestone
+- **Session management** — 48-hour HTTPS-only sessions with secure cookie tokens
+- **CSRF protection** — HMAC-SHA256 tokens bound to session, persisted across server restarts, refreshed on every page load
+- **Torrent registry** — upload `.torrent` files to register info hashes; bulk upload of hundreds of files supported
+- **Token search** — queries are split into tokens matched independently against torrent names; dots, dashes, and underscores treated as word separators so `rental family` matches `Rental.Family.2025.2160p.WEB`
+- **Torrent detail pages** — files, sizes, piece count, piece length, privacy flag, uploader
+- **Magnet link generation** — configurable tracker list with per-tracker enable/disable
+- **IP allowlist** — pin accounts to known IP addresses; build allowlist directly from login history
+- **Admin panel** — manage users, torrents, invite codes, settings, event log; all in one interface
+- **Auto-promotion** — optionally promote Basic users to Standard after a configurable torrent count
+- **Open tracker mode** — toggle in settings to accept announces for any info hash without requiring torrent registration; takes effect immediately without restart
+- **Public profile pages** — Standard and above can view other users' profiles and torrent lists
+- **Password complexity enforcement** — minimum length, uppercase, lowercase, digit, and symbol requirements; all configurable
+- **Brute-force lockout** — accounts locked after 5 consecutive failed login attempts
+- **Danger zone** — bulk-delete all torrents globally, all torrents per user, or all non-super user accounts; all gated by confirmation dialogs
+- **robots.txt** — configurable via admin settings
+- **SQLite backend** — WAL mode, per-thread connections, 10-second busy timeout with retry logic
+
+### Security
+
+- CSRF protection on all state-changing requests (HMAC-SHA256, session-bound, restart-persistent)
+- All user content HTML-escaped before output — no XSS surface
+- PBKDF2-HMAC-SHA256 password hashing, 260,000 iterations, unique salt per account
+- Session cookies: `HttpOnly; SameSite=Strict; Secure`
+- All database queries parameterized — no SQL injection surface
+- No shell execution (`os.system`, `subprocess`, `eval`) anywhere in the codebase
+
 ### Query Tool (`tracker_query.py`)
 
 - Tests HTTP, HTTPS, and UDP trackers
@@ -40,7 +75,8 @@ A lightweight, self-hosted BitTorrent tracker with full HTTP, HTTPS, and UDP sup
 | `tracker_query.py` | The query and diagnostic tool |
 | `tracker.service` | systemd service unit |
 | `deploy.sh` | Auto-deploy script — polls GitHub and deploys updates |
-| `INSTALL.md` | Full installation guide |
+| `INSTALL.md` | Full installation guide including TLS and registration mode setup |
+| `USER_GUIDE.md` | End-user and admin guide for registration mode |
 
 ## Quick Start
 
@@ -68,6 +104,25 @@ python3 tracker_server.py \
   --domain tracker.example.net:8443 \
   --tracker-id MyTracker
 ```
+
+### Run with registration mode enabled
+
+```bash
+python3 tracker_server.py \
+  --https-port 8443 \
+  --udp-port 6969 \
+  --web-https-port 443 \
+  --cert /etc/ssl/acme/tracker.example.net/fullchain.cer \
+  --key  /etc/ssl/acme/tracker.example.net/tracker.example.net.key \
+  --ipv6 \
+  --redirect-http \
+  --domain tracker.example.net:8443 \
+  --registration \
+  --super-user admin \
+  --db /opt/tracker/tracker.db
+```
+
+Then visit `https://tracker.example.net/manage` to log in.
 
 ### Query a tracker
 
@@ -100,9 +155,11 @@ python3 tracker_server.py \
 
 ## Installation
 
-See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup with acme.sh, systemd service configuration, and Oracle Cloud firewall notes.
+See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup with acme.sh, systemd service configuration, registration mode first-run, and Oracle Cloud firewall notes.
 
 ## Server Options
+
+### Core Tracker
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -126,6 +183,17 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 | `--max-scrape-hashes` | 5 | Maximum info_hashes allowed per scrape request |
 | `--full-scrape` | off | Allow scrape with no info_hash |
 | `--verbose` | off | Enable debug logging |
+
+### Registration Mode
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--registration` | off | Enable registration mode and the `/manage` web interface |
+| `--super-user` | — | Superuser username (required with `--registration`) |
+| `--super-user-password` | — | Set or reset the superuser password (service must be stopped) |
+| `--db` | `/opt/tracker/tracker.db` | Path to SQLite database |
+| `--manage-port` | same as `--web-https-port` | Management interface HTTPS port if different from stats port |
+| `--manage-http-port` | 80 | Management HTTP redirect port (0 to disable) |
 
 ## Requirements
 
