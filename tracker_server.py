@@ -4369,7 +4369,7 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
         torrent_rows = f'<tr><td colspan="{cols}" class="empty">No torrents registered yet</td></tr>'
 
     admin_link = (
-        '<a href="/manage/admin" class="dash-nav-btn">&#9881; Admin Panel</a>'
+        '<a href="/manage/admin" class="dash-nav-btn">&#9881;&#65039; Admin Panel</a>'
         if is_admin else '')
     search_link = '<a href="/manage/search" class="dash-nav-btn">&#128269; Search</a>'
 
