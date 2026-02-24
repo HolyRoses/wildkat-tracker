@@ -615,7 +615,7 @@ def _pagination_html(current_page: int, total_pages: int, base_url: str,
         prev_p = p
 
     # Prev / Next arrows
-    prev_btn = (f'<a href="{page_url(current_page-1)}" style="{btn}">&#8592;</a> '
+    prev_btn = (f'<a href="{page_url(current_page-1)}" style="{btn}">&#10094;</a> '
                 if current_page > 1 else '')
     next_btn = (f' <a href="{page_url(current_page+1)}" style="{btn}">&#8594;</a>'
                 if current_page < total_pages else '')
@@ -2018,7 +2018,7 @@ def generate_stats_html(snap: dict, web_config: dict, show_manage: bool = False)
                   'padding:6px 16px;border-radius:6px;border:1px solid var(--border);'
                   'color:var(--muted);text-decoration:none;margin-left:8px')
     if show_manage:
-        manage_btn = f'<div style="text-align:right;margin-bottom:8px"><a href="/manage/dashboard" style="{_btn_style}">&#9881; Manage</a></div>'
+        manage_btn = f'<div style="text-align:right;margin-bottom:8px"><a href="/manage/dashboard" style="{_btn_style}">&#9881;&#65039; Manage</a></div>'
     elif web_config.get('free_signup'):
         manage_btn = f'<div style="text-align:right;margin-bottom:8px"><a href="/manage/signup" style="{_btn_style}">Sign Up</a></div>'
     else:
@@ -4324,7 +4324,7 @@ def _render_search(user, torrents: list, query: str = '',
 
     body = f'''
   <div class="page-title">Search Torrents</div>
-  <div class="page-sub"><a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#8592; Dashboard</a></div>
+  <div class="page-sub"><a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a></div>
   <div class="card" style="margin-bottom:0">
     <form method="GET" action="/manage/search" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
       <div class="form-group" style="flex:1;margin:0;min-width:240px">
@@ -4821,7 +4821,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
 
     body = f'''
   <div class="page-title">Admin Panel</div>
-  <div class="page-sub">Manage torrents and users &nbsp;·&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none;font-size:0.85rem">← Dashboard</a></div>
+  <div class="page-sub">Manage torrents and users &nbsp;·&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none;font-size:0.85rem">&#10094; Dashboard</a></div>
   {_autotab_js}
   <div class="tabs">
     <button class="tab active" onclick="showTab('torrents',this)">Torrents</button>
@@ -4986,9 +4986,9 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard') -> st
     body = f'''
   <div class="page-title">{t["name"]}</div>
   <div class="page-sub">
-    <a href="{back_url}" style="color:var(--muted);text-decoration:none">&#8592; Back</a>
+    <a href="{back_url}" style="color:var(--muted);text-decoration:none">&#10094; Back</a>
     &nbsp;&#183;&nbsp;
-    <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#8592; Dashboard</a>
+    <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
   </div>
 
   <div class="two-col" style="margin-bottom:0">
@@ -5045,7 +5045,7 @@ def _render_public_profile(viewer, target_user, torrents: list,
     admin_link = ''
     if vrole in ('super', 'admin'):
         admin_link = (f' &nbsp;&#183;&nbsp; <a href="/manage/admin/user/{uname_h}" '
-                      f'style="color:var(--muted);text-decoration:none">&#9881; Admin View</a>')
+                      f'style="color:var(--muted);text-decoration:none">&#9881;&#65039; Admin View</a>')
 
     role_badge = f'<span class="badge badge-{trole}">{trole.upper()}</span>'
 
@@ -5068,7 +5068,7 @@ def _render_public_profile(viewer, target_user, torrents: list,
   </div>
   <div class="page-sub" style="margin-bottom:20px">
     Public profile
-    &nbsp;&#183;&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#8592; Dashboard</a>
+    &nbsp;&#183;&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
     {admin_link}
   </div>
 
@@ -5290,11 +5290,11 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     )
 
     # ── Nav ───────────────────────────────────────────────────
-    nav_links = ' &nbsp;&#183;&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#8592; Dashboard</a>'
+    nav_links = ' &nbsp;&#183;&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>'
     if not is_own_profile:
         nav_links = (
             ' &nbsp;&#183;&nbsp; <a href="/manage/admin" style="color:var(--muted);text-decoration:none">'
-            + '&#8592; Admin Panel</a>'
+            + '&#10094; Admin Panel</a>'
             + nav_links
         )
 
