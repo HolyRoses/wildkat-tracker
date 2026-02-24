@@ -4095,10 +4095,12 @@ function copyInvite(btn, path) {
     btn.innerHTML = '&#10003; Copied!';
     btn.style.borderColor = 'var(--green)';
     btn.style.color = 'var(--green)';
+    btn.style.background = 'transparent';
     setTimeout(function() {
       btn.innerHTML = orig;
       btn.style.borderColor = '';
       btn.style.color = '';
+      btn.style.background = '';
     }, 2000);
   }).catch(function() {
     prompt('Copy this invite URL:', url);
@@ -4110,10 +4112,12 @@ function copyMagnet(btn, url) {
     btn.innerHTML = '&#10003; Copied!';
     btn.style.borderColor = 'var(--green)';
     btn.style.color = 'var(--green)';
+    btn.style.background = 'transparent';
     setTimeout(function() {
       btn.innerHTML = orig;
       btn.style.borderColor = '';
       btn.style.color = '';
+      btn.style.background = '';
     }, 2000);
   }).catch(function() {
     prompt('Copy this magnet link:', url);
