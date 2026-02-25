@@ -11,15 +11,17 @@ This guide covers the registration mode web interface at `/manage`. It is intend
 3. [The Dashboard](#3-the-dashboard)
 4. [Registering Torrents](#4-registering-torrents)
 5. [Torrent Detail Pages](#5-torrent-detail-pages)
-6. [Your Profile](#6-your-profile)
-7. [User Profiles](#7-user-profiles)
-8. [Searching Torrents](#8-searching-torrents)
-9. [Admin Panel](#9-admin-panel)
-10. [User Management (Admin)](#10-user-management-admin)
-11. [IP Allowlist and IP Lock](#11-ip-allowlist-and-ip-lock)
-12. [Settings (Admin)](#12-settings-admin)
-13. [Invite Codes](#13-invite-codes)
-14. [Passwords](#14-passwords)
+6. [Comments and Notifications](#6-comments-and-notifications)
+7. [Your Profile](#7-your-profile)
+8. [User Profiles](#8-user-profiles)
+9. [Searching Torrents](#9-searching-torrents)
+10. [Admin Panel](#10-admin-panel)
+11. [User Management (Admin)](#11-user-management-admin)
+12. [IP Allowlist and IP Lock](#12-ip-allowlist-and-ip-lock)
+13. [Settings (Admin)](#13-settings-admin)
+14. [Invite Codes](#14-invite-codes)
+15. [Database Backup and Restore](#15-database-backup-and-restore)
+16. [Passwords](#16-passwords)
 
 ---
 
@@ -60,7 +62,7 @@ There are three ways to get an account:
 
 ### Password Requirements
 
-Password requirements are set by the admin and displayed on the registration and password-change forms. The exact rules are shown in the form itself.
+Password requirements are set by the admin and displayed on the registration and password-change forms. The exact rules are shown in the form itself. All password fields include a **show/hide eye button** — click it to reveal what you are typing to confirm there are no typos.
 
 ---
 
@@ -127,26 +129,69 @@ The **Copy Magnet Link** button builds a magnet URI from the info hash, torrent 
 
 The **Delete** button appears if you own the torrent or are an Admin/Super.
 
+If comments are enabled site-wide, a **Comments** section appears below the file list. See [Section 6](#6-comments-and-notifications).
+
 ---
 
-## 6. Your Profile
+## 6. Comments and Notifications
+
+Comments can be left on any torrent detail page when the feature is enabled by an administrator. If comments are disabled site-wide, the comments section and the notification bell are hidden entirely — there is no visible trace of the system.
+
+### Posting a Comment
+
+Type your comment in the text area at the bottom of the torrent detail page and click **Post Comment**. Comments support **@mentions** — type `@username` anywhere in your text to notify that user.
+
+- You can only mention users who exist on the tracker. If you mention a username that does not exist, the comment is still posted but a modal alert appears warning you which @mentions were not delivered.
+- You cannot mention yourself.
+
+### Replies
+
+Click **Reply** on any comment to post a threaded reply. Replies are visually indented below their parent comment. Threading is recursive — you can reply to replies. Each level is indented to show the hierarchy.
+
+### Editing Comments
+
+Click **Edit** on one of your own comments to modify it. The edit box replaces the comment inline. @mention validation runs on edits as well — unknown mentions trigger the same modal warning.
+
+### Deleting Comments
+
+Click **Delete** on one of your own comments. If the comment has no replies it is removed immediately. If it has replies, a `[deleted]` placeholder is shown in its place to preserve the thread structure.
+
+Admins and Super can delete any comment regardless of ownership.
+
+### Comment Locking
+
+Admins and Super can **lock** comments on any torrent. When locked, no new comments or replies can be posted by anyone. A lock badge appears in the comment section header. Existing comments remain visible. Locking and unlocking is toggled from the **Actions** card on the torrent detail page.
+
+### Deleting All Comments on a Torrent
+
+Admins and Super have a **🗑 Delete All Comments** button in the Actions card on the torrent detail page. This permanently removes every comment and notification associated with that torrent. This cannot be undone.
+
+### The Notification Bell
+
+When someone replies to your comment or @mentions you, a notification is created and the 🔔 bell icon in the navigation bar shows a count badge.
+
+**Bell dropdown** — click the bell to see your 5 most recent unread notifications. Each item shows who acted, what they did, and which torrent it was on. Click any item to mark it read and jump to the comment. A **View all notifications** link at the bottom opens the full page.
+
+**Notifications page** (`/manage/notifications`) — shows all your notifications, read and unread. Unread items are highlighted. Click the torrent name or the **View →** button on any row to mark it read and navigate to the comment. Use **✓ Mark all read** to clear everything at once.
+
+The bell is hidden from the navigation bar when the comments and notifications system is disabled by an administrator.
+
+---
+
+## 7. Your Profile
 
 Click your **username** in the top navigation bar to go to your profile page.
 
 Your profile shows:
 
-- Your role badge
+- Your role badge and status badges (locked, disabled) if applicable
 - **Account Details** — join date, created-by (shows "Invited by username" if you joined via invite), login count, last login, last password change, failed attempts, and your current **Credits** balance
+- **Actions card** — contains a **Change Password** button that takes you to the password change page
 - Login history (Superuser view only)
 - IP Allowlist — if your account has IP-locking enabled
-- **Invite Codes** — your pending and consumed invite codes (see below)
+- **Invite Codes** — your pending and consumed invite codes
 - All your registered torrents with pagination
 - **Danger Zone** — delete all your torrents at once (permanent)
-
-From your profile you can also:
-
-- **Change your password** — via the Change Password button
-- **Delete individual torrents** — click Delete on any torrent row
 
 ### Credits and Invite Generation
 
@@ -154,13 +199,13 @@ If the reward system is enabled, you earn credits by uploading torrents. Once yo
 
 Your current credit balance is shown in the **Account Details** card on your profile.
 
-The **Invite Codes** card on your profile always shows your invite history. If you have credits available, a **Generate Invite Link** button appears showing your remaining balance. Clicking it spends 1 credit and creates a new invite code. If you have no credits the button is visible but disabled.
+The **Invite Codes** card shows your invite history. If you have credits available, a **Generate Invite Link** button appears. Clicking it spends 1 credit and creates a new invite code. If you have no credits the button is shown disabled.
 
-Each invite code in the list has a **Copy URL** button — click it to copy the full invite link to your clipboard. Share this URL with the person you want to invite. Once they register with it the code is marked consumed and the entry shows who used it.
+Each invite code in the list has a **Copy URL** button to copy the full invite link to your clipboard. Once someone registers with it the code is marked consumed and the entry shows who used it.
 
 ---
 
-## 7. User Profiles
+## 8. User Profiles
 
 Standard, Admin, and Super users can view public profiles of other users by clicking their username in any torrent listing or by navigating to `/manage/user/{username}`.
 
@@ -179,7 +224,7 @@ If you are an Admin or Super, a small **⚙ Admin View** link appears on the pub
 
 ---
 
-## 8. Searching Torrents
+## 9. Searching Torrents
 
 Click the **🔍 Search** button on the Dashboard or navigate to `/manage/search`.
 
@@ -199,11 +244,11 @@ An additional **Filter this page** box on the results page lets you narrow the c
 
 ---
 
-## 9. Admin Panel
+## 10. Admin Panel
 
 Accessible to Admin and Super only via the **⚙ Admin Panel** button on the Dashboard.
 
-The Admin Panel has seven tabs:
+The Admin Panel has nine tabs:
 
 ### Torrents Tab
 
@@ -211,41 +256,58 @@ All registered torrents across all users, paginated. Includes the owner column. 
 
 ### Users Tab
 
-All registered accounts. Shows each user's role badges, creation date, login count, and last login. Click a username to go to the full user management page for that account.
+All registered accounts with role badges, creation date, login count, and last login. Click a username to open their full management page. Each row includes a **Set Password** button that opens the dedicated password-change page for that user.
 
 ### Add User Tab
 
-Create a new account directly by specifying username, password, and role. Use this when you want to create an account without sending an invite link.
+Create a new account by specifying username, password, and role (Basic, Standard, or Admin). Use this when you want to create an account without sending an invite link.
+
+If the password does not meet the site's complexity requirements, an error message explains exactly which rules failed. The tab stays open and the username you typed is pre-filled so you only need to correct the password.
 
 ### Trackers Tab
 
-Manage the tracker URLs embedded in generated magnet links. Each tracker can be enabled or disabled individually. You can also add new tracker URLs or remove existing ones.
+Manage the tracker URLs embedded in generated magnet links. Each tracker can be individually enabled or disabled. Add new tracker URLs or remove existing ones.
 
 ### Settings Tab
 
-See [Section 12](#12-settings-admin) below.
+See [Section 13](#13-settings-admin).
+
+### Database Tab
+
+See [Section 15](#15-database-backup-and-restore). Visible to Super only.
 
 ### Invites Tab
 
-See [Section 13](#13-invite-codes) below. Visible to Admin and Super.
+See [Section 14](#14-invite-codes). Visible to Admin and Super.
 
 ### Danger Tab
 
-See the Danger Zone operations in [Section 10](#10-user-management-admin). Visible to Super only.
+See [Section 11](#11-user-management-admin) — Super-Only Danger Operations. Visible to Super only.
 
 ### Event Log Tab
 
-A log of significant actions — user creation, torrent registration, deletions, password changes, IP lock operations, settings changes, credit adjustments, invite creation and consumption, and more. Each event shows a timestamp, the actor who performed it, and a description. The 100 most recent events are shown.
+A log of significant actions — user creation, torrent registration, deletions, password changes, IP lock operations, settings changes, credit adjustments, invite creation and consumption, comment actions, database backup and restore, and system wipe. Each entry shows a timestamp, the actor who performed it, and a description. The 100 most recent events are shown.
 
 ---
 
-## 10. User Management (Admin)
+## 11. User Management (Admin)
 
 Click any username in the Users tab to open their management page.
 
 ### Account Information
 
-Shows all account fields including join date, created-by (displayed as "Invited by **username**" when the account was created via invite), last login, login count, failed attempts, last password change, and current credits balance.
+Shows all account fields: join date, created-by (displayed as "Invited by **username**" when the account was created via invite), last login, login count, failed attempts, last password change, and current credits balance.
+
+### Actions Card
+
+The **Actions** card contains all controls for that account:
+
+- **Set Password** — opens the dedicated password-change page for this user
+- **Unlock Account** — appears only when the account is locked after failed login attempts
+- **Disable / Enable** — manually block or unblock an account
+- **Promote / Demote** — role management buttons
+- **Delete User** — permanently removes the account
+- **+ Credit / − Credit** — manually adjust the user's credit balance
 
 ### Role Management
 
@@ -253,20 +315,12 @@ Admins can promote or demote Standard and Basic users. Superusers can also promo
 
 ### Locking and Disabling
 
-- **Locked** — set automatically after 5 consecutive failed login attempts. Cannot log in until an admin clicks **Unlock Account**. The failed attempts counter resets when the password is changed or the account is unlocked.
-- **Disable / Enable** — a manual block that admins can toggle at any time. A disabled account cannot log in.
-
-### Password Reset
-
-Admins can set a new password for any account below their own role level.
-
-### Credit Adjustment
-
-The **Actions** card includes **+ Credit** and **− Credit** buttons. Use these to manually add or remove credits from a user's balance. The balance is floored at zero. All adjustments are logged in the Event Log.
+- **Locked** — set automatically after 5 consecutive failed login attempts. An admin must click **Unlock Account** to restore access. The failed attempts counter resets on unlock or password change.
+- **Disable / Enable** — a manual block admins can toggle at any time. A disabled account cannot log in regardless of password.
 
 ### IP Allowlist
 
-See [Section 11](#11-ip-allowlist-and-ip-lock) below.
+See [Section 12](#12-ip-allowlist-and-ip-lock).
 
 ### Torrent List
 
@@ -274,30 +328,42 @@ All torrents registered by this user, paginated. Admins and Super can delete ind
 
 ### Danger Zone
 
-Permanently deletes all torrents registered by this user in a single operation. Only visible to the Superuser, or to the user on their own profile. Shows an accurate total count before confirmation.
+Permanently deletes all torrents registered by this user in a single operation. Only visible to the Superuser, or to the user themselves on their own profile. Shows an accurate count before the confirmation prompt.
+
+### Super-Only Danger Operations
+
+The **Danger** tab in the Admin Panel contains four operations, only accessible to the Superuser:
+
+- **Delete All Users** — permanently deletes every account except the super account. All sessions are invalidated.
+- **Delete All Torrents** — permanently removes every registered torrent from the tracker.
+- **Delete All Comments & Notifications** — permanently removes every comment and notification across the entire system. Torrent lock states are preserved.
+- **☢ System Wipe** — wipes all users (except the super account), all torrents, all comments, all notifications, all invite codes, all sessions, and the entire event log. Returns the tracker to near-factory state.
+
+The System Wipe requires a two-step typed confirmation to prevent accidents:
+
+1. A modal asks you to type `SYSTEMWIPE` exactly — the Continue button stays disabled until the text matches precisely.
+2. A second modal gives you one final chance to cancel before anything is deleted.
 
 ---
 
-## 11. IP Allowlist and IP Lock
+## 12. IP Allowlist and IP Lock
 
-The IP allowlist restricts a user account to only log in from specific IP addresses.
+The IP allowlist restricts an account to only log in from specific IP addresses.
 
 ### Building the Allowlist from Login History
 
-On any user's management page, the **Recent Login IPs** card shows IP addresses from that user's recent logins with timestamps and checkboxes.
-
-To add one or more IPs to the allowlist:
+On a user's management page, the **Recent Login IPs** card shows IP addresses from their recent logins with timestamps and checkboxes.
 
 1. Check the boxes next to the IPs you want to allow
 2. Click **🔒 IP Lock Selected**
 
 ### Manual Entry
 
-You can also manually add any IP address by typing it into the input field and clicking **Add**.
+Type any IP address into the input field and click **Add** to add it directly without requiring a prior login from that address.
 
 ### Removing Entries
 
-Click **Remove** next to any entry to remove it. Click **Clear All** to remove all entries and disable IP locking for that account.
+Click **Remove** next to any entry to remove it individually. Click **Clear All** to remove all entries and disable IP locking for that account.
 
 ### IPv6 Addresses
 
@@ -305,7 +371,7 @@ Full IPv6 addresses are supported. IPv4 and IPv6 addresses are treated separatel
 
 ---
 
-## 12. Settings (Admin)
+## 13. Settings (Admin)
 
 The **Settings** tab controls site-wide behaviour. All changes take effect immediately without restarting the server.
 
@@ -315,15 +381,15 @@ Controls what passwords are accepted: minimum length (default: 12), require uppe
 
 ### Open Tracker
 
-When **on**, the tracker accepts BitTorrent announces for any info hash — not just torrents registered in the database. User accounts and the web interface are unaffected. Useful for running a semi-open tracker while still managing user access to the web interface. Default: off.
-
-### Free Signup
-
-When **on**, anyone can register a new account via the login page. When **off**, new users can only join via invite link or admin-created account. Default: off.
+When **on**, the tracker accepts BitTorrent announces for any info hash — not just torrents registered in the database. User accounts and the web interface are unaffected. Default: off.
 
 ### Reward System
 
-When **on**, users automatically earn 1 credit for every N torrents they upload. The threshold N is configurable (default: 200). Credits are recurring — a user earns a credit at 200 uploads, another at 400, another at 600, and so on. Credits can be spent to generate invite links. Default: off.
+When **on**, users automatically earn 1 credit for every N torrents they upload. The threshold N is configurable (default: 200). Credits accumulate and can be spent to generate invite links. Default: off.
+
+### Free Signup
+
+When **on**, anyone can register a new account via the login page without an invite. Default: off.
 
 ### Torrents Per Page
 
@@ -331,68 +397,106 @@ Controls how many torrents are shown per page on the Dashboard, Admin Panel, use
 
 ### Auto-Promote
 
-When **on**, Basic users are automatically promoted to Standard when they have registered at least the configured number of torrents. The threshold is configurable (default: 25 torrents).
+When **on**, Basic users are automatically promoted to Standard once they have registered at least the configured number of torrents. Default threshold: 25 torrents.
+
+### Comments & Notifications
+
+When **on**, the full comment and notification system is active on all torrent detail pages and the notification bell appears in the navigation bar. When **off**, the comments section is completely removed from all torrent pages and the bell disappears from the navbar. Default: on.
 
 ### robots.txt
 
-The content returned at `/robots.txt`. By default, search engine crawlers are told to stay away from `/announce`, `/scrape`, and `/manage`. Edit here if you want different behaviour.
+The content returned at `/robots.txt`. By default, search engine crawlers are instructed to avoid `/announce`, `/scrape`, and `/manage`. Edit here to change crawl behaviour.
 
 ---
 
-## 13. Invite Codes
+## 14. Invite Codes
 
 Invite codes allow controlled onboarding of new users without enabling open free signup.
 
 ### Admin — Invites Tab
 
-The **Invites** tab in the Admin Panel (visible to Admin and Super) shows a table of all invite codes across all users:
+The **Invites** tab (visible to Admin and Super) shows all invite codes across all users:
 
 | Column | Description |
 |--------|-------------|
-| Code | Truncated token — enough to identify it |
-| Created By | The admin or user who generated it — clickable link to their profile |
+| Code | Truncated token |
+| Created By | Who generated it — clickable link |
 | Created At | When it was created |
-| Status | **Pending** (unused) or **Used by username** with date — username is a clickable link |
-| Actions | Copy URL button and Delete button (pending codes only) |
+| Status | **Pending** or **Used by username** with date — username is a link |
+| Actions | Copy URL and Delete (pending only) |
 
-To generate a new invite code as an admin, click **+ Generate Invite Code** at the top of the tab. The code appears in the table immediately. Use the **Copy URL** button to get the full invite link to share.
-
-To revoke an unused code, click **Delete** on its row.
+Click **+ Generate Invite Code** to create a new code. Use **Copy URL** to get the shareable link. Click **Delete** to revoke an unused code.
 
 ### User — Generating Invites with Credits
 
-If the reward system is enabled and you have credits, the **Invite Codes** card on your profile shows a **Generate Invite Link** button with your remaining balance. Clicking it spends 1 credit and creates a new invite code.
+If the reward system is enabled and you have credits, the **Invite Codes** card on your profile shows a **Generate Invite Link** button. Clicking it spends 1 credit and creates a new code. With no credits the button is shown but disabled.
 
-If you have no credits the button is shown disabled — it does nothing when clicked. Credits are earned by uploading torrents once the reward system is enabled by an admin.
-
-Your invite history is always visible in the Invite Codes card regardless of your current credit balance, so you can see which of your past invites have been used and by whom.
+Your invite history is always visible regardless of credit balance — you can always see which invites you have generated and who consumed them.
 
 ### The Invite Link
-
-An invite URL looks like:
 
 ```
 https://tracker.example.net/manage/invite/abc123def456...
 ```
 
-Opening this URL shows a registration form with a note showing who invited you. The invite is single-use — once someone completes registration with it, the code is consumed and cannot be reused. If the link has already been used or deleted, an "Invalid Invite" page is shown.
+Opening the URL shows a registration form noting who invited you. The link is single-use — once someone registers with it the code is consumed and cannot be reused. An "Invalid Invite" page is shown if the link has expired or been deleted.
 
-Accounts created via invite show "Invited by **username**" in their Account Details rather than a plain created-by value.
+Accounts created via invite show "Invited by **username**" in their Account Details.
 
 ---
 
-## 14. Passwords
+## 15. Database Backup and Restore
+
+The **Database** tab in the Admin Panel (Super only) provides live backup and restore without downtime.
+
+### Creating a Backup
+
+Click **⬇ Download Backup**. The server creates a consistent snapshot using SQLite's online backup API and downloads it as:
+
+```
+tracker-backup-YYYYMMDD-HHMMSS.db.gz
+```
+
+The current database size is shown on the card. The download is logged in the Event Log.
+
+### Restoring from a Backup
+
+Click **⬆ Restore from Backup**, choose a `.db.gz` file, and confirm. Before touching the live database the server:
+
+1. Confirms the file is valid gzip
+2. Confirms the decompressed content is a real SQLite database
+3. Runs an integrity check on the backup
+
+If all checks pass, the live database file is replaced on disk, WAL and SHM sidecar files are cleared, and all active connections across all server threads reopen automatically. You are redirected to the Database tab with a success message.
+
+> **Important:** Take a fresh backup before restoring. The restore overwrites all current data immediately and cannot be undone.
+
+---
+
+## 16. Passwords
+
+### Showing and Hiding Password Input
+
+All password fields on the site include an **eye button** (👁) on the right edge of the input. Click it to reveal what you are typing in plain text — useful for confirming there are no typos before submitting. Click again to hide. The button does not affect keyboard tab order and cannot accidentally submit the form.
+
+This applies to: the invite and free signup forms, the Change Password page, the Set Password (admin) page, and the Add User form in the Admin Panel.
 
 ### Changing Your Own Password
 
-From your profile page, click **Change Password**. Enter your current password and the new password twice to confirm. The new password must meet the site's complexity requirements.
+From your profile page, click **Change Password**. Enter your current password and the new password twice to confirm. The new password must meet the site's complexity requirements, which are displayed on the form. On success you are returned to the Dashboard.
+
+### Admin Setting Another User's Password
+
+From a user's management page (Actions card) or the Users tab in the Admin Panel, click **Set Password**. This opens a dedicated page — *Set Password — Changing password for [username]* — where you enter the new password twice. No knowledge of the user's current password is required. The same complexity requirements apply and are shown on the form.
+
+All password changes are logged in the Event Log with the actor and the target account.
 
 ### Forgotten Password / Lockout
 
-There is no self-service password reset — contact an admin or superuser. They can set a new password for your account from the user management page.
+There is no self-service password reset — contact an admin or superuser. They can set a new password from the user management page without needing to know the current password.
 
-If the **superuser** is locked out, the password must be reset from the command line on the server (see INSTALL.md section 8.5).
+If the **superuser** is locked out, the password must be reset from the command line on the server (see INSTALL.md).
 
 ### Password Security
 
-Passwords are hashed using PBKDF2-HMAC-SHA256 with 260,000 iterations and a unique random salt per account. Plain-text passwords are never stored or logged. Session tokens are cryptographically random 32-byte hex strings stored only in the browser cookie and the database (never logged).
+Passwords are hashed using PBKDF2-HMAC-SHA256 with 260,000 iterations and a unique random salt per account. Plain-text passwords are never stored or logged. Session tokens are cryptographically random 32-byte hex strings stored only in the browser cookie and the database — never logged anywhere.

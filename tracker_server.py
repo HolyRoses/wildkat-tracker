@@ -677,10 +677,18 @@ class RegistrationDB:
     def __init__(self, db_path: str):
         self._path = db_path
         self._local = threading.local()
+        self._restore_lock = threading.Lock()
+        self._restore_gen  = 0   # incremented on every restore; forces conn reopen
         self._init_schema()
 
     def _conn(self) -> sqlite3.Connection:
-        if not getattr(self._local, 'conn', None):
+        # If a restore happened since this thread last opened, reopen
+        if (not getattr(self._local, 'conn', None) or
+                getattr(self._local, 'conn_gen', -1) != self._restore_gen):
+            old = getattr(self._local, 'conn', None)
+            if old:
+                try: old.close()
+                except Exception: pass
             conn = sqlite3.connect(self._path, check_same_thread=False,
                                    timeout=10)
             conn.row_factory = sqlite3.Row
@@ -688,6 +696,7 @@ class RegistrationDB:
             conn.execute('PRAGMA foreign_keys=ON')
             conn.execute('PRAGMA busy_timeout=10000')  # wait up to 10s on lock
             self._local.conn = conn
+            self._local.conn_gen = self._restore_gen
         return self._local.conn
 
     def _init_schema(self):
@@ -801,6 +810,11 @@ class RegistrationDB:
             c.execute('ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 0')
         if 'credits_awarded' not in ucols:
             c.execute('ALTER TABLE users ADD COLUMN credits_awarded INTEGER NOT NULL DEFAULT 0')
+        # comments_locked column (may not exist on older installs)
+        tcols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
+        if 'comments_locked' not in tcols:
+            c.execute('ALTER TABLE torrents ADD COLUMN comments_locked INTEGER NOT NULL DEFAULT 0')
+        c.commit()
         # invite_codes table (may not exist on older installs)
         c.execute('''
             CREATE TABLE IF NOT EXISTS invite_codes (
@@ -811,6 +825,32 @@ class RegistrationDB:
                 consumed_at          TEXT,
                 consumed_by_username TEXT
             )''')
+        c.commit()
+        # ── Comments & notifications (migration-safe) ────────
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS comments (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash   TEXT    NOT NULL,
+                user_id     INTEGER NOT NULL,
+                username    TEXT    NOT NULL,
+                parent_id   INTEGER,
+                body        TEXT    NOT NULL,
+                created_at  TEXT    NOT NULL,
+                edited_at   TEXT,
+                is_deleted  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS notifications (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id        INTEGER NOT NULL,
+                type           TEXT    NOT NULL,
+                from_username  TEXT    NOT NULL,
+                info_hash      TEXT    NOT NULL,
+                torrent_name   TEXT    NOT NULL,
+                comment_id     INTEGER NOT NULL,
+                created_at     TEXT    NOT NULL,
+                is_read        INTEGER NOT NULL DEFAULT 0
+            );
+        ''')
         c.commit()
 
     def _init_defaults(self, announce_urls: list):
@@ -830,6 +870,7 @@ class RegistrationDB:
             'pw_require_symbol': '1',
             'open_tracker':       '0',
             'reward_enabled':     '0',
+            'comments_enabled':   '1',
             'reward_threshold':   '200',
         }
         for k, v in defaults.items():
@@ -1396,22 +1437,134 @@ class RegistrationDB:
         ).fetchall()
 
     def delete_torrent(self, ih: str, actor: str):
+        ih_upper = ih.upper()
         # Fetch name before deleting so we can log it
         row = self._conn().execute(
-            'SELECT name FROM torrents WHERE info_hash=?', (ih.upper(),)
+            'SELECT name FROM torrents WHERE info_hash=?', (ih_upper,)
         ).fetchone()
-        torrent_name = row['name'] if row else ih.upper()
+        torrent_name = row['name'] if row else ih_upper
         for attempt in range(5):
             try:
-                self._conn().execute('DELETE FROM torrents WHERE info_hash=?', (ih.upper(),))
-                self._conn().commit()
-                self._log(actor, 'delete_torrent', ih.upper(), torrent_name)
+                c = self._conn()
+                # Expunge all comments and notifications tied to this torrent
+                c.execute('DELETE FROM comments WHERE info_hash=?', (ih_upper,))
+                c.execute('DELETE FROM notifications WHERE info_hash=?', (ih_upper,))
+                c.execute('DELETE FROM torrents WHERE info_hash=?', (ih_upper,))
+                c.commit()
+                self._log(actor, 'delete_torrent', ih_upper, torrent_name)
                 return
             except sqlite3.OperationalError as e:
                 if 'locked' in str(e) and attempt < 4:
                     time.sleep(0.25 * (attempt + 1))
                     continue
                 raise
+
+    def backup_to_bytes(self) -> bytes:
+        """Return a gzip-compressed snapshot of the live DB as raw bytes."""
+        import io, gzip, tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tf:
+            tmp_path = tf.name
+        try:
+            dst = sqlite3.connect(tmp_path)
+            self._conn().backup(dst)
+            dst.close()
+            with open(tmp_path, 'rb') as f:
+                raw = f.read()
+        finally:
+            os.unlink(tmp_path)
+        gz_buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=gz_buf, mode='wb', compresslevel=9) as gz:
+            gz.write(raw)
+        return gz_buf.getvalue()
+
+    def restore_from_bytes(self, gz_data: bytes, actor: str) -> None:
+        """Replace the live DB with a gzip-compressed SQLite backup."""
+        import gzip, tempfile, os, shutil
+        try:
+            raw = gzip.decompress(gz_data)
+        except Exception:
+            raise ValueError('Not a valid gzip file')
+        if not raw.startswith(b'SQLite format 3\x00'):
+            raise ValueError('File is not a valid SQLite database')
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tf:
+            tf.write(raw)
+            tmp_path = tf.name
+        try:
+            # Validate integrity before touching the live DB
+            check = sqlite3.connect(tmp_path)
+            result = check.execute('PRAGMA integrity_check').fetchone()
+            check.close()
+            if result[0] != 'ok':
+                raise ValueError('Backup database failed integrity check')
+            with self._restore_lock:
+                # Close this thread's connection and flush WAL
+                conn = getattr(self._local, 'conn', None)
+                if conn:
+                    try:
+                        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                        conn.close()
+                    except Exception:
+                        pass
+                    self._local.conn = None
+                # Overwrite the DB file on disk
+                shutil.copy2(tmp_path, self._path)
+                # Remove any stale WAL / SHM files so they don't override the restore
+                for ext in ('-wal', '-shm'):
+                    sidecar = self._path + ext
+                    if os.path.exists(sidecar):
+                        try: os.unlink(sidecar)
+                        except Exception: pass
+                # Bump generation — every thread will reopen on next DB call
+                self._restore_gen += 1
+        finally:
+            os.unlink(tmp_path)
+        # Log using the freshly-reopened connection
+        self._log(actor, 'db_restore', '', 'Database restored from backup')
+
+    def delete_all_comments_global(self, actor: str) -> int:
+        """Hard-delete every comment and notification in the system."""
+        count = self._conn().execute('SELECT COUNT(*) FROM comments').fetchone()[0]
+        self._conn().execute('DELETE FROM comments')
+        self._conn().execute('DELETE FROM notifications')
+        self._conn().commit()
+        self._log(actor, 'delete_all_comments_global', '', f'{count} comment(s) removed')
+        return count
+
+    def system_wipe(self, actor: str):
+        """Wipe all data except the super user account and system settings."""
+        c = self._conn()
+        c.execute('DELETE FROM users WHERE username != ?', (actor,))
+        c.execute('DELETE FROM torrents')
+        c.execute('DELETE FROM comments')
+        c.execute('DELETE FROM notifications')
+        c.execute('DELETE FROM invite_codes')
+        c.execute('DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users)')
+        c.execute('DELETE FROM events')
+        c.execute('DELETE FROM ip_allowlist WHERE user_id NOT IN (SELECT id FROM users)')
+        c.execute('DELETE FROM login_history WHERE user_id NOT IN (SELECT id FROM users)')
+        c.commit()
+        self._log(actor, 'SYSTEM_WIPE', '', 'All data wiped except super account')
+
+    def delete_all_comments(self, ih: str, actor: str) -> int:
+        """Hard-delete every comment and associated notifications for a torrent.
+        Returns number of comments deleted."""
+        count = self._conn().execute(
+            'SELECT COUNT(*) FROM comments WHERE info_hash=?', (ih.upper(),)
+        ).fetchone()[0]
+        self._conn().execute('DELETE FROM comments WHERE info_hash=?', (ih.upper(),))
+        self._conn().execute('DELETE FROM notifications WHERE info_hash=?', (ih.upper(),))
+        self._conn().commit()
+        self._log(actor, 'delete_all_comments', ih.upper(), f'{count} comment(s) removed')
+        return count
+
+    def set_comments_locked(self, ih: str, locked: bool, actor: str):
+        self._conn().execute(
+            'UPDATE torrents SET comments_locked=? WHERE info_hash=?',
+            (1 if locked else 0, ih.upper())
+        )
+        self._conn().commit()
+        action = 'lock_comments' if locked else 'unlock_comments'
+        self._log(actor, action, ih.upper())
 
     def get_torrent(self, ih: str) -> sqlite3.Row | None:
         return self._conn().execute(
@@ -1450,6 +1603,135 @@ class RegistrationDB:
         now = datetime.datetime.now().isoformat(timespec='seconds')
         self._conn().execute('DELETE FROM sessions WHERE expires_at<=?', (now,))
         self._conn().commit()
+
+    # ── Comments ──────────────────────────────────────────────
+
+    def add_comment(self, info_hash: str, user_id: int, username: str,
+                    body: str, parent_id: int | None = None) -> int:
+        c = self._conn()
+        cur = c.execute(
+            'INSERT INTO comments (info_hash,user_id,username,parent_id,body,created_at)'
+            ' VALUES (?,?,?,?,?,?)',
+            (info_hash.upper(), user_id, username, parent_id, body, self._ts())
+        )
+        c.commit()
+        return cur.lastrowid
+
+    def get_comments(self, info_hash: str) -> list:
+        return self._conn().execute(
+            'SELECT * FROM comments WHERE info_hash=? ORDER BY id ASC',
+            (info_hash.upper(),)
+        ).fetchall()
+
+    def get_comment(self, comment_id: int):
+        return self._conn().execute(
+            'SELECT * FROM comments WHERE id=?', (comment_id,)
+        ).fetchone()
+
+    def edit_comment(self, comment_id: int, user_id: int, body: str, is_admin: bool) -> bool:
+        row = self.get_comment(comment_id)
+        if not row or row['is_deleted']:
+            return False
+        if not is_admin and row['user_id'] != user_id:
+            return False
+        self._conn().execute(
+            'UPDATE comments SET body=?, edited_at=? WHERE id=?',
+            (body, self._ts(), comment_id)
+        )
+        self._conn().commit()
+        return True
+
+    def delete_comment(self, comment_id: int, user_id: int, is_admin: bool) -> bool:
+        row = self.get_comment(comment_id)
+        if not row:
+            return False
+        if not is_admin and row['user_id'] != user_id:
+            return False
+        parent_id = row['parent_id']
+        # Hard delete if no replies exist, soft delete if replies must be preserved
+        has_replies = self._conn().execute(
+            'SELECT COUNT(*) FROM comments WHERE parent_id=?', (comment_id,)
+        ).fetchone()[0]
+        if has_replies:
+            self._conn().execute(
+                'UPDATE comments SET is_deleted=1, body=? WHERE id=?',
+                ('[deleted]', comment_id)
+            )
+        else:
+            self._conn().execute('DELETE FROM comments WHERE id=?', (comment_id,))
+            # If this was a reply, check if the parent is a soft-deleted comment
+            # with no remaining replies — if so, clean it up too
+            if parent_id:
+                parent = self.get_comment(parent_id)
+                if parent and parent['is_deleted']:
+                    remaining = self._conn().execute(
+                        'SELECT COUNT(*) FROM comments WHERE parent_id=?', (parent_id,)
+                    ).fetchone()[0]
+                    if not remaining:
+                        self._conn().execute(
+                            'DELETE FROM comments WHERE id=?', (parent_id,)
+                        )
+        self._conn().commit()
+        return True
+
+    # ── Notifications ──────────────────────────────────────────
+
+    def add_notification(self, user_id: int, ntype: str, from_username: str,
+                         info_hash: str, torrent_name: str, comment_id: int):
+        c = self._conn()
+        c.execute(
+            'INSERT INTO notifications'
+            ' (user_id,type,from_username,info_hash,torrent_name,comment_id,created_at)'
+            ' VALUES (?,?,?,?,?,?,?)',
+            (user_id, ntype, from_username, info_hash.upper(),
+             torrent_name, comment_id, self._ts())
+        )
+        c.commit()
+        # Prune to 100 per user
+        c.execute(
+            'DELETE FROM notifications WHERE user_id=? AND id NOT IN'
+            ' (SELECT id FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 100)',
+            (user_id, user_id)
+        )
+        c.commit()
+
+    def get_unread_notifications(self, user_id: int, limit: int = 5) -> list:
+        return self._conn().execute(
+            'SELECT * FROM notifications WHERE user_id=? AND is_read=0'
+            ' ORDER BY id DESC LIMIT ?',
+            (user_id, limit)
+        ).fetchall()
+
+    def get_all_notifications(self, user_id: int) -> list:
+        return self._conn().execute(
+            'SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 100',
+            (user_id,)
+        ).fetchall()
+
+    def get_unread_count(self, user_id: int) -> int:
+        return self._conn().execute(
+            'SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0',
+            (user_id,)
+        ).fetchone()[0]
+
+    def mark_notification_read(self, notif_id: int, user_id: int):
+        self._conn().execute(
+            'UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?',
+            (notif_id, user_id)
+        )
+        self._conn().commit()
+
+    def mark_all_notifications_read(self, user_id: int):
+        self._conn().execute(
+            'UPDATE notifications SET is_read=1 WHERE user_id=?', (user_id,)
+        )
+        self._conn().commit()
+
+    def get_notification(self, notif_id: int, user_id: int):
+        return self._conn().execute(
+            'SELECT * FROM notifications WHERE id=? AND user_id=?',
+            (notif_id, user_id)
+        ).fetchone()
 
     # ── Events ─────────────────────────────────────────────────
 
@@ -2909,6 +3191,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_admin()
         elif path == '/manage/password':
             self._get_password_page()
+        elif path.startswith('/manage/admin/set-password/'):
+            self._get_admin_set_password(path[len('/manage/admin/set-password/'):])
+        elif path == '/manage/admin/db-backup':
+            self._get_db_backup()
         elif path == '/manage/logout':
             self._do_logout()
         elif path == '/manage/signup':
@@ -2925,6 +3211,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._serve_robots()
         elif path == '/manage/search':
             self._get_search()
+        elif path == '/manage/notifications':
+            self._get_notifications()
+        elif path.startswith('/manage/torrent/lock/'):
+            ih = path[len('/manage/torrent/lock/'):]
+            self._get_toggle_comments_lock(ih, True)
+        elif path.startswith('/manage/torrent/unlock/'):
+            ih = path[len('/manage/torrent/unlock/'):]
+            self._get_toggle_comments_lock(ih, False)
         elif path.startswith('/manage/torrent/'):
             ih = path[len('/manage/torrent/'):]
             self._get_torrent_detail(ih)
@@ -2979,6 +3273,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_delete_user()
         elif path == '/manage/admin/change-password':
             self._post_admin_change_password()
+        elif path == '/manage/admin/set-password':
+            self._post_admin_set_password()
         elif path == '/manage/admin/unlock':
             self._post_unlock_user()
         elif path == '/manage/admin/disable-user':
@@ -2999,6 +3295,25 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_tracker_move()
         elif path == '/manage/admin/save-settings':
             self._post_save_settings()
+        elif path == '/manage/comment/post':
+            self._post_comment()
+        elif path == '/manage/comment/edit':
+            self._post_comment_edit()
+        elif path == '/manage/comment/delete':
+            self._post_comment_delete()
+        elif path.startswith('/manage/notifications/read/'):
+            nid = path[len('/manage/notifications/read/'):]
+            self._post_notification_read(nid)
+        elif path == '/manage/notifications/read-all':
+            self._post_notification_read_all()
+        elif path == '/manage/comment/delete-all':
+            self._post_delete_all_comments()
+        elif path == '/manage/admin/delete-all-comments-global':
+            self._post_delete_all_comments_global()
+        elif path == '/manage/admin/system-wipe':
+            self._post_system_wipe()
+        elif path == '/manage/admin/db-restore':
+            self._post_db_restore()
         elif path == '/manage/signup':
             self._post_signup()
         elif path.startswith('/manage/invite/'):
@@ -3074,10 +3389,14 @@ class ManageHandler(BaseHTTPRequestHandler):
         events       = REGISTRATION_DB.list_events(100)
         trackers     = REGISTRATION_DB.list_magnet_trackers()
         settings     = REGISTRATION_DB.get_all_settings()
+        msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        tab      = qs.get('tab',      [''])[0]
         self._send_html(_render_admin(user, all_torrents, all_users, events, trackers, settings,
                                       page=page, total_pages=total_pages, total=total,
                                       upage=upage, utotal_pages=utotal_pages, utotal=utotal,
-                                      uquery=uquery))
+                                      uquery=uquery, msg=msg, msg_type=msg_type, tab=tab,
+                                      new_username=urllib.parse.unquote(qs.get('new_username',[''])[0])))
 
     def _get_password_page(self):
         user = self._get_session_user()
@@ -3178,6 +3497,151 @@ class ManageHandler(BaseHTTPRequestHandler):
         torrents = REGISTRATION_DB.list_torrents(user_id=user['id'])
         self._send_html(_render_dashboard(user, torrents, msg, msg_type))
 
+    def _get_notifications(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        self._send_html(_render_notifications_page(user))
+
+    def _post_comment(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body   = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih     = fields.get('info_hash', '').strip().upper()
+        text   = fields.get('body', '').strip()[:2000]
+        parent = fields.get('parent_id', '').strip()
+        parent_id = int(parent) if parent.isdigit() else None
+        if not ih or not text:
+            return self._redirect(f'/manage/torrent/{ih.lower()}')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not t: return self._redirect('/manage/dashboard')
+        # Block if comments system is disabled globally
+        if REGISTRATION_DB.get_setting('comments_enabled', '1') != '1':
+            return self._redirect(f'/manage/torrent/{ih.lower()}')
+        # Block posting if comments are locked on this torrent
+        if t['comments_locked']:
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg=locked')
+        uname = user['username']
+        tname = t['name']
+        # Validate @mentions — warn on unknowns but still post
+        mentioned = set(_MENTION_RE.findall(text))
+        unknown = [m for m in mentioned
+                   if m != uname and not REGISTRATION_DB.get_user(m)]
+        if unknown:
+            unknown_list = ', '.join(f'@{u}' for u in sorted(unknown))
+            warn_param = urllib.parse.quote(unknown_list)
+            # Still save the comment; just notify the poster
+            cid = REGISTRATION_DB.add_comment(ih, user['id'], uname, text, parent_id)
+            _deliver_notifications(cid, ih, tname, uname, text, parent_id)
+            return self._redirect(
+                f'/manage/torrent/{ih.lower()}?warn={warn_param}#comment-{cid}')
+        cid = REGISTRATION_DB.add_comment(ih, user['id'], uname, text, parent_id)
+        _deliver_notifications(cid, ih, tname, uname, text, parent_id)
+        self._redirect(f'/manage/torrent/{ih.lower()}#comment-{cid}')
+
+    def _post_comment_edit(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body   = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        cid    = fields.get('comment_id', '').strip()
+        ih     = fields.get('info_hash', '').strip().upper()
+        text   = fields.get('body', '').strip()[:2000]
+        if not cid.isdigit() or not text:
+            return self._redirect(f'/manage/torrent/{ih.lower()}')
+        role = _user_role(user)
+        REGISTRATION_DB.edit_comment(int(cid), user['id'], text, role in ('super','admin'))
+        # Validate @mentions — warn on unknowns the same as post
+        uname = user['username']
+        mentioned = set(_MENTION_RE.findall(text))
+        unknown = [m for m in mentioned
+                   if m != uname and not REGISTRATION_DB.get_user(m)]
+        if unknown:
+            unknown_list = ', '.join(f'@{u}' for u in sorted(unknown))
+            warn_param = urllib.parse.quote(unknown_list)
+            return self._redirect(
+                f'/manage/torrent/{ih.lower()}?warn={warn_param}#comment-{cid}')
+        self._redirect(f'/manage/torrent/{ih.lower()}#comment-{cid}')
+
+    def _post_comment_delete(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body   = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        cid    = fields.get('comment_id', '').strip()
+        ih     = fields.get('info_hash', '').strip().upper()
+        if not cid.isdigit():
+            return self._redirect(f'/manage/torrent/{ih.lower()}')
+        role = _user_role(user)
+        REGISTRATION_DB.delete_comment(int(cid), user['id'], role in ('super','admin'))
+        self._redirect(f'/manage/torrent/{ih.lower()}')
+
+    def _post_notification_read(self, nid_str: str):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if nid_str.isdigit():
+            n = REGISTRATION_DB.get_notification(int(nid_str), user['id'])
+            if n:
+                REGISTRATION_DB.mark_notification_read(int(nid_str), user['id'])
+                return self._redirect(
+                    f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}')
+        self._redirect('/manage/notifications')
+
+    def _post_delete_all_comments_global(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) not in ('super', 'admin'):
+            return self._redirect('/manage/dashboard')
+        count = REGISTRATION_DB.delete_all_comments_global(user['username'])
+        self._redirect('/manage/admin?tab=danger&msg=' +
+                       urllib.parse.quote(f'{count} comment(s) and all notifications deleted'))
+
+    def _post_system_wipe(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) != 'super':
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        # Double-check the confirmation token server-side
+        if fields.get('confirm_token', '').strip() != 'SYSTEMWIPE':
+            self._redirect('/manage/admin?tab=danger&msg=' +
+                           urllib.parse.quote('System wipe cancelled — confirmation token mismatch'))
+            return
+        REGISTRATION_DB.system_wipe(user['username'])
+        # Invalidate all other sessions; keep the super session alive
+        self._redirect('/manage/admin?tab=danger&msg=' +
+                       urllib.parse.quote('System wipe complete. All data removed except your account.'))
+
+    def _post_delete_all_comments(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) not in ('super', 'admin'):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        if not ih: return self._redirect('/manage/dashboard')
+        count = REGISTRATION_DB.delete_all_comments(ih, user['username'])
+        msg = urllib.parse.quote(f'{count} comment(s) deleted')
+        self._redirect(f'/manage/torrent/{ih.lower()}?msg={msg}&msg_type=success')
+
+    def _post_notification_read_all(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        REGISTRATION_DB.mark_all_notifications_read(user['id'])
+        self._redirect('/manage/notifications')
+
+    def _get_toggle_comments_lock(self, ih: str, lock: bool):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) not in ('super', 'admin'):
+            return self._redirect(f'/manage/torrent/{ih.lower()}')
+        t = REGISTRATION_DB.get_torrent(ih.upper())
+        if not t: return self._redirect('/manage/dashboard')
+        REGISTRATION_DB.set_comments_locked(ih, lock, user['username'])
+        self._redirect(f'/manage/torrent/{ih.lower()}')
+
     def _get_torrent_detail(self, ih: str):
         user = self._get_session_user()
         if not user: return self._redirect('/manage')
@@ -3186,7 +3650,12 @@ class ManageHandler(BaseHTTPRequestHandler):
         referer = self.headers.get('Referer', '')
         back = urllib.parse.urlparse(referer).path or '/manage/dashboard'
         if back.startswith('/manage/torrent'): back = '/manage/dashboard'
-        self._send_html(_render_torrent_detail(user, t, back_url=back))
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        warn     = urllib.parse.unquote(qs.get('warn',     [''])[0])
+        self._send_html(_render_torrent_detail(user, t, back_url=back,
+                                               msg=msg, msg_type=msg_type, warn=warn))
 
     def _post_delete_torrent(self):
         user = self._get_session_user()
@@ -3256,7 +3725,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         pw_settings = REGISTRATION_DB.get_all_settings()
         pw_errors   = _validate_password(password, pw_settings)
         if pw_errors:
-            return self._redirect('/manage/admin?msg=pw_error&tab=adduser')
+            err = urllib.parse.quote('Password does not meet requirements: ' + '; '.join(pw_errors))
+            un  = urllib.parse.quote(username)
+            return self._redirect(f'/manage/admin?tab=adduser&msg={err}&msg_type=error&new_username={un}')
         ok = REGISTRATION_DB.create_user(username, password, is_new_admin, user['username'])
         if ok and is_new_standard and not is_new_admin:
             REGISTRATION_DB.set_standard(username, True, user['username'])
@@ -3283,6 +3754,100 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/admin')
         REGISTRATION_DB.delete_user(target, user['username'])
         self._redirect('/manage/admin')
+
+    def _get_db_backup(self):
+        user = self._get_session_user()
+        if not user or user['username'] != SUPER_USER:
+            return self._redirect('/manage/admin')
+        try:
+            gz_data = REGISTRATION_DB.backup_to_bytes()
+        except Exception as e:
+            logging.error('DB backup failed: %s', e)
+            return self._redirect('/manage/admin?tab=database&msg='
+                                  + urllib.parse.quote('Backup failed: ' + str(e)))
+        import datetime
+        stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        fname = f'tracker-backup-{stamp}.db.gz'
+        REGISTRATION_DB._log(user['username'], 'db_backup', '', 'Database backup downloaded')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/gzip')
+        self.send_header('Content-Disposition', f'attachment; filename="{fname}"')
+        self.send_header('Content-Length', str(len(gz_data)))
+        self.end_headers()
+        self.wfile.write(gz_data)
+
+    def _post_db_restore(self):
+        user = self._get_session_user()
+        if not user or user['username'] != SUPER_USER:
+            return self._redirect('/manage/admin')
+        body = self._read_body()
+        fields, files = _parse_multipart(self.headers, body)
+        file_entry = files.get('db_file')
+        if not file_entry:
+            return self._redirect('/manage/admin?tab=database&msg='
+                                  + urllib.parse.quote('No file received.'))
+        # _parse_multipart stores files as (filename, bytes)
+        gz_data = file_entry[1] if isinstance(file_entry, tuple) else file_entry
+        try:
+            REGISTRATION_DB.restore_from_bytes(gz_data, user['username'])
+        except ValueError as e:
+            return self._redirect('/manage/admin?tab=database&msg='
+                                  + urllib.parse.quote(str(e)) + '&msg_type=error')
+        except Exception as e:
+            logging.error('DB restore failed: %s', e)
+            return self._redirect('/manage/admin?tab=database&msg='
+                                  + urllib.parse.quote('Restore failed: ' + str(e)) + '&msg_type=error')
+        self._redirect('/manage/admin?tab=database&msg='
+                       + urllib.parse.quote('Database restored successfully. Please verify the site.')
+                       + '&msg_type=success')
+
+    def _get_admin_set_password(self, target_username: str):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if not (user['is_admin'] or user['username'] == SUPER_USER):
+            return self._redirect('/manage/dashboard')
+        target = REGISTRATION_DB.get_user(target_username)
+        if not target or target['username'] == SUPER_USER:
+            return self._redirect('/manage/admin')
+        # Admins cannot change other admin passwords
+        if user['username'] != SUPER_USER and target['is_admin']:
+            return self._redirect('/manage/admin')
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        self._send_html(_render_admin_set_password_page(
+            user, target, msg=msg, msg_type=msg_type))
+
+    def _post_admin_set_password(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        is_super = user['username'] == SUPER_USER
+        if not (user['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
+        body   = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target   = fields.get('username', '').strip()
+        new_pass = fields.get('new_password', '')
+        conf     = fields.get('confirm_password', '')
+        back_url = f'/manage/admin/set-password/{urllib.parse.quote(target)}'
+        if not target or target == SUPER_USER:
+            return self._redirect('/manage/admin')
+        t_user = REGISTRATION_DB.get_user(target)
+        if not t_user:
+            return self._redirect('/manage/admin')
+        if not is_super and t_user['is_admin']:
+            return self._redirect('/manage/admin')
+        if new_pass != conf:
+            err = urllib.parse.quote('Passwords do not match.')
+            return self._redirect(f'{back_url}?msg={err}&msg_type=error')
+        pw_settings = REGISTRATION_DB.get_all_settings()
+        pw_errors   = _validate_password(new_pass, pw_settings)
+        if pw_errors:
+            err = urllib.parse.quote('Password does not meet requirements: ' + '; '.join(pw_errors))
+            return self._redirect(f'{back_url}?msg={err}&msg_type=error')
+        REGISTRATION_DB.change_password(target, new_pass, user['username'])
+        ok = urllib.parse.quote(f'Password changed for {target}.')
+        self._redirect(f'/manage/admin/user/{urllib.parse.quote(target)}?msg={ok}&msg_type=success')
 
     def _post_admin_change_password(self):
         user = self._get_session_user()
@@ -3597,6 +4162,9 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.set_setting('open_tracker', val, user['username'])
             OPEN_TRACKER = (val == '1')
             log.info('OPEN_TRACKER set to %s by %s', OPEN_TRACKER, user['username'])
+        elif form_id == 'comments_enabled':
+            val = '1' if fields.get('comments_enabled') == '1' else '0'
+            REGISTRATION_DB.set_setting('comments_enabled', val, user['username'])
         elif form_id == 'robots_txt':
             val = fields.get('robots_txt', 'User-agent: *\nDisallow: /')
             REGISTRATION_DB.set_setting('robots_txt', val[:4000], user['username'])
@@ -3974,6 +4542,14 @@ _MANAGE_CSS = '''
                 text-transform: uppercase; color: var(--muted); margin-bottom: 18px;
                 padding-bottom: 10px; border-bottom: 1px solid var(--border); }
   .form-group { margin-bottom: 16px; }
+  .pw-wrap { position:relative; display:block; }
+  .pw-wrap input { width:100%; padding-right:44px; box-sizing:border-box; }
+  .pw-eye { position:absolute; right:0; top:0; bottom:0; width:40px;
+            background:none; border:none; cursor:pointer; color:var(--muted);
+            display:flex; align-items:center; justify-content:center;
+            padding:0; transition:color 0.15s; }
+  .pw-eye:hover { color:var(--text); }
+  .pw-eye svg { width:18px; height:18px; flex-shrink:0; }
   .form-group label { display: block; font-size: 0.82rem; color: var(--muted);
                       margin-bottom: 6px; font-family: var(--mono); font-size: 0.72rem;
                       letter-spacing: 0.1em; text-transform: uppercase; }
@@ -4030,6 +4606,97 @@ _MANAGE_CSS = '''
   .page-sub { font-size: 0.85rem; color: var(--muted); margin-bottom: 28px; }
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
   @media (max-width: 640px) { .two-col { grid-template-columns: 1fr; } }
+  /* ── Comments ── */
+  .comment-card { background:var(--card); border:1px solid var(--border); border-radius:12px;
+                  padding:16px 20px; margin-bottom:16px; }
+  /* tree node wrapper — carries the anchor id */
+  .comment-node { position:relative; }
+  .comment-node:target > .comment-inner {
+    border-color:var(--accent); animation:highlight-fade 2s ease forwards; }
+  @keyframes highlight-fade { 0%{background:rgba(245,166,35,0.10)} 100%{background:transparent} }
+  /* inner bubble */
+  .comment-inner { border-radius:8px; padding:12px 16px;
+                   border:1px solid var(--border); background:var(--card); }
+  /* depth backgrounds — each level slightly darker */
+  .comment-depth-0 > .comment-inner { background:var(--card); }
+  .comment-depth-1 > .comment-inner { background:var(--card2); }
+  .comment-depth-2 > .comment-inner { background:var(--bg); border-color:var(--border); }
+  .comment-depth-3 > .comment-inner { background:var(--bg); opacity:0.92; }
+  /* branch connector: indented children sit inside a left-bordered container */
+  .comment-children {
+    margin-left:20px;
+    padding-left:14px;
+    border-left:2px solid var(--border);
+    margin-top:6px;
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+  }
+  .comment-children .comment-node { padding-top:0; }
+  .comment-header { display:flex; align-items:center; gap:10px; margin-bottom:10px;
+                    flex-wrap:wrap; }
+  .comment-ts { font-family:var(--mono); font-size:0.68rem; color:var(--muted); }
+  .comment-edited { font-family:var(--mono); font-size:0.65rem; color:var(--muted); font-style:italic; }
+  .comment-body { font-size:0.9rem; line-height:1.65; color:var(--text); white-space:pre-wrap;
+                  word-break:break-word; }
+  .comment-deleted { font-size:0.9rem; color:var(--muted); font-style:italic; }
+  .comment-actions { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; align-items:center; }
+  .comment-reply-form { margin-top:10px; display:none; }
+  .comment-reply-form.open { display:block; }
+  .comment-edit-form { display:none; margin-top:10px; }
+  .comment-edit-form.open { display:block; }
+  .comment-textarea { width:100%; padding:10px 14px; background:var(--card2);
+                      border:1px solid var(--border); border-radius:6px; color:var(--text);
+                      font-family:var(--sans); font-size:0.9rem; resize:vertical;
+                      outline:none; transition:border-color 0.15s; min-height:80px; }
+  .comment-textarea:focus { border-color:var(--accent); }
+  .btn-ghost { background:transparent; border:none; font-family:var(--mono); font-size:0.72rem;
+               letter-spacing:0.06em; color:var(--muted); cursor:pointer; padding:2px 6px;
+               border-radius:4px; transition:color 0.15s; }
+  .btn-ghost:hover { color:var(--accent); }
+  .btn-ghost-danger { color:var(--muted); }
+  .btn-ghost-danger:hover { color:var(--red); }
+  /* ── Notification bell ── */
+  .sr-only { position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0; }
+  .notif-wrap { position:relative; display:inline-flex; align-items:center; }
+  .notif-bell-btn { background:transparent; border:none; cursor:pointer; font-size:1.1rem;
+                    padding:4px 6px; border-radius:6px; transition:opacity 0.15s;
+                    display:flex; align-items:center; gap:5px; line-height:1; }
+  .notif-bell-btn:hover { opacity:0.75; }
+  .notif-bell-btn .notif-count { font-family:var(--mono); font-size:0.65rem; letter-spacing:0.05em;
+                                  background:var(--accent); color:#000; border-radius:10px;
+                                  padding:1px 6px; font-weight:700; }
+  .notif-bell-inactive { opacity:0.35; }
+  .notif-dropdown { position:absolute; right:0; top:calc(100% + 8px); width:340px;
+                    background:var(--card); border:1px solid var(--border); border-radius:12px;
+                    box-shadow:0 8px 32px rgba(0,0,0,0.4); z-index:1000; display:none;
+                    overflow:hidden; }
+  .notif-dropdown.open { display:block; }
+  .notif-dropdown-header { padding:12px 16px; border-bottom:1px solid var(--border);
+                           display:flex; justify-content:space-between; align-items:center; }
+  .notif-dropdown-title { font-family:var(--mono); font-size:0.68rem; letter-spacing:0.15em;
+                          text-transform:uppercase; color:var(--muted); }
+  .notif-item { display:block; padding:12px 16px; border-bottom:1px solid var(--border);
+                text-decoration:none; color:var(--text); transition:background 0.1s; cursor:pointer;
+                background:transparent; border:none; width:100%; text-align:left; }
+  .notif-item:last-child { border-bottom:none; }
+  .notif-item:hover { background:var(--card2); }
+  .notif-item-type { font-family:var(--mono); font-size:0.65rem; color:var(--muted);
+                     margin-bottom:3px; letter-spacing:0.08em; }
+  .notif-item-text { font-size:0.85rem; color:var(--text); line-height:1.4; }
+  .notif-item-ts { font-family:var(--mono); font-size:0.65rem; color:var(--muted); margin-top:3px; }
+  .notif-empty { padding:24px 16px; text-align:center; font-family:var(--mono);
+                 font-size:0.78rem; color:var(--muted); }
+  .notif-footer { padding:10px 16px; border-top:1px solid var(--border); text-align:center; }
+  .notif-footer a { font-family:var(--mono); font-size:0.72rem; color:var(--accent);
+                    text-decoration:none; letter-spacing:0.08em; }
+  .notif-footer a:hover { opacity:0.8; }
+  /* ── Notifications page ── */
+  .notif-page-item { background:var(--card); border:1px solid var(--border); border-radius:10px;
+                     padding:16px 20px; margin-bottom:12px; display:flex;
+                     justify-content:space-between; align-items:flex-start; gap:16px; }
+  .notif-page-item.unread { border-left:3px solid var(--accent); }
+  .notif-page-meta { font-family:var(--mono); font-size:0.68rem; color:var(--muted); margin-top:4px; }
 '''
 
 _MANAGE_HEAD = '''<!DOCTYPE html>
@@ -4085,6 +4752,108 @@ function confirmAction(msg) {
     document.getElementById('_ca_no').onclick  = function(){ document.body.removeChild(o); resolve(false); };
   });
 }
+function initiateSystemWipe() {
+  // Step 1: type SYSTEMWIPE
+  var o = document.createElement('div');
+  o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:9999;display:flex;align-items:center;justify-content:center';
+  o.setAttribute('role','alertdialog');
+  o.setAttribute('aria-modal','true');
+  o.setAttribute('aria-labelledby','_sw1_title');
+  o.innerHTML = '<div style="background:var(--card);border:2px solid var(--red);border-radius:12px;padding:32px;max-width:480px;width:92%">'
+    + '<div id="_sw1_title" style="font-family:var(--mono);font-size:0.7rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--red);margin-bottom:12px">&#9762; System Wipe — Step 1 of 2</div>'
+    + '<p style="font-size:0.9rem;color:var(--text);margin-bottom:18px;line-height:1.6">'
+    + 'This will permanently delete <strong>all users, torrents, comments, notifications, invites, and logs</strong> except your super account.<br><br>'
+    + 'Type <strong style="color:var(--red);font-family:var(--mono)">SYSTEMWIPE</strong> to continue:</p>'
+    + '<input id="_sw_input" type="text" autocomplete="off" spellcheck="false"'
+    + ' style="width:100%;padding:10px 14px;background:var(--card2);border:1px solid var(--border);'
+    + 'border-radius:6px;color:var(--text);font-family:var(--mono);font-size:1rem;outline:none;margin-bottom:18px"'
+    + ' aria-label="Type SYSTEMWIPE to confirm" placeholder="Type SYSTEMWIPE">'
+    + '<div style="display:flex;gap:12px;justify-content:flex-end">'
+    + '<button id="_sw1_cancel" class="btn">Cancel</button>'
+    + '<button id="_sw1_ok" class="btn btn-danger">Continue</button>'
+    + '</div></div>';
+  document.body.appendChild(o);
+  var inp = document.getElementById('_sw_input');
+  inp.focus();
+  inp.addEventListener('input', function() {
+    document.getElementById('_sw1_ok').disabled = inp.value !== 'SYSTEMWIPE';
+  });
+  document.getElementById('_sw1_ok').disabled = true;
+  document.getElementById('_sw1_cancel').onclick = function() { document.body.removeChild(o); };
+  document.getElementById('_sw1_ok').onclick = function() {
+    if (inp.value !== 'SYSTEMWIPE') return;
+    document.body.removeChild(o);
+    // Step 2: final confirmation
+    var o2 = document.createElement('div');
+    o2.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:center;justify-content:center';
+    o2.setAttribute('role','alertdialog');
+    o2.setAttribute('aria-modal','true');
+    o2.setAttribute('aria-labelledby','_sw2_title');
+    o2.innerHTML = '<div style="background:var(--card);border:2px solid var(--red);border-radius:12px;padding:32px;max-width:480px;width:92%;text-align:center">'
+      + '<div id="_sw2_title" style="font-family:var(--mono);font-size:0.7rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--red);margin-bottom:16px">&#9762; System Wipe — Step 2 of 2</div>'
+      + '<p style="font-size:1rem;color:var(--text);margin-bottom:24px;line-height:1.7">'
+      + '<strong style="color:var(--red)">This is your last chance.</strong><br>'
+      + 'All data will be permanently destroyed.<br>'
+      + 'This action <strong>cannot</strong> be undone.</p>'
+      + '<div style="display:flex;gap:12px;justify-content:center">'
+      + '<button id="_sw2_cancel" class="btn" style="min-width:100px">Cancel</button>'
+      + '<button id="_sw2_ok" class="btn btn-danger" style="min-width:140px">Wipe Everything</button>'
+      + '</div></div>';
+    document.body.appendChild(o2);
+    document.getElementById('_sw2_cancel').onclick = function() { document.body.removeChild(o2); };
+    document.getElementById('_sw2_ok').focus();
+    document.getElementById('_sw2_ok').onclick = function() {
+      document.body.removeChild(o2);
+      // Submit hidden form with CSRF + token
+      var f = document.createElement('form');
+      f.method = 'POST';
+      f.action = '/manage/admin/system-wipe';
+      var ct = document.createElement('input'); ct.type='hidden'; ct.name='confirm_token'; ct.value='SYSTEMWIPE';
+      f.appendChild(ct);
+      var csrf = document.createElement('input'); csrf.type='hidden'; csrf.name='_csrf';
+      csrf.value = (document.cookie.match(/wkcsrf=([^;]+)/) || [])[1] || '';
+      f.appendChild(csrf);
+      document.body.appendChild(f);
+      f.submit();
+    };
+    o2.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') document.body.removeChild(o2);
+    });
+  };
+  o.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') document.body.removeChild(o);
+    if (e.key === 'Enter' && inp.value === 'SYSTEMWIPE') document.getElementById('_sw1_ok').click();
+  });
+}
+function togglePwVis(btn) {
+  var inp = btn.previousElementSibling;
+  var showing = inp.type === 'text';
+  inp.type = showing ? 'password' : 'text';
+  btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+  // swap eye-open / eye-off icon
+  btn.querySelector('.eye-open').style.display = showing ? '' : 'none';
+  btn.querySelector('.eye-off').style.display  = showing ? 'none' : '';
+}
+function showWarnModal(msg) {
+  var o = document.createElement('div');
+  o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:9999;display:flex;align-items:center;justify-content:center';
+  o.setAttribute('role','alertdialog');
+  o.setAttribute('aria-modal','true');
+  o.setAttribute('aria-labelledby','_wm_title');
+  o.setAttribute('aria-describedby','_wm_body');
+  o.innerHTML = '<div style="background:var(--card);border:1px solid rgba(224,91,48,0.4);border-radius:12px;padding:28px 32px;max-width:480px;width:92%;text-align:center">'
+    + '<div id="_wm_title" style="font-family:var(--mono);font-size:0.68rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--red);margin-bottom:12px">&#9888; Notice</div>'
+    + '<div id="_wm_body" style="font-size:0.9rem;margin-bottom:24px;line-height:1.6;color:var(--text)">' + msg + '</div>'
+    + '<button id="_wm_ok" class="btn btn-primary" autofocus>OK</button>'
+    + '</div>';
+  document.body.appendChild(o);
+  var ok = document.getElementById('_wm_ok');
+  ok.focus();
+  ok.onclick = function(){ document.body.removeChild(o); };
+  o.addEventListener('keydown', function(e){
+    if(e.key==='Escape'||e.key==='Enter') document.body.removeChild(o);
+  });
+}
 // CSRF: inject token from cookie into every POST form before submit
 function _getCsrf(){
   var m=document.cookie.match(/(?:^|;[ \t]*)wkcsrf=([^;]+)/);
@@ -4127,6 +4896,53 @@ function copyInvite(btn, path) {
     prompt('Copy this invite URL:', url);
   });
 }
+function toggleNotifDropdown(e) {
+  e.stopPropagation();
+  var d = document.getElementById('notif-dropdown');
+  if (d) d.classList.toggle('open');
+}
+document.addEventListener('click', function() {
+  var d = document.getElementById('notif-dropdown');
+  if (d) d.classList.remove('open');
+});
+function readNotif(id, url) {
+  fetch('/manage/notifications/read/' + id, {method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'_csrf=' + encodeURIComponent(document.cookie.match(/wkcsrf=([^;]+)/)?.[1] || '')
+  }).then(function() { window.location = url; });
+}
+function toggleReplyForm(id, mentionUser) {
+  // Close any other open reply forms first
+  document.querySelectorAll('.comment-reply-form.open').forEach(function(el) {
+    if (el.id !== 'reply-form-' + id) {
+      el.classList.remove('open');
+      var ta = el.querySelector('textarea');
+      if (ta) ta.value = '';
+    }
+  });
+  var f = document.getElementById('reply-form-' + id);
+  if (!f) return;
+  var opening = !f.classList.contains('open');
+  f.classList.toggle('open');
+  if (opening) {
+    var ta = f.querySelector('textarea');
+    if (ta) {
+      if (mentionUser && ta.value === '') {
+        ta.value = '@' + mentionUser + ' ';
+      }
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
+  }
+}
+function toggleEditForm(id) {
+  var b = document.getElementById('comment-body-' + id);
+  var f = document.getElementById('edit-form-' + id);
+  if (!b || !f) return;
+  var editing = f.classList.contains('open');
+  if (editing) { f.classList.remove('open'); b.style.display = ''; }
+  else { f.classList.add('open'); b.style.display = 'none'; f.querySelector('textarea').focus(); }
+}
 function copyMagnet(btn, url) {
   navigator.clipboard.writeText(url).then(function() {
     var orig = btn.innerHTML;
@@ -4154,10 +4970,48 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
     if user:
         role = _user_role(user)
         role_label = role.upper()
+        _comments_on = (REGISTRATION_DB.get_setting('comments_enabled','1') == '1') if REGISTRATION_DB else False
+        unread = REGISTRATION_DB.get_unread_count(user['id']) if (REGISTRATION_DB and _comments_on) else 0
+        bell_cls = 'notif-bell-btn' if unread else 'notif-bell-btn notif-bell-inactive'
+        badge_html = (f'<span class="notif-count">{unread}</span>' if unread else '')
+        unread_items = REGISTRATION_DB.get_unread_notifications(user['id'], 5) if REGISTRATION_DB else []
+        dropdown_items = ''
+        for n in unread_items:
+            icon = '💬' if n['type'] == 'reply' else '@'
+            label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
+            tname_h = _h(n['torrent_name'][:40] + ('…' if len(n['torrent_name']) > 40 else ''))
+            from_h = _h(n['from_username'])
+            ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
+            n_id   = n['id']
+            n_hash = n['info_hash'].lower()
+            n_cid  = n['comment_id']
+            dropdown_items += (
+                f'<button class="notif-item" '
+                f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}#comment-{n_cid}\')"'
+                f' aria-label="{label} by {from_h} on {tname_h}">'
+                f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
+                f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
+                f'<div class="notif-item-ts">{ts_h}</div>'
+                f'</button>'
+            )
+        if not dropdown_items:
+            dropdown_items = '<div class="notif-empty">No unread notifications</div>'
+        bell_html = (
+            f'<div class="notif-wrap">'
+            f'<button class="{bell_cls}" onclick="toggleNotifDropdown(event)" aria-label="Notifications">'
+            f'🔔{badge_html}</button>'
+            f'<div class="notif-dropdown" id="notif-dropdown">'
+            f'<div class="notif-dropdown-header">'
+            f'<span class="notif-dropdown-title">Notifications</span>'
+            f'</div>'
+            f'{dropdown_items}'
+            f'<div class="notif-footer"><a href="/manage/notifications">View all notifications</a></div>'
+            f'</div></div>'
+        )
         nav = (f'<a href="/manage/profile" class="nav-user" style="text-decoration:none">'
                f'<span class="nav-username">{_h(user["username"])}</span> '
                f'<span class="badge badge-{role}">{role_label}</span></a>'
-               f'<a href="/manage/password" class="btn btn-sm">Password</a>'
+               + bell_html +
                f'<a href="/manage/logout" class="btn btn-sm">Logout</a>')
     else:
         nav = ''
@@ -4209,11 +5063,11 @@ def _render_signup(msg: str = '', pw_settings: dict | None = None,
         {pw_req_html}
         <div class="form-group">
           <label for="signup-password">Password</label>
-          <input id="signup-password" type="password" name="password" autocomplete="new-password" required>
+          <div class="pw-wrap"><input id="signup-password" type="password" name="password" autocomplete="new-password" required><button type="button" class="pw-eye" onclick="togglePwVis(this)" aria-label="Show password" tabindex="-1"><svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button></div>
         </div>
         <div class="form-group">
           <label for="signup-confirm">Confirm Password</label>
-          <input id="signup-confirm" type="password" name="confirm_password" required>
+          <div class="pw-wrap"><input id="signup-confirm" type="password" name="confirm_password" autocomplete="new-password" required><button type="button" class="pw-eye" onclick="togglePwVis(this)" aria-label="Show password" tabindex="-1"><svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button></div>
         </div>
         <button type="submit" class="btn btn-primary" style="width:100%;margin-top:8px">Create Account</button>
       </form>
@@ -4446,7 +5300,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   msg: str = '', msg_type: str = 'error',
                   page: int = 1, total_pages: int = 1, total: int = 0,
                   upage: int = 1, utotal_pages: int = 1, utotal: int = 0,
-                  uquery: str = '') -> str:
+                  uquery: str = '', tab: str = '', new_username: str = '') -> str:
     is_super = user['username'] == SUPER_USER
 
     # ── Tracker rows ─────────────────────────────────────────────
@@ -4603,6 +5457,20 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
       </div>
+      <div class="card">
+        <div class="card-title">Comments &amp; Notifications</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Enable or disable the comment and notification system site-wide.
+          When disabled, comments cannot be posted and the notification bell is hidden.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="comments_enabled">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
+            <input type="checkbox" name="comments_enabled" value="1" {'checked' if settings.get('comments_enabled','1')=='1' else ''}> Enable comments &amp; notifications
+          </label>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
     </div>
     <div class="card">
       <div class="card-title">robots.txt</div>
@@ -4618,7 +5486,6 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <button type="submit" class="btn btn-primary">Save</button>
       </form>
     </div>'''
-
     # ── Invites HTML ──────────────────────────────────────────
     all_codes = REGISTRATION_DB.list_invite_codes() if REGISTRATION_DB else []
     _inv_rows = ''
@@ -4671,6 +5538,53 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
       </table>
     </div>'''
 
+    # ── Database Management HTML ─────────────────────────────
+    import os as _os
+    try:
+        _db_size = _os.path.getsize(REGISTRATION_DB._path)
+        _db_size_str = (f'{_db_size / 1048576:.2f} MB' if _db_size >= 1048576
+                        else f'{_db_size / 1024:.1f} KB')
+    except Exception:
+        _db_size_str = 'unknown'
+    database_html = f'''
+    <div class="two-col">
+      <div class="card">
+        <div class="card-title">Backup Database</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:8px">
+          Download a complete gzip-compressed snapshot of the live database.
+          Current size: <strong style="color:var(--text)">{_db_size_str}</strong>
+        </p>
+        <p style="font-size:0.82rem;color:var(--muted);margin-bottom:16px">
+          The backup is taken using SQLite&rsquo;s online backup API &mdash;
+          safe to run while the tracker is live.
+        </p>
+        <a href="/manage/admin/db-backup" class="btn btn-primary"
+           aria-label="Download database backup">&#11015; Download Backup</a>
+      </div>
+      <div class="card">
+        <div class="card-title">Restore Database</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:8px">
+          Upload a <code>.db.gz</code> backup file to replace the live database.
+        </p>
+        <p style="font-size:0.82rem;color:var(--red);margin-bottom:16px">
+          <strong>Warning:</strong> This replaces all current data immediately.
+          Make sure you have a recent backup before restoring.
+        </p>
+        <form method="POST" action="/manage/admin/db-restore"
+              enctype="multipart/form-data"
+              data-confirm="Replace the live database with this backup? All current data will be overwritten.">
+          <div class="form-group">
+            <label for="db-restore-file">Backup File (.db.gz)</label>
+            <input id="db-restore-file" type="file" name="db_file"
+                   accept=".gz,.db.gz" required
+                   style="display:block;margin-top:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <button type="submit" class="btn btn-danger"
+                  aria-label="Restore database from backup file">&#11014; Restore from Backup</button>
+        </form>
+      </div>
+    </div>'''
+
     # ── Auto-promote + Danger HTML ───────────────────────────
     danger_html = f'''
     <div class="two-col">
@@ -4682,7 +5596,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         </p>
         <form method="POST" action="/manage/admin/delete-all-users"
               data-confirm="Delete ALL users except super? This CANNOT be undone.">
-          <button class="btn btn-danger">Delete All Users</button>
+          <button class="btn btn-danger" aria-label="Delete all user accounts">Delete All Users</button>
         </form>
       </div>
       <div class="card" style="border-color:rgba(224,91,48,0.3)">
@@ -4692,8 +5606,30 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         </p>
         <form method="POST" action="/manage/admin/delete-all-torrents"
               data-confirm="Delete ALL registered torrents from the tracker? This CANNOT be undone.">
-          <button class="btn btn-danger">Delete All Torrents</button>
+          <button class="btn btn-danger" aria-label="Delete all torrents">Delete All Torrents</button>
         </form>
+      </div>
+      <div class="card" style="border-color:rgba(224,91,48,0.3)">
+        <div class="card-title" style="color:var(--accent2)">Delete All Comments &amp; Notifications</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Permanently removes every comment and notification across the entire system.
+          Torrent lock states are preserved. This cannot be undone.
+        </p>
+        <form method="POST" action="/manage/admin/delete-all-comments-global"
+              data-confirm="Delete ALL comments and notifications system-wide? This CANNOT be undone.">
+          <button class="btn btn-danger" aria-label="Delete all comments and notifications">Delete All Comments &amp; Notifications</button>
+        </form>
+      </div>
+      <div class="card" style="border-color:rgba(224,91,48,0.6)">
+        <div class="card-title" style="color:var(--red);font-size:0.78rem">&#9762; System Wipe</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          <strong style="color:var(--red)">EXTREME DANGER.</strong>
+          Wipes <em>all</em> users (except your super account), torrents, comments,
+          notifications, invite codes, sessions, and event logs.
+          Returns tracker to near-factory state. This <strong>absolutely cannot</strong> be undone.
+        </p>
+        <button class="btn btn-danger" onclick="initiateSystemWipe()"
+                aria-label="Initiate system wipe — requires typed confirmation">&#9762; System Wipe</button>
       </div>
     </div>'''
 
@@ -4733,15 +5669,8 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         actions = ''
         # Change password -- anyone except superuser passwd (only super can do that via CLI)
         if not u_is_super:
-            actions += f'''
-            <form method="POST" action="/manage/admin/change-password" style="display:inline">
-              <input type="hidden" name="username" value="{uname_h}">
-              <input type="text" name="new_password" placeholder="new password"
-                     style="width:120px;padding:3px 8px;margin-right:4px;background:var(--card2);
-                            border:1px solid var(--border);border-radius:4px;color:var(--text);
-                            font-family:var(--mono);font-size:0.72rem" required>
-              <button class="btn btn-sm">Set Passwd</button>
-            </form>'''
+            actions += (f'<a href="/manage/admin/set-password/{uname_h}"'
+                        f' class="btn btn-sm">Set Password</a>')
 
         # Unlock -- admins and super
         if u['is_locked']:
@@ -4830,17 +5759,32 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     if not ev_rows:
         ev_rows = '<tr><td colspan="5" class="empty">No events yet</td></tr>'
 
-    _tab_settings = ('<button class="tab" onclick="showTab(\'settings\',this)">Settings</button>'
-                     if is_super else '')
-    _tab_invites  = ('<button class="tab" onclick="showTab(\'invites\',this)">Invites</button>'
-                     if (is_super or user['is_admin']) else '')
-    _tab_danger   = ('<button class="tab tab-danger" onclick="showTab(\'danger\',this)"'
-                     '>Danger</button>'
-                     if is_super else '')
-    _autotab_js   = ('<script>window.addEventListener("DOMContentLoaded",function(){'
-                     'var b=document.querySelector(".tab:nth-child(2)");'
-                     'if(b){b.click();}})</script>'
-                     if (uquery or upage > 1) else '')
+    _tab_settings  = ('<button class="tab" onclick="showTab(\'settings\',this)">Settings</button>'
+                      if is_super else '')
+    _tab_database  = ('<button class="tab" onclick="showTab(\'database\',this)">Database</button>'
+                      if is_super else '')
+    _tab_invites   = ('<button class="tab" onclick="showTab(\'invites\',this)">Invites</button>'
+                      if (is_super or user['is_admin']) else '')
+    _tab_danger    = ('<button class="tab tab-danger" onclick="showTab(\'danger\',this)"'
+                      '>Danger</button>'
+                      if is_super else '')
+    _tab_names = ['torrents','users','adduser','trackers','settings','database','invites','danger','events']
+    if tab and tab in _tab_names:
+        _safe_tab = tab.replace("'", '')
+        _autotab_js = (
+            '<script>window.addEventListener("DOMContentLoaded",function(){'
+            'var els=document.querySelectorAll(".tab");'
+            'for(var i=0;i<els.length;i++){'
+            'var oc=els[i].getAttribute("onclick")||"";'
+            f'if(oc.indexOf("showTab(\'{_safe_tab}\'")!==-1){{els[i].click();break;}}'
+            '}})</script>'
+        )
+    elif uquery or upage > 1:
+        _autotab_js = ('<script>window.addEventListener("DOMContentLoaded",function(){'
+                       'var b=document.querySelector(".tab:nth-child(2)");'
+                       'if(b){b.click();}})</script>')
+    else:
+        _autotab_js = ''
 
     body = f'''
   <div class="page-title">Admin Panel</div>
@@ -4852,6 +5796,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     <button class="tab" onclick="showTab('adduser',this)">Add User</button>
     <button class="tab" onclick="showTab('trackers',this)">Trackers</button>
     {_tab_settings}
+    {_tab_database}
     {_tab_invites}
     {_tab_danger}
     <button class="tab" onclick="showTab('events',this)">Event Log</button>
@@ -4899,11 +5844,11 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
       <form method="POST" action="/manage/admin/add-user">
         <div class="form-group">
           <label>Username</label>
-          <input type="text" name="username" required>
+          <input type="text" name="username" value="{_h(new_username)}" required>
         </div>
         <div class="form-group">
-          <label>Password</label>
-          <input type="password" name="password" required>
+          <label for="adduser-pw">Password</label>
+          <div class="pw-wrap"><input id="adduser-pw" type="password" name="password" required autocomplete="new-password"><button type="button" class="pw-eye" onclick="togglePwVis(this)" aria-label="Show password" tabindex="-1"><svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button></div>
         </div>
         {"" if not is_super else """
         <div class="form-group">
@@ -4942,6 +5887,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
   </div>
 
   {'<div class="panel" id="panel-settings">' + settings_html + '</div>' if is_super else ''}
+  {'<div class="panel" id="panel-database">' + database_html + '</div>' if is_super else ''}
   {'<div class="panel" id="panel-invites">' + invites_html + '</div>' if (is_super or user['is_admin']) else ''}
   {'<div class="panel" id="panel-danger">' + danger_html + '</div>' if is_super else ''}
 
@@ -4957,7 +5903,266 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     return _manage_page('Admin Panel', body, user=user, msg=msg, msg_type=msg_type)
 
 
-def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard') -> str:
+def _deliver_notifications(cid: int, ih: str, tname: str,
+                           uname: str, text: str, parent_id):
+    """Send reply and @mention notifications for a newly posted comment."""
+    if not REGISTRATION_DB:
+        return
+    if parent_id:
+        parent_row = REGISTRATION_DB.get_comment(parent_id)
+        if parent_row and parent_row['user_id'] != REGISTRATION_DB.get_user(uname)['id']:
+            REGISTRATION_DB.add_notification(
+                parent_row['user_id'], 'reply', uname, ih, tname, cid)
+    mentioned = set(_MENTION_RE.findall(text))
+    poster = REGISTRATION_DB.get_user(uname)
+    poster_id = poster['id'] if poster else -1
+    for mname in mentioned:
+        if mname == uname: continue
+        muser = REGISTRATION_DB.get_user(mname)
+        if muser and muser['id'] != poster_id:
+            REGISTRATION_DB.add_notification(
+                muser['id'], 'mention', uname, ih, tname, cid)
+
+_MENTION_RE = re.compile(r'@([a-zA-Z0-9._-]+)')
+
+def _render_comment_body(body: str) -> str:
+    """HTML-escape body then linkify @mentions."""
+    escaped = _h(body)
+    def _linkify(m):
+        u = m.group(1)
+        return f'<a href="/manage/user/{_h(u)}" class="user-link">@{_h(u)}</a>'
+    return _MENTION_RE.sub(_linkify, escaped)
+
+
+def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = False) -> str:
+    if not REGISTRATION_DB:
+        return ''
+    all_comments = REGISTRATION_DB.get_comments(info_hash)
+    role   = _user_role(viewer)
+    is_mod = role in ('super', 'admin')
+    ih_h   = _h(info_hash)
+
+    # Build parent->children map  (0 = top-level)
+    children_map: dict = {}
+    for c in all_comments:
+        pid = c['parent_id'] or 0
+        children_map.setdefault(pid, []).append(c)
+
+    def _node(c, depth: int = 0) -> str:
+        cid      = c['id']
+        uname    = _h(c['username'])
+        ts       = _h((c['created_at'] or '')[:16].replace('T', ' '))
+        is_own   = (c['user_id'] == viewer['id'])
+        can_del  = is_mod or is_own
+        can_edit = is_own and not c['is_deleted']
+
+        edited_html = ''
+        if c['edited_at']:
+            et = _h((c['edited_at'] or '')[:16].replace('T', ' '))
+            edited_html = f' <span class="comment-edited">(edited {et})</span>'
+
+        header = (
+            f'<div class="comment-header">'
+            f'<a href="/manage/user/{uname}" class="user-link">{uname}</a>'
+            f'<span class="comment-ts">{ts}</span>'
+            f'{edited_html}'
+            f'</div>'
+        )
+
+        if c['is_deleted']:
+            body_html    = '<div class="comment-deleted">[deleted]</div>'
+            actions_html = ''
+            reply_form   = ''
+            edit_form    = ''
+        else:
+            body_html = (
+                f'<div class="comment-body" id="comment-body-{cid}">'
+                f'{_render_comment_body(c["body"])}</div>'
+            )
+
+            uname_js = uname.replace("'", "\\'")
+            reply_onclick = 'toggleReplyForm(' + str(cid) + ', \'' + uname_js + '\')'  
+            action_btns = []
+            if not locked:
+                action_btns.append(
+                    f'<button class="btn-ghost" onclick="{reply_onclick}"'
+                    f' aria-label="Reply to {uname}">&#x21A9; Reply</button>'
+                )
+            if can_edit and not locked:
+                action_btns.append(
+                    f'<button class="btn-ghost"'
+                    f' onclick="toggleEditForm({cid})"'
+                    f' aria-label="Edit your comment">&#x270E; Edit</button>'
+                )
+            if can_del:
+                action_btns.append(
+                    f'<form method="POST" action="/manage/comment/delete"'
+                    f' style="display:inline">'
+                    f'<input type="hidden" name="comment_id" value="{cid}">'
+                    f'<input type="hidden" name="info_hash" value="{ih_h}">'
+                    f'<button type="submit" class="btn-ghost btn-ghost-danger"'
+                    f' aria-label="Delete comment">&#x2715; Delete</button>'
+                    f'</form>'
+                )
+            actions_html = (
+                f'<div class="comment-actions">{"".join(action_btns)}</div>'
+            )
+
+            edit_form = (
+                f'<div class="comment-edit-form" id="edit-form-{cid}">'
+                f'<form method="POST" action="/manage/comment/edit">'
+                f'<input type="hidden" name="comment_id" value="{cid}">'
+                f'<input type="hidden" name="info_hash" value="{ih_h}">'
+                f'<label for="edit-ta-{cid}" class="sr-only">Edit comment</label>'
+                f'<textarea id="edit-ta-{cid}" class="comment-textarea" name="body"'
+                f' maxlength="2000" aria-label="Edit comment">{_h(c["body"])}</textarea>'
+                f'<div style="display:flex;gap:8px;margin-top:8px">'
+                f'<button type="submit" class="btn btn-primary btn-sm">Save</button>'
+                f'<button type="button" class="btn btn-sm"'
+                f' onclick="toggleEditForm({cid})">Cancel</button>'
+                f'</div></form></div>'
+            )
+
+            # Reply form sits directly below this comment, before children
+            reply_form = '' if locked else (
+                f'<div class="comment-reply-form" id="reply-form-{cid}">'
+                f'<form method="POST" action="/manage/comment/post">'
+                f'<input type="hidden" name="info_hash" value="{ih_h}">'
+                f'<input type="hidden" name="parent_id" value="{cid}">'
+                f'<label for="reply-ta-{cid}" class="sr-only">Reply to {uname}</label>'
+                f'<textarea id="reply-ta-{cid}" class="comment-textarea" name="body"'
+                f' maxlength="2000" placeholder="Replying to {uname}&#8230;"'
+                f' aria-label="Reply to {uname}"></textarea>'
+                f'<div style="display:flex;gap:8px;margin-top:8px">'
+                f'<button type="submit" class="btn btn-primary btn-sm">Post Reply</button>'
+                f'<button type="button" class="btn btn-sm"'
+                f' onclick="toggleReplyForm({cid})">Cancel</button>'
+                f'</div></form></div>'
+            )
+
+        # Render children recursively, indented beneath this node
+        children = children_map.get(cid, [])
+        children_html = ''
+        if children:
+            child_items = ''.join(_node(ch, depth + 1) for ch in children)
+            children_html = f'<div class="comment-children">{child_items}</div>'
+
+        depth_cls = f'comment-depth-{min(depth, 3)}'
+        return (
+            f'<div class="comment-node {depth_cls}" id="comment-{cid}">'
+            f'<div class="comment-inner">'
+            f'{header}{body_html}{edit_form}{actions_html}{reply_form}'
+            f'</div>'
+            f'{children_html}'
+            f'</div>'
+        )
+
+    top_level = children_map.get(0, [])
+    cards_html = ''
+    for c in top_level:
+        cards_html += (
+            f'<div class="comment-card">{_node(c, depth=0)}</div>'
+        )
+
+    if locked:
+        add_form = (
+            f'<div class="card" style="border-color:rgba(224,91,48,0.3)">'
+            f'<div role="status" aria-live="polite"'
+            f' style="display:flex;align-items:center;gap:10px;color:var(--muted);'
+            f'font-family:var(--mono);font-size:0.82rem">'
+            f'&#x1F512; Comments are locked for this torrent.'
+            f'</div></div>'
+        )
+    else:
+        add_form = (
+            f'<div class="card">'
+            f'<div class="card-title">Add Comment</div>'
+            f'<form method="POST" action="/manage/comment/post">'
+            f'<input type="hidden" name="info_hash" value="{ih_h}">'
+            f'<div class="form-group">'
+            f'<label for="new-comment-body" class="sr-only">Write a comment</label>'
+            f'<textarea id="new-comment-body" class="comment-textarea" name="body"'
+            f' maxlength="2000"'
+            f' placeholder="Write a comment&#8230; use @username to mention someone"'
+            f' aria-label="Write a comment" style="min-height:100px"></textarea>'
+            f'</div>'
+            f'<button type="submit" class="btn btn-primary">Post Comment</button>'
+            f'</form></div>'
+        )
+
+    count = len(all_comments)
+    lock_badge = (
+        ' <span style="font-size:0.75rem;color:var(--red);'
+        'font-family:var(--mono);font-weight:400">&#x1F512; Locked</span>'
+        if locked else ''
+    )
+    count_html = (
+        f' <span style="color:var(--muted);font-weight:400">({count})</span>'
+        if count else ''
+    )
+    return (
+        f'<div id="comments-section">'
+        f'<div class="card-title" style="margin-bottom:20px">'
+        f'Comments{count_html}{lock_badge}'
+        f'</div>'
+        f'{cards_html}{add_form}'
+        f'</div>'
+    )
+
+
+def _render_notifications_page(viewer) -> str:
+    if not REGISTRATION_DB:
+        return _manage_page('Notifications', '<p>Unavailable</p>', user=viewer)
+    notifs = REGISTRATION_DB.get_all_notifications(viewer['id'])
+    unread_count = sum(1 for n in notifs if not n['is_read'])
+
+    rows = ''
+    for n in notifs:
+        icon  = '💬' if n['type'] == 'reply' else '@ '
+        label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
+        from_h   = _h(n['from_username'])
+        tname_h  = _h(n['torrent_name'])
+        ts_h     = _h((n['created_at'] or '')[:16].replace('T', ' '))
+        url      = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
+        unread_cls = '' if n['is_read'] else ' unread'
+        n_id = n['id']
+        read_js = f"readNotif({n_id},'{url}')"
+        rows += (
+            f'<div class="notif-page-item{unread_cls}">'
+            f'<div>'
+            f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
+            f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+            f' {label} on '
+            f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+            f'<div class="notif-page-meta">{ts_h}</div>'
+            f'</div>'
+            f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+            f'</div>'
+        )
+
+    if not rows:
+        rows = '<div style="text-align:center;padding:48px;color:var(--muted);font-family:var(--mono);font-size:0.85rem">No notifications yet</div>'
+
+    mark_all = ''
+    if unread_count:
+        mark_all = (
+            f'<form method="POST" action="/manage/notifications/read-all" style="display:inline">'
+            f'<button class="btn btn-sm">✓ Mark all read</button>'
+            f'</form>'
+        )
+
+    body = (
+        f'<div class="page-title">Notifications</div>'
+        f'<div class="page-sub" style="display:flex;justify-content:space-between;align-items:center">'
+        f'<span><a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a></span>'
+        f'{mark_all}'
+        f'</div>'
+        f'{rows}'
+    )
+    return _manage_page('Notifications', body, user=viewer)
+
+
+def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: str = '', msg_type: str = 'error', warn: str = '') -> str:
     """Full detail page for a single torrent."""
     is_super  = viewer['username'] == SUPER_USER
     vrole     = _user_role(viewer)
@@ -5004,7 +6209,29 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard') -> st
                    f' data-confirm="Permanently delete {tname}?">'
                    f'<input type="hidden" name="info_hash" value="{ih}">'
                    f'<input type="hidden" name="redirect" value="{back_url}">'
-                   f'<button class="btn btn-danger">Delete</button></form>')
+                   f'<button class="btn btn-danger" aria-label="Delete torrent {tname}">Delete</button></form>')
+
+    # Lock/unlock comments button (admin/super only)
+    role = _user_role(viewer)
+    lock_btn = ''
+    del_comments_btn = ''
+    if role in ('super', 'admin'):
+        locked = t['comments_locked'] if 'comments_locked' in t.keys() else 0
+        if locked:
+            lock_btn = (f'<a href="/manage/torrent/unlock/{ih.lower()}" class="btn btn-sm"'
+                        f' aria-label="Unlock comments for this torrent">&#x1F513; Unlock Comments</a>')
+        else:
+            lock_btn = (f'<a href="/manage/torrent/lock/{ih.lower()}" class="btn btn-sm btn-danger"'
+                        f' aria-label="Lock comments for this torrent">&#x1F512; Lock Comments</a>')
+        tname_esc = t['name'].replace('"', '&quot;').replace("'", '&#39;')
+        del_comments_btn = (
+            f'<form method="POST" action="/manage/comment/delete-all" style="display:inline"'
+            f' data-confirm="Delete ALL comments on {tname_esc}? This cannot be undone.">'
+            f'<input type="hidden" name="info_hash" value="{ih}">'
+            f'<button type="submit" class="btn btn-sm btn-danger"'
+            f' aria-label="Delete all comments on this torrent">&#x1F5D1; Delete All Comments</button>'
+            f'</form>'
+        )
 
     body = f'''
   <div class="page-title">{t["name"]}</div>
@@ -5043,6 +6270,8 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard') -> st
       <div style="display:flex;flex-direction:column;gap:12px;align-items:flex-start">
         <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet Link</button>
         {del_btn}
+        {lock_btn}
+        {del_comments_btn}
       </div>
     </div>
   </div>
@@ -5051,7 +6280,25 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard') -> st
     {files_html}
   </div>'''
 
-    return _manage_page(t['name'], body, user=viewer)
+    is_locked = bool(t['comments_locked']) if 'comments_locked' in t.keys() else False
+    _comments_globally_on = (
+        REGISTRATION_DB.get_setting('comments_enabled', '1') == '1'
+    ) if REGISTRATION_DB else True
+    comments_html = (
+        _render_comments(ih, viewer, t['name'], locked=is_locked)
+        if _comments_globally_on else ''
+    )
+    warn_script = ''
+    if warn:
+        names = _h(warn)
+        warn_script = (
+            f'<script>document.addEventListener("DOMContentLoaded",function(){{'
+            f'showWarnModal("The following @mention(s) were not delivered because '
+            f'those usernames do not exist:<br><br><strong>{names}</strong>");'
+            f'}});</script>'
+        )
+    return _manage_page(t['name'], body + comments_html + warn_script,
+                        user=viewer, msg=msg, msg_type=msg_type)
 
 
 def _render_public_profile(viewer, target_user, torrents: list,
@@ -5326,15 +6573,21 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     viewer_role = _user_role(viewer)
     t_is_super  = (uname == SUPER_USER)
     t_is_admin  = target_user['is_admin']
-    if not is_own_profile and viewer_role in ('super', 'admin'):
+    if is_own_profile:
+        actions_card = (
+            '<div class="card"><div class="card-title">Actions</div>'
+            '<div style="display:flex;flex-direction:column;gap:14px">'
+            '<div>'
+            '<a href="/manage/password" class="btn btn-primary">Change Password</a>'
+            '</div>'
+            '</div></div>'
+        )
+    elif viewer_role in ('super', 'admin'):
         hi = '<input type="hidden" name="username" value="' + uname_h + '">'
         pw_form = ''
         if not t_is_super:
             pw_form = (
-                '<form method="POST" action="/manage/admin/change-password" style="display:flex;gap:8px;flex-wrap:wrap">'
-                + hi
-                + '<input type="password" name="new_password" placeholder="new password" style="flex:1;min-width:140px;padding:8px 12px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem" required>'
-                + '<button class="btn btn-sm">Set Password</button></form>'
+                '<a href="/manage/admin/set-password/' + uname_h + '" class="btn btn-sm">Set Password</a>'
             )
         unlock_btn = ''
         if target_user['is_locked']:
@@ -5408,7 +6661,6 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + '</div>'
             + '</div></div>'
         )
-
     body = (
         '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;flex-wrap:wrap">'
         + '<div class="page-title">' + uname_h + '</div>'
@@ -5502,6 +6754,36 @@ def _render_invite_section(viewer, target_user, is_own_profile: bool, db) -> str
     )
 
 
+def _render_admin_set_password_page(viewer, target_user, msg: str = '', msg_type: str = 'error') -> str:
+    """Admin-only page to set another user's password — no current password required."""
+    pw_settings = REGISTRATION_DB.get_all_settings() if REGISTRATION_DB else {}
+    pw_req_html = _pw_requirements_html(pw_settings)
+    tname_h = _h(target_user['username'])
+    cancel_url = f'/manage/admin/user/{tname_h}'
+    body = f'''
+  <div style="max-width:420px;margin:0 auto">
+    <div class="page-title">Set Password</div>
+    <div class="page-sub">Changing password for <strong>{tname_h}</strong></div>
+    <div class="card">
+      <form method="POST" action="/manage/admin/set-password">
+        <input type="hidden" name="username" value="{tname_h}">
+        {pw_req_html}
+        <div class="form-group">
+          <label for="asp-new">New Password</label>
+          <div class="pw-wrap"><input id="asp-new" type="password" name="new_password" required autocomplete="new-password"><button type="button" class="pw-eye" onclick="togglePwVis(this)" aria-label="Show password" tabindex="-1"><svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button></div>
+        </div>
+        <div class="form-group">
+          <label for="asp-conf">Confirm New Password</label>
+          <div class="pw-wrap"><input id="asp-conf" type="password" name="confirm_password" required autocomplete="new-password"><button type="button" class="pw-eye" onclick="togglePwVis(this)" aria-label="Show password" tabindex="-1"><svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button></div>
+        </div>
+        <button type="submit" class="btn btn-primary">Set Password</button>
+        <a href="{cancel_url}" class="btn" style="margin-left:8px">Cancel</a>
+      </form>
+    </div>
+  </div>'''
+    return _manage_page('Set Password', body, user=viewer, msg=msg, msg_type=msg_type)
+
+
 def _render_password_page(user, msg: str = '', msg_type: str = 'error') -> str:
     pw_settings = REGISTRATION_DB.get_all_settings() if REGISTRATION_DB else {}
     pw_req_html = _pw_requirements_html(pw_settings)
@@ -5512,17 +6794,17 @@ def _render_password_page(user, msg: str = '', msg_type: str = 'error') -> str:
     <div class="card">
       <form method="POST" action="/manage/password">
         <div class="form-group">
-          <label>Current Password</label>
-          <input type="password" name="current_password" required>
+          <label for="cp-cur">Current Password</label>
+          <div class="pw-wrap"><input id="cp-cur" type="password" name="current_password" required autocomplete="current-password"><button type="button" class="pw-eye" onclick="togglePwVis(this)" aria-label="Show password" tabindex="-1"><svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button></div>
         </div>
         {pw_req_html}
         <div class="form-group">
-          <label>New Password</label>
-          <input type="password" name="new_password" required>
+          <label for="cp-new">New Password</label>
+          <div class="pw-wrap"><input id="cp-new" type="password" name="new_password" required autocomplete="new-password"><button type="button" class="pw-eye" onclick="togglePwVis(this)" aria-label="Show password" tabindex="-1"><svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button></div>
         </div>
         <div class="form-group">
-          <label>Confirm New Password</label>
-          <input type="password" name="confirm_password" required>
+          <label for="cp-conf">Confirm New Password</label>
+          <div class="pw-wrap"><input id="cp-conf" type="password" name="confirm_password" required autocomplete="new-password"><button type="button" class="pw-eye" onclick="togglePwVis(this)" aria-label="Show password" tabindex="-1"><svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button></div>
         </div>
         <button type="submit" class="btn btn-primary">Update Password</button>
         <a href="/manage/dashboard" class="btn" style="margin-left:8px">Cancel</a>
