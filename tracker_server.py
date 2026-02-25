@@ -1999,6 +1999,8 @@ FAVICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
   <ellipse cx="23.5" cy="14.5" rx="0.9" ry="0.6" fill="rgba(255,255,255,0.6)" transform="rotate(-20,23.5,14.5)"/>
 </svg>'''
 
+APPLE_TOUCH_ICON_B64 = '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'
+
 FAVICON_ICO = bytes.fromhex(
     '000001000101000101000001002000280000001600000028000000'
     '010000000200000001002000000000000000000000000000000000'
@@ -2149,6 +2151,7 @@ def generate_stats_html(snap: dict, web_config: dict, show_manage: bool = False)
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Wildkat Tracker</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,{urllib.parse.quote(FAVICON_SVG.strip())}">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=JetBrains+Mono:wght@400;600&family=DM+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
@@ -3843,6 +3846,16 @@ class StatsWebHandler(ManageHandler):
             self.send_header('Cache-Control', 'no-cache')
             self.end_headers()
             self.wfile.write(body)
+        elif path in ('/apple-touch-icon.png', '/apple-touch-icon-precomposed.png'):
+            import base64 as _b64
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/png')
+            self.send_header('Cache-Control', 'public, max-age=86400')
+            data = _b64.b64decode(APPLE_TOUCH_ICON_B64)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         elif path == '/favicon.ico':
             self.send_response(200)
             self.send_header('Content-Type', 'image/x-icon')
@@ -4026,6 +4039,7 @@ _MANAGE_HEAD = '''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{title} -- Wildkat Tracker</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,{favicon}">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
