@@ -26,19 +26,28 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Four-tier role system** — Super, Admin, Standard, Basic — with granular permission boundaries at each level
 - **Superuser account** — designated at startup via `--super-user`; cannot be deleted or demoted; full unrestricted access
 - **User registration** — open signup (configurable), invite-only via invite codes, or admin-created accounts
-- **Invite code system** — admins generate single-use invite URLs from the Invites tab; users can spend reward credits to generate their own; consumed invites record who was invited and by whom
-- **Reward/credits system** — users earn 1 credit per N torrents uploaded (threshold configurable, default 200); credits are spent to generate invite links; admins can manually adjust any user's credit balance; recurring — credits keep accumulating at every threshold milestone
+- **Invite code system** — admins generate single-use invite URLs from the Invites tab; Standard+ users can purchase invite codes with points (default 1,000 pts); consumed invites record who was invited and by whom
+- **Points economy** — a full site-wide economy replacing the old credits system. Users earn points for daily logins (with streak multipliers), torrent uploads, and comments. Points are spent on invite codes, bounties, and peer-to-peer transfers. All economy parameters are configurable from the admin Economy tab
+- **Login streaks** — consecutive daily login bonus multipliers; current streak is visible on profiles and the leaderboard
+- **Bounty board** — users post point-backed content requests. Others contribute to raise the prize, then claim with an info hash when they have the content. Requestor confirms or rejects; community can vote to auto-confirm. Payout splits between claimer, uploader (if different), and a configurable requestor refund; house cut percentage is destroyed (deflationary)
+- **Point transfers** — Standard+ users can send points directly to other users, subject to a configurable fee percentage that is destroyed rather than redistributed
+- **Leaderboard** — six ranked categories: Top Holders, All-Time Earners, Top Uploaders, Bounty Hunters, Login Streaks, Most Chatty. Top N per category is configurable. Standard+ only; Basic users see a teaser listing locked features
+- **Economy admin dashboard** — live stats showing points in circulation, in escrow, in debt, 30-day generation and destruction flow, breakdown by transaction type, and open/pending/fulfilled bounty counts; plus full settings for every economy parameter
 - **Session management** — 48-hour HTTPS-only sessions with secure cookie tokens
 - **CSRF protection** — HMAC-SHA256 tokens bound to session, persisted across server restarts, refreshed on every page load
 - **Torrent registry** — upload `.torrent` files to register info hashes; bulk upload of hundreds of files supported
-- **Token search** — queries are split into tokens matched independently against torrent names; dots, dashes, and underscores treated as word separators so `rental family` matches `Rental.Family.2025.2160p.WEB`
-- **Torrent detail pages** — files, sizes, piece count, piece length, privacy flag, uploader
+- **Token search** — queries split into tokens matched independently against torrent names; dots, dashes, and underscores treated as word separators so `rental family` matches `Rental.Family.2025.2160p.WEB`
+- **Info hash click-to-copy** — click the info hash on any torrent detail page to copy it to clipboard instantly; flashes ✓ Copied confirmation
+- **Torrent detail pages** — files, sizes, piece count, piece length, privacy flag, uploader, copy-magnet button
 - **Magnet link generation** — configurable tracker list with per-tracker enable/disable
 - **IP allowlist** — pin accounts to known IP addresses; build allowlist directly from login history
-- **Admin panel** — manage users, torrents, invite codes, settings, event log; all in one interface
-- **Auto-promotion** — optionally promote Basic users to Standard after a configurable torrent count
+- **Admin panel** — ten tabs: torrents, users, add user, trackers, settings, database, economy, invites, danger, events
+- **Searchable event log** — filter events by free text across all fields, by actor, by action type, or by target; color-coded rows (red for deletions/bans, green for logins/uploads/awards, amber for points/bounties); shows total matching count
+- **Admin point grants** — text input to grant or remove any amount up to a configurable maximum per transaction; ±10 quick buttons; maximum enforced server-side
+- **Auto-promotion** — promote Basic users to Standard after reaching a configurable torrent upload threshold
 - **Open tracker mode** — toggle in settings to accept announces for any info hash without requiring torrent registration; takes effect immediately without restart
-- **Public profile pages** — Standard and above can view other users' profiles and torrent lists
+- **Public profile pages** — Standard+ can view other users' profiles showing points balance, login streak, torrent count, and full paginated torrent list
+- **Three-column navigation bar** — logo left, center nav buttons (🖥 Dashboard, 🔍 Search, 🎯 Bounties, 🏆 Leaderboard), user area with badge and notification bell right; Bounties and Leaderboard hidden for Basic users
 - **Password complexity enforcement** — minimum length, uppercase, lowercase, digit, and symbol requirements; all configurable
 - **Brute-force lockout** — accounts locked after 5 consecutive failed login attempts
 - **Danger zone** — bulk-delete all torrents globally, all torrents per user, or all non-super user accounts; all gated by confirmation dialogs
@@ -190,7 +199,7 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 |------|---------|-------------|
 | `--registration` | off | Enable registration mode and the `/manage` web interface |
 | `--super-user` | — | Superuser username (required with `--registration`) |
-| `--super-user-password` | — | Set or reset the superuser password (service must be stopped) |
+| `--super-user-password` | — | Set or reset the superuser password (process exits after setting) |
 | `--db` | `/opt/tracker/tracker.db` | Path to SQLite database |
 | `--manage-port` | same as `--web-https-port` | Management interface HTTPS port if different from stats port |
 | `--manage-http-port` | 80 | Management HTTP redirect port (0 to disable) |

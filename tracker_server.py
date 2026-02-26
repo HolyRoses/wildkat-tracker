@@ -60,6 +60,26 @@ from socketserver import ThreadingMixIn
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+    request_queue_size = 128  # default is 5; larger backlog survives SYN floods
+    ssl_context = None        # set after construction when HTTPS is needed
+
+    def get_request(self):
+        # Accept the raw TCP connection first
+        conn, addr = self.socket.accept()
+        if self.ssl_context:
+            # Set timeout on the raw socket BEFORE the SSL handshake.
+            # Without this, a scanner that completes TCP but sends no
+            # TLS ClientHello freezes the handshake indefinitely, blocking
+            # the entire accept loop. The timeout raises OSError which
+            # _handle_request_noblock() silently discards and the loop recovers.
+            conn.settimeout(10)
+            try:
+                conn = self.ssl_context.wrap_socket(conn, server_side=True)
+            except Exception:
+                conn.close()
+                raise
+            conn.settimeout(None)  # clear — timeout was only needed for the handshake
+        return conn, addr
 
 
 # ─────────────────────────────────────────────────────────────
@@ -421,8 +441,6 @@ STATS = StatsTracker()
 REGISTRATION_MODE  = False
 REGISTRATION_DB    = None   # RegistrationDB instance, set in main()
 OPEN_TRACKER       = False  # mirrors settings[open_tracker]; updated without restart
-REWARD_ENABLED     = False  # mirrors settings[reward_enabled]
-REWARD_THRESHOLD   = 200    # mirrors settings[reward_threshold]
 SUPER_USER         = ''
 _MANAGE_HTTPS_PORT = 0      # set in main() so /manage routes know the HTTPS port
 
@@ -718,7 +736,13 @@ class RegistrationDB:
                 login_count           INTEGER NOT NULL DEFAULT 0,
                 last_password_change  TEXT,
                 credits               INTEGER NOT NULL DEFAULT 0,
-                credits_awarded       INTEGER NOT NULL DEFAULT 0
+                credits_awarded       INTEGER NOT NULL DEFAULT 0,
+                points                INTEGER NOT NULL DEFAULT 0,
+                login_streak          INTEGER NOT NULL DEFAULT 0,
+                longest_streak        INTEGER NOT NULL DEFAULT 0,
+                last_login_date       TEXT,
+                comment_pts_date      TEXT,
+                comment_pts_today     INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS invite_codes (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -810,6 +834,20 @@ class RegistrationDB:
             c.execute('ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 0')
         if 'credits_awarded' not in ucols:
             c.execute('ALTER TABLE users ADD COLUMN credits_awarded INTEGER NOT NULL DEFAULT 0')
+        if 'points' not in ucols:
+            c.execute('ALTER TABLE users ADD COLUMN points INTEGER NOT NULL DEFAULT 0')
+            # migrate existing credits balance into points
+            c.execute('UPDATE users SET points = credits WHERE credits > 0')
+        if 'login_streak' not in ucols:
+            c.execute('ALTER TABLE users ADD COLUMN login_streak INTEGER NOT NULL DEFAULT 0')
+        if 'longest_streak' not in ucols:
+            c.execute('ALTER TABLE users ADD COLUMN longest_streak INTEGER NOT NULL DEFAULT 0')
+        if 'last_login_date' not in ucols:
+            c.execute('ALTER TABLE users ADD COLUMN last_login_date TEXT')
+        if 'comment_pts_date' not in ucols:
+            c.execute('ALTER TABLE users ADD COLUMN comment_pts_date TEXT')
+        if 'comment_pts_today' not in ucols:
+            c.execute('ALTER TABLE users ADD COLUMN comment_pts_today INTEGER NOT NULL DEFAULT 0')
         # comments_locked column (may not exist on older installs)
         tcols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
         if 'comments_locked' not in tcols:
@@ -825,6 +863,21 @@ class RegistrationDB:
                 consumed_at          TEXT,
                 consumed_by_username TEXT
             )''')
+        c.commit()
+        # ── Points ledger (migration-safe) ───────────────────
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS points_ledger (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER NOT NULL,
+                delta         INTEGER NOT NULL,
+                balance_after INTEGER NOT NULL,
+                reason        TEXT    NOT NULL,
+                ref_type      TEXT    NOT NULL DEFAULT '',
+                ref_id        TEXT    NOT NULL DEFAULT '',
+                created_at    TEXT    NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+        ''')
         c.commit()
         # ── Comments & notifications (migration-safe) ────────
         c.executescript('''
@@ -852,6 +905,49 @@ class RegistrationDB:
             );
         ''')
         c.commit()
+        # ── Bounty system (migration-safe) ───────────────────
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS bounties (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_by       TEXT    NOT NULL,
+                description      TEXT    NOT NULL,
+                status           TEXT    NOT NULL DEFAULT 'open',
+                initial_cost     INTEGER NOT NULL DEFAULT 0,
+                total_escrow     INTEGER NOT NULL DEFAULT 0,
+                claimed_infohash TEXT,
+                claimed_by       TEXT,
+                claimed_at       TEXT,
+                fulfilled_by     TEXT,
+                fulfilled_at     TEXT,
+                created_at       TEXT    NOT NULL,
+                expires_at       TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bounty_contributions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                bounty_id   INTEGER NOT NULL,
+                username    TEXT    NOT NULL,
+                amount      INTEGER NOT NULL,
+                contributed_at TEXT NOT NULL,
+                FOREIGN KEY (bounty_id) REFERENCES bounties(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS bounty_votes (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                bounty_id  INTEGER NOT NULL,
+                username   TEXT    NOT NULL,
+                voted_at   TEXT    NOT NULL,
+                UNIQUE(bounty_id, username),
+                FOREIGN KEY (bounty_id) REFERENCES bounties(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS bounty_comments (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                bounty_id  INTEGER NOT NULL,
+                username   TEXT    NOT NULL,
+                body       TEXT    NOT NULL,
+                created_at TEXT    NOT NULL,
+                FOREIGN KEY (bounty_id) REFERENCES bounties(id) ON DELETE CASCADE
+            );
+        ''')
+        c.commit()
 
     def _init_defaults(self, announce_urls: list):
         """Seed magnet_trackers and settings if not already present."""
@@ -860,7 +956,7 @@ class RegistrationDB:
         defaults = {
             'free_signup':           '0',
             'auto_promote_enabled':   '0',
-            'auto_promote_threshold': '25',
+            'auto_promote_threshold': '100',
             'torrents_per_page':       '50',
             'robots_txt':              'User-agent: *\nDisallow: /announce\nDisallow: /scrape\nDisallow: /manage\n',
             'pw_min_length':     '12',
@@ -869,9 +965,31 @@ class RegistrationDB:
             'pw_require_digit':  '1',
             'pw_require_symbol': '1',
             'open_tracker':       '0',
-            'reward_enabled':     '0',
             'comments_enabled':   '1',
-            'reward_threshold':   '200',
+            # ── Points economy ────────────────────────────────
+            'points_login_daily':       '1',
+            'points_streak_7day':       '1',
+            'points_streak_30day':      '4',
+            'points_upload':            '25',
+            'points_comment':           '1',
+            'points_comment_cap':       '10',
+            'points_penalty_torrent':   '25',
+            'points_penalty_comment':   '1',
+            'points_invite_cost':       '1000',
+            'points_transfer_fee_pct':  '25',
+            # ── Bounty system ─────────────────────────────────
+            'bounty_min_cost':          '50',
+            'bounty_refund_pct':        '25',
+            'bounty_claimer_pct':       '70',
+            'bounty_uploader_pct':      '15',
+            'bounty_reject_penalty':    '10',
+            'bounty_expiry_days':       '90',
+            'bounty_confirm_votes':     '3',
+            'bounty_pending_hours':     '48',
+            # ── Leaderboard ───────────────────────────────────
+            'leaderboard_top_n':        '10',
+            # ── Admin ─────────────────────────────────────────
+            'admin_max_point_grant':    '1000',
         }
         for k, v in defaults.items():
             c.execute('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)', (k, v))
@@ -1136,21 +1254,19 @@ class RegistrationDB:
         self._log(actor, 'delete_all_torrents', 'ALL', 'deleted entire torrent database')
 
     def check_auto_promote(self, user_id: int) -> bool:
-        """Promote basic→standard if upload threshold reached. Returns True if promoted."""
+        """Promote basic→standard if points threshold reached. Returns True if promoted."""
         if self.get_setting('auto_promote_enabled') != '1':
             return False
         user = self.get_user_by_id(user_id)
         if not user or user['is_standard'] or user['is_admin']:
             return False
-        threshold = int(self.get_setting('auto_promote_threshold', '25'))
-        count = self._conn().execute(
-            'SELECT COUNT(*) FROM torrents WHERE uploaded_by_id=?', (user_id,)
-        ).fetchone()[0]
-        if count >= threshold:
+        threshold = int(self.get_setting('auto_promote_threshold', '100'))
+        pts = user['points'] if 'points' in user.keys() else 0
+        if pts >= threshold:
             self._conn().execute('UPDATE users SET is_standard=1 WHERE id=?', (user_id,))
             self._conn().commit()
             self._log('system', 'auto_promote', user['username'],
-                      f'promoted to standard after {count} uploads')
+                      f'promoted to standard after reaching {pts} points')
             return True
         return False
 
@@ -1242,49 +1358,235 @@ class RegistrationDB:
 
     # ── Credits & Invite Codes ────────────────────────────
 
-    def check_reward_credit(self, user_id: int) -> bool:
-        """Award credits if user has crossed a new reward threshold. Returns True if awarded."""
-        if not REWARD_ENABLED or REWARD_THRESHOLD < 1:
-            return False
+    # ── Points Engine ─────────────────────────────────────────
+
+    def award_points(self, user_id: int, delta: int, reason: str,
+                     ref_type: str = '', ref_id: str = '') -> int:
+        """Award (positive) or deduct (negative) points. Points can go negative.
+        Writes a ledger entry and returns the new balance."""
+        c = self._conn()
+        c.execute('UPDATE users SET points = points + ? WHERE id = ?', (delta, user_id))
+        c.commit()
+        row = c.execute('SELECT points FROM users WHERE id=?', (user_id,)).fetchone()
+        balance = row[0] if row else 0
+        c.execute(
+            'INSERT INTO points_ledger (user_id,delta,balance_after,reason,ref_type,ref_id,created_at)'
+            ' VALUES (?,?,?,?,?,?,?)',
+            (user_id, delta, balance, reason, ref_type, ref_id, self._ts())
+        )
+        c.commit()
+        return balance
+
+    def spend_points(self, user_id: int, amount: int, reason: str,
+                     ref_type: str = '', ref_id: str = '') -> bool:
+        """Spend points only if balance >= amount. Returns True on success."""
         user = self.get_user_by_id(user_id)
         if not user:
             return False
-        count = self._conn().execute(
-            'SELECT COUNT(*) FROM torrents WHERE uploaded_by_id=?', (user_id,)
-        ).fetchone()[0]
-        should_have = count // REWARD_THRESHOLD
-        awarded = user['credits_awarded']
-        to_give = should_have - awarded
-        if to_give > 0:
-            self._conn().execute(
-                'UPDATE users SET credits=credits+?, credits_awarded=credits_awarded+? WHERE id=?',
-                (to_give, to_give, user_id)
-            )
-            self._conn().commit()
-            self._log('system', 'reward_credit', user['username'],
-                      f'{to_give} credit(s) awarded at {count} torrents')
-            return True
-        return False
+        pts = user['points'] if 'points' in user.keys() else 0
+        if pts < amount:
+            return False
+        self.award_points(user_id, -amount, reason, ref_type, ref_id)
+        return True
 
-    def adjust_credits(self, username: str, delta: int, actor: str) -> int:
-        """Add delta credits to user (can be negative, floored at 0). Returns new balance."""
-        self._conn().execute(
-            'UPDATE users SET credits=MAX(0, credits+?) WHERE username=?',
-            (delta, username)
-        )
-        self._conn().commit()
-        row = self._conn().execute(
-            'SELECT credits FROM users WHERE username=?', (username,)
-        ).fetchone()
-        new_bal = row[0] if row else 0
-        action = 'credit_add' if delta > 0 else 'credit_remove'
+    def adjust_points(self, username: str, delta: int, actor: str) -> int:
+        """Admin manual point adjustment (can be positive or negative). Returns new balance."""
+        user = self.get_user(username)
+        if not user:
+            return 0
+        reason = f'Admin adjustment by {actor} ({delta:+d})'
+        new_bal = self.award_points(user['id'], delta, reason, 'admin', actor)
+        action = 'points_add' if delta > 0 else 'points_remove'
         self._log(actor, action, username, f'delta={delta:+d} balance={new_bal}')
+        self.check_auto_promote(user['id'])
         return new_bal
 
+    def daily_login_check(self, user_id: int) -> int:
+        """Award daily login + streak bonus points. Returns points awarded (0 if already done today)."""
+        today = datetime.date.today().isoformat()
+        user = self.get_user_by_id(user_id)
+        if not user:
+            return 0
+        last_date = user['last_login_date'] if 'last_login_date' in user.keys() else None
+        if last_date == today:
+            return 0  # already awarded today
+        # Calculate streak
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        current_streak = user['login_streak'] if 'login_streak' in user.keys() else 0
+        new_streak = (current_streak + 1) if last_date == yesterday else 1
+        longest = max(user['longest_streak'] if 'longest_streak' in user.keys() else 0, new_streak)
+        c = self._conn()
+        c.execute(
+            'UPDATE users SET last_login_date=?, login_streak=?, longest_streak=? WHERE id=?',
+            (today, new_streak, longest, user_id)
+        )
+        c.commit()
+        # Compute points to award
+        daily = int(self.get_setting('points_login_daily', '1'))
+        s7    = int(self.get_setting('points_streak_7day',  '1'))
+        s30   = int(self.get_setting('points_streak_30day', '4'))
+        total = daily
+        parts = ['daily login']
+        if new_streak % 7 == 0:
+            total += s7
+            parts.append(f'7-day streak (day {new_streak})')
+        if new_streak % 30 == 0:
+            total += s30
+            parts.append(f'30-day streak (day {new_streak})')
+        self.award_points(user_id, total, ' + '.join(parts), 'login', today)
+        self.check_auto_promote(user_id)
+        return total
+
+    def award_upload_points(self, user_id: int, torrent_name: str, info_hash: str) -> int:
+        """Award points for a new torrent upload. Returns points awarded."""
+        pts = int(self.get_setting('points_upload', '25'))
+        bal = self.award_points(user_id, pts, f'upload: {torrent_name}', 'torrent', info_hash)
+        self.check_auto_promote(user_id)
+        return pts
+
+    def award_comment_points(self, user_id: int, comment_id: int) -> int:
+        """Award comment points (up to daily cap). Returns points awarded (0 if cap reached)."""
+        pts_each = int(self.get_setting('points_comment', '1'))
+        cap      = int(self.get_setting('points_comment_cap', '10'))
+        today    = datetime.date.today().isoformat()
+        user = self.get_user_by_id(user_id)
+        if not user:
+            return 0
+        # Reset daily counter if date changed
+        c_date  = user['comment_pts_date']  if 'comment_pts_date'  in user.keys() else None
+        c_today = user['comment_pts_today'] if 'comment_pts_today' in user.keys() else 0
+        if c_date != today:
+            c_today = 0
+        if c_today >= cap:
+            return 0
+        c = self._conn()
+        c.execute(
+            'UPDATE users SET comment_pts_date=?, comment_pts_today=? WHERE id=?',
+            (today, c_today + pts_each, user_id)
+        )
+        c.commit()
+        self.award_points(user_id, pts_each, 'comment posted', 'comment', str(comment_id))
+        self.check_auto_promote(user_id)
+        return pts_each
+
+    def penalize_torrent_owner(self, info_hash: str, actor: str):
+        """Deduct points from the torrent owner when an admin deletes their torrent."""
+        row = self._conn().execute(
+            'SELECT uploaded_by_id, uploaded_by_username FROM torrents WHERE info_hash=?',
+            (info_hash.upper(),)
+        ).fetchone()
+        if not row or not row['uploaded_by_id']:
+            return
+        owner_id = row['uploaded_by_id']
+        owner_un = row['uploaded_by_username']
+        # Only penalize if actor is not the owner (i.e. admin removal)
+        if owner_un == actor:
+            return
+        pts = int(self.get_setting('points_penalty_torrent', '25'))
+        self.award_points(owner_id, -pts, f'torrent removed by {actor}', 'penalty_torrent',
+                          info_hash.upper())
+        self._log(actor, 'points_penalty', owner_un, f'-{pts} pts (torrent removed)')
+
+    def penalize_comment_author(self, comment_id: int, actor: str):
+        """Deduct points from comment author when an admin deletes their comment."""
+        row = self._conn().execute(
+            'SELECT user_id, username FROM comments WHERE id=?', (comment_id,)
+        ).fetchone()
+        if not row:
+            return
+        if row['username'] == actor:
+            return  # self-delete: no penalty
+        pts = int(self.get_setting('points_penalty_comment', '1'))
+        self.award_points(row['user_id'], -pts, f'comment removed by {actor}', 'penalty_comment',
+                          str(comment_id))
+
+    def spend_points_for_invite(self, username: str) -> str | None:
+        """Spend invite cost in points to generate an invite. Returns token or None."""
+        cost = int(self.get_setting('points_invite_cost', '1000'))
+        user = self.get_user(username)
+        if not user:
+            return None
+        pts = user['points'] if 'points' in user.keys() else 0
+        if pts < cost:
+            return None
+        self.spend_points(user['id'], cost, f'invite code purchased ({cost} pts)',
+                          'invite', '')
+        return self.create_invite_code(username)
+
+    def transfer_points(self, from_username: str, to_username: str, amount: int) -> tuple[bool, str]:
+        """Transfer points between users with configurable fee. Returns (success, message)."""
+        if from_username == to_username:
+            return False, 'Cannot transfer to yourself.'
+        sender = self.get_user(from_username)
+        recipient = self.get_user(to_username)
+        if not sender:
+            return False, 'Sender not found.'
+        if not recipient:
+            return False, f'User @{to_username} not found.'
+        sender_pts = sender['points'] if 'points' in sender.keys() else 0
+        if sender_pts < amount:
+            return False, f'Insufficient points. You have {sender_pts} pts.'
+        fee_pct = int(self.get_setting('points_transfer_fee_pct', '25'))
+        fee  = max(1, round(amount * fee_pct / 100))
+        received = amount - fee
+        self.spend_points(sender['id'], amount,
+                          f'transfer to @{to_username} ({fee} pts fee)',
+                          'transfer', to_username)
+        self.award_points(recipient['id'], received,
+                          f'transfer from @{from_username} ({fee} pts fee deducted)',
+                          'transfer', from_username)
+        self._log(from_username, 'transfer_points', to_username,
+                  f'sent={amount} fee={fee} received={received}')
+        self.check_auto_promote(recipient['id'])
+        return True, f'Transferred {received} pts to @{to_username} ({fee} pts fee).'
+
+    def get_points_ledger(self, user_id: int, limit: int = 50) -> list:
+        """Return most recent ledger entries for a user."""
+        return self._conn().execute(
+            'SELECT * FROM points_ledger WHERE user_id=? ORDER BY id DESC LIMIT ?',
+            (user_id, limit)
+        ).fetchall()
+
+    def get_economy_stats(self) -> dict:
+        """Return economy-wide statistics for the admin dashboard."""
+        c = self._conn()
+        def _q(sql, *args):
+            row = c.execute(sql, args).fetchone()
+            return row[0] if row and row[0] is not None else 0
+        total_positive  = _q('SELECT SUM(points) FROM users WHERE points > 0')
+        total_debt      = _q('SELECT SUM(points) FROM users WHERE points < 0')
+        total_generated = _q('SELECT SUM(delta) FROM points_ledger WHERE delta > 0')
+        total_destroyed = _q('SELECT SUM(delta) FROM points_ledger WHERE delta < 0')
+        in_escrow       = _q("SELECT SUM(total_escrow) FROM bounties WHERE status IN ('open','pending')")
+        cutoff30 = (datetime.datetime.now() - datetime.timedelta(days=30)).isoformat()
+        gen_30d  = _q('SELECT SUM(delta) FROM points_ledger WHERE delta > 0 AND created_at > ?', cutoff30)
+        burn_30d = _q('SELECT SUM(delta) FROM points_ledger WHERE delta < 0 AND created_at > ?', cutoff30)
+        open_bounties     = _q("SELECT COUNT(*) FROM bounties WHERE status='open'")
+        pending_bounties  = _q("SELECT COUNT(*) FROM bounties WHERE status='pending'")
+        fulfilled_bounties= _q("SELECT COUNT(*) FROM bounties WHERE status='fulfilled'")
+        expired_bounties  = _q("SELECT COUNT(*) FROM bounties WHERE status='expired'")
+        rows = c.execute(
+            'SELECT ref_type, SUM(delta) as net FROM points_ledger GROUP BY ref_type ORDER BY ref_type'
+        ).fetchall()
+        breakdown = {r['ref_type'] or 'other': r['net'] for r in rows}
+        return {
+            'in_circulation':  total_positive,
+            'in_debt':         abs(total_debt),
+            'in_escrow':       in_escrow,
+            'total_generated': total_generated,
+            'total_destroyed': abs(total_destroyed),
+            'net_all_time':    total_generated + total_destroyed,
+            'gen_30d':         gen_30d,
+            'burn_30d':        abs(burn_30d),
+            'net_30d':         gen_30d + burn_30d,
+            'breakdown':       breakdown,
+            'open_bounties':     open_bounties,
+            'pending_bounties':  pending_bounties,
+            'fulfilled_bounties':fulfilled_bounties,
+            'expired_bounties':  expired_bounties,
+        }
+
     def create_invite_code(self, created_by_username: str) -> str:
-        """Generate a new invite code, spending 1 credit if user is not admin/super.
-        Admin/super generate for free. Returns the token.
-        """
         token = secrets.token_urlsafe(32)
         self._conn().execute(
             'INSERT INTO invite_codes (code, created_by_username, created_at) VALUES (?,?,?)',
@@ -1294,18 +1596,373 @@ class RegistrationDB:
         self._log(created_by_username, 'create_invite', token[:12] + '...')
         return token
 
-    def spend_credit_for_invite(self, username: str) -> str | None:
-        """Spend 1 credit and create an invite. Returns token or None if no credits."""
-        row = self._conn().execute(
-            'SELECT credits FROM users WHERE username=?', (username,)
+    # ── Bounty System ─────────────────────────────────────────
+
+    def create_bounty(self, username: str, description: str) -> tuple[bool, str]:
+        """Create a new bounty. Spends points. Returns (ok, message_or_id)."""
+        min_cost = int(self.get_setting('bounty_min_cost', '50'))
+        ok = self.spend_points(
+            self.get_user(username)['id'], min_cost,
+            f'bounty created: {description[:40]}', 'bounty', ''
+        )
+        if not ok:
+            return False, f'Insufficient points. Minimum bounty cost is {min_cost} pts.'
+        expiry = (datetime.datetime.now() +
+                  datetime.timedelta(days=int(self.get_setting('bounty_expiry_days', '90')))
+                  ).date().isoformat()
+        c = self._conn()
+        cur = c.execute(
+            'INSERT INTO bounties (created_by, description, status, initial_cost, total_escrow, created_at, expires_at)'
+            ' VALUES (?,?,?,?,?,?,?)',
+            (username, description, 'open', min_cost, min_cost, self._ts(), expiry)
+        )
+        c.commit()
+        bid = cur.lastrowid
+        # Record the contribution
+        c.execute('INSERT INTO bounty_contributions (bounty_id,username,amount,contributed_at) VALUES (?,?,?,?)',
+                  (bid, username, min_cost, self._ts()))
+        c.commit()
+        self._log(username, 'bounty_create', str(bid), description[:60])
+        return True, str(bid)
+
+    def contribute_to_bounty(self, bounty_id: int, username: str, amount: int) -> tuple[bool, str]:
+        """Add points to an existing open bounty."""
+        b = self.get_bounty(bounty_id)
+        if not b:
+            return False, 'Bounty not found.'
+        if b['status'] not in ('open', 'pending'):
+            return False, 'Bounty is no longer active.'
+        user = self.get_user(username)
+        if not user:
+            return False, 'User not found.'
+        if amount < 1:
+            return False, 'Amount must be at least 1.'
+        ok = self.spend_points(user['id'], amount,
+                               f'contributed {amount} pts to bounty #{bounty_id}',
+                               'bounty_contrib', str(bounty_id))
+        if not ok:
+            return False, 'Insufficient points.'
+        c = self._conn()
+        c.execute('UPDATE bounties SET total_escrow=total_escrow+? WHERE id=?', (amount, bounty_id))
+        c.execute('INSERT INTO bounty_contributions (bounty_id,username,amount,contributed_at) VALUES (?,?,?,?)',
+                  (bounty_id, username, amount, self._ts()))
+        c.commit()
+        # Notify bounty creator
+        creator = b['created_by']
+        if creator != username:
+            self._notify_bounty(creator, 'bounty_contribution', username, bounty_id,
+                                b['description'], amount)
+        self._log(username, 'bounty_contribute', str(bounty_id), f'+{amount} pts')
+        return True, 'Contributed successfully.'
+
+    def claim_bounty(self, bounty_id: int, claimer: str, info_hash: str) -> tuple[bool, str]:
+        """Submit an infohash as fulfillment. First valid submission wins."""
+        b = self.get_bounty(bounty_id)
+        if not b:
+            return False, 'Bounty not found.'
+        if b['status'] != 'open':
+            return False, 'Bounty is not open for claims.'
+        if b['created_by'] == claimer:
+            return False, 'You cannot claim your own bounty.'
+        ih = info_hash.strip().upper()
+        torrent = self.get_torrent(ih)
+        if not torrent:
+            return False, 'No torrent with that info hash is registered on this tracker.'
+        now = datetime.datetime.now()
+        expiry_dt = datetime.datetime.fromisoformat(b['expires_at'] + 'T23:59:59')
+        if now > expiry_dt:
+            return False, 'This bounty has expired.'
+        pending_until = (now + datetime.timedelta(
+            hours=int(self.get_setting('bounty_pending_hours', '48'))
+        )).isoformat()
+        c = self._conn()
+        c.execute(
+            'UPDATE bounties SET status=?,claimed_infohash=?,claimed_by=?,claimed_at=? WHERE id=?',
+            ('pending', ih, claimer, self._ts(), bounty_id)
+        )
+        c.commit()
+        self._log(claimer, 'bounty_claim', str(bounty_id), f'ih={ih} torrent={torrent["name"]}')
+        # Notify all contributors
+        contributors = self._get_bounty_contributor_usernames(bounty_id)
+        for u in contributors:
+            if u != claimer:
+                self._notify_bounty(u, 'bounty_claimed', claimer, bounty_id,
+                                    b['description'], 0, ih)
+        return True, 'Claim submitted. Awaiting confirmation.'
+
+    def confirm_bounty(self, bounty_id: int, confirmer: str) -> tuple[bool, str]:
+        """Requestor confirms fulfillment. Pays out escrow."""
+        b = self.get_bounty(bounty_id)
+        if not b:
+            return False, 'Bounty not found.'
+        if b['status'] != 'pending':
+            return False, 'No pending claim to confirm.'
+        if b['created_by'] != confirmer:
+            return False, 'Only the bounty creator can confirm.'
+        return self._fulfill_bounty(bounty_id, refund_requestor=True)
+
+    def reject_bounty_claim(self, bounty_id: int, rejecter: str) -> tuple[bool, str]:
+        """Requestor rejects the claim. Bounty returns to open. Claimer penalised."""
+        b = self.get_bounty(bounty_id)
+        if not b:
+            return False, 'Bounty not found.'
+        if b['status'] != 'pending':
+            return False, 'No pending claim to reject.'
+        if b['created_by'] != rejecter:
+            return False, 'Only the bounty creator can reject a claim.'
+        claimer = b['claimed_by']
+        penalty = int(self.get_setting('bounty_reject_penalty', '10'))
+        claimer_user = self.get_user(claimer)
+        if claimer_user:
+            self.award_points(claimer_user['id'], -penalty,
+                              f'bounty #{bounty_id} claim rejected', 'bounty_reject', str(bounty_id))
+        c = self._conn()
+        c.execute(
+            'UPDATE bounties SET status=?,claimed_infohash=NULL,claimed_by=NULL,claimed_at=NULL WHERE id=?',
+            ('open', bounty_id)
+        )
+        c.commit()
+        self._log(rejecter, 'bounty_reject', str(bounty_id), f'claimer={claimer}')
+        if claimer_user:
+            self._notify_bounty(claimer, 'bounty_rejected', rejecter, bounty_id,
+                                b['description'], 0)
+        return True, 'Claim rejected. Bounty is open again.'
+
+    def vote_bounty_fulfilled(self, bounty_id: int, voter: str) -> tuple[bool, str]:
+        """Community vote that a pending claim is legitimate."""
+        b = self.get_bounty(bounty_id)
+        if not b:
+            return False, 'Bounty not found.'
+        if b['status'] != 'pending':
+            return False, 'No pending claim to vote on.'
+        if b['created_by'] == voter or b['claimed_by'] == voter:
+            return False, 'Requestor and claimer cannot vote.'
+        c = self._conn()
+        try:
+            c.execute('INSERT INTO bounty_votes (bounty_id,username,voted_at) VALUES (?,?,?)',
+                      (bounty_id, voter, self._ts()))
+            c.commit()
+        except sqlite3.IntegrityError:
+            return False, 'You have already voted.'
+        # Check if threshold reached
+        vote_count = c.execute('SELECT COUNT(*) FROM bounty_votes WHERE bounty_id=?',
+                               (bounty_id,)).fetchone()[0]
+        threshold = int(self.get_setting('bounty_confirm_votes', '3'))
+        if vote_count >= threshold:
+            self._fulfill_bounty(bounty_id, refund_requestor=False)
+        return True, 'Vote recorded.'
+
+    def _fulfill_bounty(self, bounty_id: int, refund_requestor: bool) -> tuple[bool, str]:
+        """Internal: pay out escrow and close bounty as fulfilled."""
+        b = self.get_bounty(bounty_id)
+        claimer  = b['claimed_by']
+        ih       = b['claimed_infohash']
+        escrow   = b['total_escrow']
+        torrent  = self.get_torrent(ih) if ih else None
+        uploader = torrent['uploaded_by_username'] if torrent else None
+
+        claimer_pct  = int(self.get_setting('bounty_claimer_pct',  '70')) / 100
+        uploader_pct = int(self.get_setting('bounty_uploader_pct', '15')) / 100
+
+        claimer_pay  = int(escrow * claimer_pct)
+        if uploader and uploader != claimer:
+            uploader_pay = int(escrow * uploader_pct)
+        else:
+            uploader_pay = 0
+            claimer_pay  = int(escrow * (claimer_pct + uploader_pct))
+
+        # Pay claimer
+        claimer_user = self.get_user(claimer)
+        if claimer_user:
+            self.award_points(claimer_user['id'], claimer_pay,
+                              f'bounty #{bounty_id} fulfilled (claimer share)',
+                              'bounty_payout', str(bounty_id))
+        # Pay uploader if different
+        if uploader_pay > 0:
+            up_user = self.get_user(uploader)
+            if up_user:
+                self.award_points(up_user['id'], uploader_pay,
+                                  f'your torrent fulfilled bounty #{bounty_id}',
+                                  'bounty_payout', str(bounty_id))
+                self._notify_bounty(uploader, 'bounty_uploader_payout', claimer, bounty_id,
+                                    b['description'], uploader_pay, ih)
+        # Refund requestor their initial cost % if confirming themselves
+        if refund_requestor:
+            refund_pct = int(self.get_setting('bounty_refund_pct', '25')) / 100
+            refund_amt = int(b['initial_cost'] * refund_pct)
+            if refund_amt > 0:
+                req_user = self.get_user(b['created_by'])
+                if req_user:
+                    self.award_points(req_user['id'], refund_amt,
+                                      f'bounty #{bounty_id} confirmed — partial refund',
+                                      'bounty_refund', str(bounty_id))
+
+        c = self._conn()
+        c.execute(
+            'UPDATE bounties SET status=?,fulfilled_by=?,fulfilled_at=? WHERE id=?',
+            ('fulfilled', claimer, self._ts(), bounty_id)
+        )
+        c.commit()
+        self._log('system', 'bounty_fulfilled', str(bounty_id),
+                  f'claimer={claimer} escrow={escrow} refund={refund_requestor}')
+        if claimer_user:
+            self._notify_bounty(claimer, 'bounty_fulfilled', b['created_by'], bounty_id,
+                                b['description'], claimer_pay, ih)
+        return True, 'Bounty fulfilled.'
+
+    def expire_bounties(self):
+        """Called periodically to expire stale bounties and destroy their escrow."""
+        today = datetime.date.today().isoformat()
+        c = self._conn()
+        expired = c.execute(
+            "SELECT * FROM bounties WHERE status IN ('open','pending') AND expires_at <= ?",
+            (today,)
+        ).fetchall()
+        for b in expired:
+            c.execute("UPDATE bounties SET status='expired' WHERE id=?", (b['id'],))
+            c.commit()
+            contributors = self._get_bounty_contributor_usernames(b['id'])
+            for u in contributors:
+                self._notify_bounty(u, 'bounty_expired', 'system', b['id'],
+                                    b['description'], 0)
+            self._log('system', 'bounty_expired', str(b['id']),
+                      f'{b["total_escrow"]} pts destroyed')
+
+    def get_bounty(self, bounty_id: int):
+        return self._conn().execute(
+            'SELECT * FROM bounties WHERE id=?', (bounty_id,)
         ).fetchone()
-        if not row or row[0] < 1:
-            return None
+
+    def list_bounties(self, status: str | None = None, sort: str = 'points',
+                      page: int = 1, per_page: int = 20) -> tuple[list, int]:
+        c = self._conn()
+        where = ''
+        args: list = []
+        if status:
+            where = 'WHERE status=?'
+            args.append(status)
+        order = {
+            'points':  'total_escrow DESC',
+            'newest':  'created_at DESC',
+            'oldest':  'created_at ASC',
+        }.get(sort, 'total_escrow DESC')
+        total = c.execute(f'SELECT COUNT(*) FROM bounties {where}', args).fetchone()[0]
+        offset = (page - 1) * per_page
+        rows = c.execute(
+            f'SELECT * FROM bounties {where} ORDER BY {order} LIMIT ? OFFSET ?',
+            args + [per_page, offset]
+        ).fetchall()
+        return rows, total
+
+    def get_bounty_contributions(self, bounty_id: int) -> list:
+        return self._conn().execute(
+            'SELECT * FROM bounty_contributions WHERE bounty_id=? ORDER BY contributed_at',
+            (bounty_id,)
+        ).fetchall()
+
+    def get_bounty_votes(self, bounty_id: int) -> list:
+        return self._conn().execute(
+            'SELECT * FROM bounty_votes WHERE bounty_id=? ORDER BY voted_at',
+            (bounty_id,)
+        ).fetchall()
+
+    def get_bounty_comments(self, bounty_id: int) -> list:
+        return self._conn().execute(
+            'SELECT * FROM bounty_comments WHERE bounty_id=? ORDER BY created_at',
+            (bounty_id,)
+        ).fetchall()
+
+    def add_bounty_comment(self, bounty_id: int, username: str, body: str) -> int:
+        c = self._conn()
+        cur = c.execute(
+            'INSERT INTO bounty_comments (bounty_id,username,body,created_at) VALUES (?,?,?,?)',
+            (bounty_id, username, body, self._ts())
+        )
+        c.commit()
+        return cur.lastrowid
+
+    def get_leaderboard(self, top_n: int = 10) -> dict:
+        """Return ranked lists for each leaderboard category."""
+        c = self._conn()
+        def _rows(sql, *args):
+            return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+        holders = _rows(
+            'SELECT username, points FROM users WHERE is_standard=1 OR is_admin=1 '
+            'ORDER BY points DESC LIMIT ?', top_n)
+
+        earners = _rows(
+            'SELECT u.username, COALESCE(SUM(pl.delta),0) AS total_earned '
+            'FROM users u LEFT JOIN points_ledger pl ON pl.user_id=u.id AND pl.delta>0 '
+            'WHERE u.is_standard=1 OR u.is_admin=1 '
+            'GROUP BY u.id ORDER BY total_earned DESC LIMIT ?', top_n)
+
+        uploaders = _rows(
+            'SELECT uploaded_by_username AS username, COUNT(*) AS torrent_count '
+            'FROM torrents GROUP BY uploaded_by_username '
+            'ORDER BY torrent_count DESC LIMIT ?', top_n)
+
+        bounty_hunters = _rows(
+            'SELECT fulfilled_by AS username, COUNT(*) AS fulfilled_count '
+            "FROM bounties WHERE status='fulfilled' AND fulfilled_by IS NOT NULL "
+            'GROUP BY fulfilled_by ORDER BY fulfilled_count DESC LIMIT ?', top_n)
+
+        streaks = _rows(
+            'SELECT username, login_streak FROM users '
+            'WHERE (is_standard=1 OR is_admin=1) AND login_streak > 0 '
+            'ORDER BY login_streak DESC LIMIT ?', top_n)
+
+        chatty = _rows(
+            'SELECT u.username, COUNT(cm.id) AS comment_count '
+            'FROM users u JOIN comments cm ON cm.username=u.username '
+            'WHERE u.is_standard=1 OR u.is_admin=1 '
+            'GROUP BY u.username ORDER BY comment_count DESC LIMIT ?', top_n)
+
+        return {
+            'holders':       holders,
+            'earners':       earners,
+            'uploaders':     uploaders,
+            'bounty_hunters':bounty_hunters,
+            'streaks':       streaks,
+            'chatty':        chatty,
+        }
+
+    def list_bounties_by_user(self, username: str) -> dict:
+        """Return dicts of created and fulfilled bounties for profile display."""
+        c = self._conn()
+        created   = c.execute(
+            'SELECT * FROM bounties WHERE created_by=? ORDER BY created_at DESC', (username,)
+        ).fetchall()
+        fulfilled = c.execute(
+            'SELECT * FROM bounties WHERE fulfilled_by=? ORDER BY fulfilled_at DESC', (username,)
+        ).fetchall()
+        return {'created': created, 'fulfilled': fulfilled}
+
+    def _get_bounty_contributor_usernames(self, bounty_id: int) -> list[str]:
+        rows = self._conn().execute(
+            'SELECT DISTINCT username FROM bounty_contributions WHERE bounty_id=?', (bounty_id,)
+        ).fetchall()
+        return [r['username'] for r in rows]
+
+    def _notify_bounty(self, recipient: str, ntype: str, actor: str,
+                       bounty_id: int, description: str, amount: int,
+                       info_hash: str = '') -> None:
+        """Insert a notification for bounty events. Reuses notifications table with bounty ref."""
+        user = self.get_user(recipient)
+        if not user:
+            return
+        # We store bounty_id in comment_id field, info_hash as info_hash,
+        # description in torrent_name, amount in comment_id (overloaded).
+        # Use a special info_hash prefix "BOUNTY:" to distinguish from torrent notifs.
         self._conn().execute(
-            'UPDATE users SET credits=credits-1 WHERE username=?', (username,)
+            'INSERT INTO notifications (user_id,type,from_username,info_hash,torrent_name,'
+            'comment_id,created_at,is_read) VALUES (?,?,?,?,?,?,?,0)',
+            (user['id'], ntype, actor,
+             f'BOUNTY:{bounty_id}',
+             description[:120],
+             amount, self._ts())
         )
         self._conn().commit()
-        return self.create_invite_code(username)
 
     def list_invite_codes(self, created_by_username: str | None = None) -> list:
         """All codes (admin view) or codes for a specific user."""
@@ -1735,10 +2392,32 @@ class RegistrationDB:
 
     # ── Events ─────────────────────────────────────────────────
 
-    def list_events(self, limit: int = 100) -> list:
-        return self._conn().execute(
-            'SELECT * FROM events ORDER BY id DESC LIMIT ?', (limit,)
+    def list_events(self, limit: int = 200,
+                    q_actor: str = '', q_action: str = '',
+                    q_target: str = '', q_any: str = '',
+                    offset: int = 0) -> tuple:
+        """Search events with optional filters. Returns (rows, total) newest-first."""
+        clauses = []
+        params  = []
+        if q_any:
+            like = f'%{q_any}%'
+            clauses.append('(actor LIKE ? OR action LIKE ? OR target LIKE ? OR detail LIKE ?)')
+            params += [like, like, like, like]
+        if q_actor:
+            clauses.append('actor LIKE ?');  params.append(f'%{q_actor}%')
+        if q_action:
+            clauses.append('action LIKE ?'); params.append(f'%{q_action}%')
+        if q_target:
+            clauses.append('target LIKE ?'); params.append(f'%{q_target}%')
+        where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        rows = self._conn().execute(
+            f'SELECT * FROM events {where} ORDER BY id DESC LIMIT ? OFFSET ?',
+            params + [limit, offset]
         ).fetchall()
+        total = self._conn().execute(
+            f'SELECT COUNT(*) FROM events {where}', params
+        ).fetchone()[0]
+        return [dict(r) for r in rows], total
 
 
 
@@ -2988,21 +3667,32 @@ def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
 
 class IPv6HTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
-    """HTTPServer variant that binds an AF_INET6 socket.
-    IPV6_V6ONLY=1 ensures this socket handles only IPv6 traffic, allowing
-    the paired IPv4 socket to coexist on the same port (required on Linux).
-    """
+    request_queue_size = 128
+    ssl_context = None
     address_family = socket.AF_INET6
 
     def server_bind(self):
         self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         super().server_bind()
 
+    def get_request(self):
+        conn, addr = self.socket.accept()
+        if self.ssl_context:
+            conn.settimeout(10)
+            try:
+                conn = self.ssl_context.wrap_socket(conn, server_side=True)
+            except Exception:
+                conn.close()
+                raise
+            conn.settimeout(None)  # clear — timeout was only needed for the handshake
+        return conn, addr
+
 
 def start_http_server(host: str, port: int, ssl_ctx=None, label='HTTP'):
     server = ThreadingHTTPServer((host, port), TrackerHTTPHandler)
     if ssl_ctx:
-        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+        # Store context for get_request() — handshake timeout applied per-connection
+        server.ssl_context = ssl_ctx
     log.info('%s tracker listening on %s:%d/announce', label, host or '0.0.0.0', port)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -3013,7 +3703,7 @@ def start_http6_server(host6: str, port: int, ssl_ctx=None, label='HTTP'):
     """Start an IPv6 HTTP(S) tracker listener."""
     server = IPv6HTTPServer((host6, port, 0, 0), TrackerHTTPHandler)
     if ssl_ctx:
-        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+        server.ssl_context = ssl_ctx
     log.info('%s tracker listening on [%s]:%d/announce (IPv6)', label, host6 or '::', port)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -3022,6 +3712,7 @@ def start_http6_server(host6: str, port: int, ssl_ctx=None, label='HTTP'):
 
 class IPv6RedirectServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+    request_queue_size = 128
     """IPv6 variant of the HTTP→HTTPS redirect server."""
     address_family = socket.AF_INET6
 
@@ -3213,6 +3904,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_search()
         elif path == '/manage/notifications':
             self._get_notifications()
+        elif path == '/manage/bounty':
+            self._get_bounty_board()
+        elif path == '/manage/leaderboard':
+            self._get_leaderboard()
+        elif path.startswith('/manage/bounty/'):
+            bid_str = path[len('/manage/bounty/'):]
+            if bid_str.isdigit():
+                self._get_bounty_detail(int(bid_str))
+            else:
+                self._send_html('<h1>Not Found</h1>', 404)
         elif path.startswith('/manage/torrent/lock/'):
             ih = path[len('/manage/torrent/lock/'):]
             self._get_toggle_comments_lock(ih, True)
@@ -3328,6 +4029,22 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_admin_delete_invite()
         elif path == '/manage/admin/adjust-credits':
             self._post_adjust_credits()
+        elif path == '/manage/bounty/create':
+            self._post_bounty_create()
+        elif path == '/manage/bounty/contribute':
+            self._post_bounty_contribute()
+        elif path == '/manage/bounty/claim':
+            self._post_bounty_claim()
+        elif path == '/manage/bounty/confirm':
+            self._post_bounty_confirm()
+        elif path == '/manage/bounty/reject':
+            self._post_bounty_reject()
+        elif path == '/manage/bounty/vote':
+            self._post_bounty_vote()
+        elif path == '/manage/bounty/comment':
+            self._post_bounty_comment()
+        elif path == '/manage/points/transfer':
+            self._post_points_transfer()
         elif path == '/manage/profile/generate-invite':
             self._post_profile_generate_invite()
         elif path == '/manage/delete-all-torrents-user':
@@ -3386,7 +4103,13 @@ class ManageHandler(BaseHTTPRequestHandler):
             all_users = REGISTRATION_DB.list_users(page=upage, per_page=users_pp)
         utotal_pages = max(1, (utotal + users_pp - 1) // users_pp)
         upage        = min(upage, utotal_pages)
-        events       = REGISTRATION_DB.list_events(100)
+        events, ev_total = REGISTRATION_DB.list_events(
+            limit=200,
+            q_any=qs.get('eq', [''])[0].strip(),
+            q_actor=qs.get('eactor', [''])[0].strip(),
+            q_action=qs.get('eaction', [''])[0].strip(),
+            q_target=qs.get('etarget', [''])[0].strip(),
+        )
         trackers     = REGISTRATION_DB.list_magnet_trackers()
         settings     = REGISTRATION_DB.get_all_settings()
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
@@ -3396,7 +4119,12 @@ class ManageHandler(BaseHTTPRequestHandler):
                                       page=page, total_pages=total_pages, total=total,
                                       upage=upage, utotal_pages=utotal_pages, utotal=utotal,
                                       uquery=uquery, msg=msg, msg_type=msg_type, tab=tab,
-                                      new_username=urllib.parse.unquote(qs.get('new_username',[''])[0])))
+                                      new_username=urllib.parse.unquote(qs.get('new_username',[''])[0]),
+                                      ev_total=ev_total,
+                                      eq=qs.get('eq',[''])[0],
+                                      eactor=qs.get('eactor',[''])[0],
+                                      eaction=qs.get('eaction',[''])[0],
+                                      etarget=qs.get('etarget',[''])[0]))
 
     def _get_password_page(self):
         user = self._get_session_user()
@@ -3438,6 +4166,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             return
         token = REGISTRATION_DB.create_session(user['id'])
         REGISTRATION_DB.record_login_ip(user['id'], self.client_address[0])
+        REGISTRATION_DB.daily_login_check(user['id'])
         REGISTRATION_DB._log(username, 'login', self.client_address[0])
         log.debug('LOGIN success user=%r token=%s...', username, token[:8])
         self.send_response(303)
@@ -3481,8 +4210,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             ok = REGISTRATION_DB.register_torrent(ih, name, total_size, user['id'], user['username'], meta=meta)
             if ok:
                 log.info('REGISTRATION torrent registered  ih=%s  name=%s  by=%s', ih, name, user['username'])
+                REGISTRATION_DB.award_upload_points(user['id'], name, ih)
                 REGISTRATION_DB.check_auto_promote(user['id'])
-                REGISTRATION_DB.check_reward_credit(user['id'])
                 added.append(name)
             else:
                 skipped.append(f'{name} (already registered)')
@@ -3502,7 +4231,54 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not user: return self._redirect('/manage')
         self._send_html(_render_notifications_page(user))
 
-    def _post_comment(self):
+    def _get_bounty_board(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        qs   = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        sort = qs.get('sort', ['points'])[0]
+        filt = qs.get('status', [''])[0]
+        page = max(1, int(qs.get('page', ['1'])[0]) if qs.get('page', ['1'])[0].isdigit() else 1)
+        per_page = 20
+        status_filter = filt if filt in ('open', 'pending', 'fulfilled', 'expired') else None
+        bounties, total = REGISTRATION_DB.list_bounties(
+            status=status_filter, sort=sort, page=page, per_page=per_page)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        self._send_html(_render_bounty_board(user, bounties, total, page, total_pages,
+                                             sort=sort, status=filt,
+                                             msg=msg, msg_type=msg_type))
+
+    def _get_leaderboard(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        top_n = int(REGISTRATION_DB.get_setting('leaderboard_top_n', '10'))
+        data  = REGISTRATION_DB.get_leaderboard(top_n)
+        self._send_html(_render_leaderboard(user, data, top_n))
+
+    def _get_bounty_detail(self, bounty_id: int):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        bounty = REGISTRATION_DB.get_bounty(bounty_id)
+        if not bounty: return self._send_html('<h1>Bounty Not Found</h1>', 404)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        contributions = REGISTRATION_DB.get_bounty_contributions(bounty_id)
+        votes         = REGISTRATION_DB.get_bounty_votes(bounty_id)
+        comments      = REGISTRATION_DB.get_bounty_comments(bounty_id)
+        torrent = None
+        if bounty['claimed_infohash']:
+            torrent = REGISTRATION_DB.get_torrent(bounty['claimed_infohash'])
+        threshold = int(REGISTRATION_DB.get_setting('bounty_confirm_votes', '3'))
+        self._send_html(_render_bounty_detail(user, bounty, contributions, votes,
+                                              comments, torrent, threshold,
+                                              msg=msg, msg_type=msg_type))
+
+
         user = self._get_session_user()
         if not user: return self._redirect('/manage')
         body   = self._read_body()
@@ -3532,10 +4308,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             warn_param = urllib.parse.quote(unknown_list)
             # Still save the comment; just notify the poster
             cid = REGISTRATION_DB.add_comment(ih, user['id'], uname, text, parent_id)
+            REGISTRATION_DB.award_comment_points(user['id'], cid)
             _deliver_notifications(cid, ih, tname, uname, text, parent_id)
             return self._redirect(
                 f'/manage/torrent/{ih.lower()}?warn={warn_param}#comment-{cid}')
         cid = REGISTRATION_DB.add_comment(ih, user['id'], uname, text, parent_id)
+        REGISTRATION_DB.award_comment_points(user['id'], cid)
         _deliver_notifications(cid, ih, tname, uname, text, parent_id)
         self._redirect(f'/manage/torrent/{ih.lower()}#comment-{cid}')
 
@@ -4089,10 +4867,17 @@ class ManageHandler(BaseHTTPRequestHandler):
         page = min(page, total_pages)
         history   = REGISTRATION_DB.get_login_history(user['id'], 5)
         allowlist = REGISTRATION_DB.get_ip_allowlist(user['id'])
+        ledger    = REGISTRATION_DB.get_points_ledger(user['id'], 50)
+        bounty_data = REGISTRATION_DB.list_bounties_by_user(user['username'])
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
         self._send_html(_render_user_detail(user, user, torrents, history, is_super,
                                             allowlist=allowlist, is_own_profile=True,
                                             page=page, total_pages=total_pages,
-                                            total=total, base_url='/manage/profile'))
+                                            total=total, base_url='/manage/profile',
+                                            ledger=ledger, bounty_data=bounty_data,
+                                            msg=msg, msg_type=msg_type))
 
     def _post_tracker_add(self):
         user = self._get_session_user()
@@ -4183,18 +4968,56 @@ class ManageHandler(BaseHTTPRequestHandler):
                 threshold = '25'
             REGISTRATION_DB.set_setting('auto_promote_threshold', threshold, user['username'])
         elif form_id == 'reward':
-            global REWARD_ENABLED, REWARD_THRESHOLD
-            val = '1' if fields.get('reward_enabled') == '1' else '0'
-            REGISTRATION_DB.set_setting('reward_enabled', val, user['username'])
-            REWARD_ENABLED = (val == '1')
-            try:
-                thr = str(max(1, min(99999, int(fields.get('reward_threshold', '200')))))
-            except Exception:
-                thr = '200'
-            REGISTRATION_DB.set_setting('reward_threshold', thr, user['username'])
-            REWARD_THRESHOLD = int(thr)
-            log.info('REWARD set enabled=%s threshold=%s by %s', REWARD_ENABLED, REWARD_THRESHOLD, user['username'])
-        self._redirect('/manage/admin')
+            # Legacy reward form — no-op, superseded by points_earn
+            pass
+        elif form_id == 'points_earn':
+            for key, default, lo, hi in [
+                ('points_login_daily',  '1',  0, 999),
+                ('points_streak_7day',  '1',  0, 999),
+                ('points_streak_30day', '4',  0, 999),
+                ('points_upload',       '25', 0, 9999),
+                ('points_comment',      '1',  0, 999),
+                ('points_comment_cap',  '10', 0, 999),
+            ]:
+                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except: v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
+        elif form_id == 'points_spend':
+            for key, default, lo, hi in [
+                ('points_invite_cost',       '1000', 1, 99999),
+                ('points_transfer_fee_pct',  '25',   0, 99),
+                ('auto_promote_threshold',   '100',  1, 99999),
+                ('points_penalty_torrent',   '25',   0, 9999),
+                ('points_penalty_comment',   '1',    0, 999),
+            ]:
+                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except: v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
+            val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
+            REGISTRATION_DB.set_setting('auto_promote_enabled', val, user['username'])
+        elif form_id == 'bounty_settings':
+            for key, default, lo, hi in [
+                ('bounty_min_cost',       '50',  1, 99999),
+                ('bounty_refund_pct',     '25',  0, 100),
+                ('bounty_claimer_pct',    '70',  1, 100),
+                ('bounty_uploader_pct',   '15',  0, 100),
+                ('bounty_reject_penalty', '10',  0, 9999),
+                ('bounty_expiry_days',    '90',  1, 3650),
+                ('bounty_confirm_votes',  '3',   1, 999),
+                ('bounty_pending_hours',  '48',  1, 720),
+            ]:
+                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except: v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
+        elif form_id == 'leaderboard_settings':
+            try: v = str(max(3, min(100, int(fields.get('leaderboard_top_n', '10')))))
+            except: v = '10'
+            REGISTRATION_DB.set_setting('leaderboard_top_n', v, user['username'])
+        elif form_id == 'admin_grant_settings':
+            try: v = str(max(1, min(999999, int(fields.get('admin_max_point_grant', '1000')))))
+            except: v = '1000'
+            REGISTRATION_DB.set_setting('admin_max_point_grant', v, user['username'])
+        self._redirect('/manage/admin?tab=economy' if form_id in ('points_earn','points_spend','bounty_settings','leaderboard_settings','admin_grant_settings') else '/manage/admin')
 
     # ── Invite & Credit handlers ─────────────────────────────
 
@@ -4231,17 +5054,137 @@ class ManageHandler(BaseHTTPRequestHandler):
         except Exception:
             delta = 0
         if target_username and delta:
-            REGISTRATION_DB.adjust_credits(target_username, delta, user['username'])
+            max_grant = int(REGISTRATION_DB.get_setting('admin_max_point_grant', '1000'))
+            delta = max(-max_grant, min(max_grant, delta))
+            REGISTRATION_DB.adjust_points(target_username, delta, user['username'])
         referer = fields.get('referer', '')
         self._redirect(referer if referer.startswith('/manage/') else '/manage/admin')
+
+    def _post_bounty_create(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        description = fields.get('description', '').strip()[:500]
+        if not description:
+            return self._redirect('/manage/bounty?msg=empty')
+        ok, result = REGISTRATION_DB.create_bounty(user['username'], description)
+        if not ok:
+            return self._redirect(f'/manage/bounty?msg={urllib.parse.quote(result)}')
+        self._redirect(f'/manage/bounty/{result}')
+
+    def _post_bounty_contribute(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            bounty_id = int(fields.get('bounty_id', '0'))
+            amount    = int(fields.get('amount', '0'))
+        except ValueError:
+            return self._redirect('/manage/bounty')
+        ok, msg = REGISTRATION_DB.contribute_to_bounty(bounty_id, user['username'], amount)
+        q = urllib.parse.quote(msg)
+        self._redirect(f'/manage/bounty/{bounty_id}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_bounty_claim(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            bounty_id = int(fields.get('bounty_id', '0'))
+        except ValueError:
+            return self._redirect('/manage/bounty')
+        info_hash = fields.get('info_hash', '').strip()
+        ok, msg = REGISTRATION_DB.claim_bounty(bounty_id, user['username'], info_hash)
+        q = urllib.parse.quote(msg)
+        self._redirect(f'/manage/bounty/{bounty_id}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_bounty_confirm(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            bounty_id = int(fields.get('bounty_id', '0'))
+        except ValueError:
+            return self._redirect('/manage/bounty')
+        ok, msg = REGISTRATION_DB.confirm_bounty(bounty_id, user['username'])
+        q = urllib.parse.quote(msg)
+        self._redirect(f'/manage/bounty/{bounty_id}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_bounty_reject(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            bounty_id = int(fields.get('bounty_id', '0'))
+        except ValueError:
+            return self._redirect('/manage/bounty')
+        ok, msg = REGISTRATION_DB.reject_bounty_claim(bounty_id, user['username'])
+        q = urllib.parse.quote(msg)
+        self._redirect(f'/manage/bounty/{bounty_id}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_bounty_vote(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            bounty_id = int(fields.get('bounty_id', '0'))
+        except ValueError:
+            return self._redirect('/manage/bounty')
+        ok, msg = REGISTRATION_DB.vote_bounty_fulfilled(bounty_id, user['username'])
+        q = urllib.parse.quote(msg)
+        self._redirect(f'/manage/bounty/{bounty_id}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_bounty_comment(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            bounty_id = int(fields.get('bounty_id', '0'))
+        except ValueError:
+            return self._redirect('/manage/bounty')
+        text = fields.get('body', '').strip()[:2000]
+        if text:
+            cid = REGISTRATION_DB.add_bounty_comment(bounty_id, user['username'], text)
+            REGISTRATION_DB.award_comment_points(user['id'], cid)
+        self._redirect(f'/manage/bounty/{bounty_id}#bc-{bounty_id}')
+
+    def _post_points_transfer(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        to_user = fields.get('to_username', '').strip()
+        try:
+            amount = int(fields.get('amount', '0'))
+        except ValueError:
+            amount = 0
+        if not to_user or amount < 1:
+            return self._redirect('/manage/profile?msg=invalid_transfer&msg_type=error')
+        ok, msg = REGISTRATION_DB.transfer_points(user['username'], to_user, amount)
+        q = urllib.parse.quote(msg)
+        self._redirect(f'/manage/profile?msg={q}&msg_type={"success" if ok else "error"}')
 
     def _post_profile_generate_invite(self):
         user = self._get_session_user()
         if not user: return self._redirect('/manage')
-        token = REGISTRATION_DB.spend_credit_for_invite(user['username'])
+        token = REGISTRATION_DB.spend_points_for_invite(user['username'])
         if not token:
-            return self._redirect('/manage/profile?msg=nocredits')
-        self._redirect('/manage/profile')
+            cost = REGISTRATION_DB.get_setting('points_invite_cost', '1000')
+            pts  = user['points'] if 'points' in user.keys() else 0
+            return self._redirect(f'/manage/profile?msg=Insufficient+points+%28need+{cost}%2C+have+{pts}%29&msg_type=error')
+        self._redirect('/manage/profile?msg=Invite+link+created&msg_type=success')
 
     def _get_invite_signup(self, code: str):
         if REGISTRATION_DB is None:
@@ -4362,16 +5305,31 @@ class ManageHandler(BaseHTTPRequestHandler):
 
 class IPv6ManageServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+    request_queue_size = 128
+    ssl_context = None
     address_family = socket.AF_INET6
+
     def server_bind(self):
         self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         super().server_bind()
+
+    def get_request(self):
+        conn, addr = self.socket.accept()
+        if self.ssl_context:
+            conn.settimeout(10)
+            try:
+                conn = self.ssl_context.wrap_socket(conn, server_side=True)
+            except Exception:
+                conn.close()
+                raise
+            conn.settimeout(None)  # clear — timeout was only needed for the handshake
+        return conn, addr
 
 
 def start_manage_server(host: str, port: int, ssl_ctx=None, label='MANAGE'):
     server = ThreadingHTTPServer((host, port), ManageHandler)
     if ssl_ctx:
-        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+        server.ssl_context = ssl_ctx
     log.info('%s management page listening on %s:%d', label, host or '0.0.0.0', port)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -4381,7 +5339,7 @@ def start_manage_server(host: str, port: int, ssl_ctx=None, label='MANAGE'):
 def start_manage6_server(host6: str, port: int, ssl_ctx=None, label='MANAGE'):
     server = IPv6ManageServer((host6, port, 0, 0), ManageHandler)
     if ssl_ctx:
-        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+        server.ssl_context = ssl_ctx
     log.info('%s management page listening on [%s]:%d (IPv6)', label, host6, port)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -4460,6 +5418,8 @@ class StatsWebHandler(ManageHandler):
 
 class IPv6StatsWebServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+    request_queue_size = 128
+    ssl_context = None
     """IPv6 variant of the stats web server."""
     address_family = socket.AF_INET6
 
@@ -4467,11 +5427,23 @@ class IPv6StatsWebServer(ThreadingMixIn, HTTPServer):
         self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         super().server_bind()
 
+    def get_request(self):
+        conn, addr = self.socket.accept()
+        if self.ssl_context:
+            conn.settimeout(10)
+            try:
+                conn = self.ssl_context.wrap_socket(conn, server_side=True)
+            except Exception:
+                conn.close()
+                raise
+            conn.settimeout(None)  # clear — timeout was only needed for the handshake
+        return conn, addr
+
 
 def start_web_server(host: str, port: int, ssl_ctx=None, label='WEB'):
     server = ThreadingHTTPServer((host, port), StatsWebHandler)
     if ssl_ctx:
-        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+        server.ssl_context = ssl_ctx
     log.info('%s stats page listening on %s:%d', label, host or '0.0.0.0', port)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -4481,7 +5453,7 @@ def start_web_server(host: str, port: int, ssl_ctx=None, label='WEB'):
 def start_web6_server(host6: str, port: int, ssl_ctx=None, label='WEB'):
     server = IPv6StatsWebServer((host6, port, 0, 0), StatsWebHandler)
     if ssl_ctx:
-        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+        server.ssl_context = ssl_ctx
     log.info('%s stats page listening on [%s]:%d (IPv6)', label, host6 or '::', port)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -4514,7 +5486,14 @@ _MANAGE_CSS = '''
     background: radial-gradient(ellipse 80% 50% at 50% -10%, rgba(245,166,35,0.06) 0%, transparent 70%); }
   .container { max-width: 1280px; margin: 0 auto; padding: 0 32px; position: relative; z-index: 1; }
   .header { padding: 32px 0 24px; border-bottom: 1px solid var(--border); margin-bottom: 32px;
-            display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+            display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 16px; }
+  .nav-center { display: flex; gap: 8px; align-items: center; justify-content: center; flex-wrap: wrap; }
+  .nav-user-area { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+  .nav-btn { display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono);
+             font-size: 0.78rem; letter-spacing: 0.06em; padding: 7px 14px; border-radius: 6px;
+             border: 1px solid var(--border); cursor: pointer; text-decoration: none;
+             transition: all 0.15s; background: transparent; color: var(--text); white-space: nowrap; }
+  .nav-btn:hover { border-color: var(--accent); color: var(--accent); }
   .logo { font-family: var(--display); font-size: 1.4rem; font-weight: 900;
           letter-spacing: 0.12em; color: var(--accent); text-decoration: none; }
   .logo span { color: var(--text); }
@@ -4606,6 +5585,8 @@ _MANAGE_CSS = '''
   .page-sub { font-size: 0.85rem; color: var(--muted); margin-bottom: 28px; }
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
   @media (max-width: 640px) { .two-col { grid-template-columns: 1fr; } }
+  @media (max-width: 900px) { .lb-grid { grid-template-columns: 1fr 1fr !important; } }
+  @media (max-width: 560px) { .lb-grid { grid-template-columns: 1fr !important; } }
   /* ── Comments ── */
   .comment-card { background:var(--card); border:1px solid var(--border); border-radius:12px;
                   padding:16px 20px; margin-bottom:16px; }
@@ -4720,7 +5701,10 @@ _MANAGE_HEADER = '''
   <header>
   <div class="header">
     <a class="logo" href="/">&#128008; WILD<span>KAT</span></a>
-    <nav aria-label="Site navigation">
+    <nav class="nav-center" aria-label="Site navigation">
+      {center_nav}
+    </nav>
+    <nav class="nav-user-area" aria-label="User navigation">
       {nav_items}
     </nav>
   </div>
@@ -4878,6 +5862,19 @@ function filterTorrents(input, tableId) {
   var rows = document.getElementById(tableId).querySelectorAll('tr[data-name]');
   rows.forEach(function(r){ r.style.display = r.dataset.name.indexOf(q) !== -1 ? '' : 'none'; });
 }
+function copyHash(el, hash) {
+  navigator.clipboard.writeText(hash).then(function() {
+    var orig = el.textContent;
+    var origStyle = el.style.cssText;
+    el.textContent = '✓ Copied!';
+    el.style.color = 'var(--green)';
+    el.style.borderColor = 'var(--green)';
+    setTimeout(function() {
+      el.textContent = orig;
+      el.style.cssText = origStyle;
+    }, 2000);
+  });
+}
 function copyInvite(btn, path) {
   var url = window.location.protocol + '//' + window.location.host + path;
   navigator.clipboard.writeText(url).then(function() {
@@ -4977,23 +5974,49 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
         unread_items = REGISTRATION_DB.get_unread_notifications(user['id'], 5) if REGISTRATION_DB else []
         dropdown_items = ''
         for n in unread_items:
-            icon = '💬' if n['type'] == 'reply' else '@'
-            label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
-            tname_h = _h(n['torrent_name'][:40] + ('…' if len(n['torrent_name']) > 40 else ''))
-            from_h = _h(n['from_username'])
-            ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
-            n_id   = n['id']
-            n_hash = n['info_hash'].lower()
-            n_cid  = n['comment_id']
-            dropdown_items += (
-                f'<button class="notif-item" '
-                f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}#comment-{n_cid}\')"'
-                f' aria-label="{label} by {from_h} on {tname_h}">'
-                f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
-                f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
-                f'<div class="notif-item-ts">{ts_h}</div>'
-                f'</button>'
-            )
+            is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
+            if is_bounty:
+                bid = str(n['info_hash']).split(':',1)[1]
+                ntype = n['type']
+                icon, label = {
+                    'bounty_claimed':          ('🎯', 'claimed your bounty'),
+                    'bounty_rejected':         ('✗',  'rejected your claim on'),
+                    'bounty_fulfilled':        ('✅', 'fulfilled bounty'),
+                    'bounty_contribution':     ('➕', 'added points to your bounty'),
+                    'bounty_expired':          ('⏰', 'bounty expired:'),
+                    'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
+                }.get(ntype, ('🔔', 'bounty update on'))
+                tname_h = _h(n['torrent_name'][:40] + ('…' if len(n['torrent_name']) > 40 else ''))
+                from_h  = _h(n['from_username'])
+                ts_h    = _h((n['created_at'] or '')[:16].replace('T', ' '))
+                n_id    = n['id']
+                dropdown_items += (
+                    f'<button class="notif-item" '
+                    f'onclick="readNotif({n_id},\'/manage/bounty/{bid}\')"'
+                    f' aria-label="bounty notification from {from_h}">'
+                    f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
+                    f'<div class="notif-item-text"><em>{tname_h}</em></div>'
+                    f'<div class="notif-item-ts">{ts_h}</div>'
+                    f'</button>'
+                )
+            else:
+                icon = '💬' if n['type'] == 'reply' else '@'
+                label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
+                tname_h = _h(n['torrent_name'][:40] + ('…' if len(n['torrent_name']) > 40 else ''))
+                from_h = _h(n['from_username'])
+                ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
+                n_id   = n['id']
+                n_hash = n['info_hash'].lower()
+                n_cid  = n['comment_id']
+                dropdown_items += (
+                    f'<button class="notif-item" '
+                    f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}#comment-{n_cid}\')"'
+                    f' aria-label="{label} by {from_h} on {tname_h}">'
+                    f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
+                    f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
+                    f'<div class="notif-item-ts">{ts_h}</div>'
+                    f'</button>'
+                )
         if not dropdown_items:
             dropdown_items = '<div class="notif-empty">No unread notifications</div>'
         bell_html = (
@@ -5013,8 +6036,16 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                f'<span class="badge badge-{role}">{role_label}</span></a>'
                + bell_html +
                f'<a href="/manage/logout" class="btn btn-sm">Logout</a>')
+        center_nav = (
+            '<a href="/manage/dashboard" class="nav-btn">🖥 Dashboard</a>'
+            '<a href="/manage/search" class="nav-btn">🔍 Search</a>'
+            + ('' if role == 'basic' else
+               '<a href="/manage/bounty" class="nav-btn">🎯 Bounties</a>'
+               '<a href="/manage/leaderboard" class="nav-btn">🏆 Leaderboard</a>')
+        )
     else:
         nav = ''
+        center_nav = ''
 
     alert = ''
     if msg:
@@ -5023,7 +6054,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
         alert = f'<div class="alert {cls}" role="alert">{prefix}{msg}</div>'
 
     head = _MANAGE_HEAD.format(title=title, favicon=fav, css=_MANAGE_CSS)
-    header = _MANAGE_HEADER.format(nav_items=nav)
+    header = _MANAGE_HEADER.format(nav_items=nav, center_nav=center_nav)
     return head + header + alert + body + _MANAGE_FOOT
 
 
@@ -5200,7 +6231,7 @@ def _render_search(user, torrents: list, query: str = '',
     pagination = _pagination_html(page, total_pages, f'/manage/search?q={q_enc}')
 
     body = f'''
-  <div class="page-title">Search Torrents</div>
+  <div class="page-title">🔍 Search Torrents</div>
   <div class="page-sub"><a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a></div>
   <div class="card" style="margin-bottom:0">
     <form method="GET" action="/manage/search" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
@@ -5263,7 +6294,7 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
       color: var(--accent); background: rgba(245,166,35,0.08);
     }}
   </style>
-  <div class="page-title">Dashboard</div>
+  <div class="page-title">🖥 Dashboard</div>
   <div class="page-sub">Manage your registered torrents</div>
   {admin_link} {search_link}
   <div class="card" style="margin-top:16px">
@@ -5300,7 +6331,9 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   msg: str = '', msg_type: str = 'error',
                   page: int = 1, total_pages: int = 1, total: int = 0,
                   upage: int = 1, utotal_pages: int = 1, utotal: int = 0,
-                  uquery: str = '', tab: str = '', new_username: str = '') -> str:
+                  uquery: str = '', tab: str = '', new_username: str = '',
+                  ev_total: int = 0, eq: str = '', eactor: str = '',
+                  eaction: str = '', etarget: str = '') -> str:
     is_super = user['username'] == SUPER_USER
 
     # ── Tracker rows ─────────────────────────────────────────────
@@ -5392,24 +6425,6 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         </form>
       </div>
       <div class="card">
-        <div class="card-title">Reward System</div>
-        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
-          Award 1 credit for every N torrents uploaded. Users can spend credits to generate
-          invite links for new members.
-        </p>
-        <form method="POST" action="/manage/admin/save-settings">
-          <input type="hidden" name="form_id" value="reward">
-          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
-            <input type="checkbox" name="reward_enabled" value="1" {'checked' if settings.get('reward_enabled','0')=='1' else ''}> Enable reward system
-          </label>
-          <div class="form-group">
-            <label>Torrent upload threshold per credit</label>
-            <input type="number" name="reward_threshold" value="{settings.get('reward_threshold','200')}" min="1" max="99999" style="width:120px">
-          </div>
-          <button type="submit" class="btn btn-primary">Save</button>
-        </form>
-      </div>
-      <div class="card">
         <div class="card-title">Free Signup</div>
         <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
           When enabled, a Sign Up button appears on the public stats page and anyone can register an account.
@@ -5433,26 +6448,6 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             <label>Torrents per page</label>
             <input type="number" name="torrents_per_page" value="{tpp}" min="5" max="500"
                    style="width:120px">
-          </div>
-          <button type="submit" class="btn btn-primary">Save</button>
-        </form>
-      </div>
-      <div class="card">
-        <div class="card-title">Auto Promotion</div>
-        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
-          Automatically promote basic users to standard after reaching an upload threshold.
-        </p>
-        <form method="POST" action="/manage/admin/save-settings">
-          <input type="hidden" name="form_id" value="auto_promote">
-          <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:16px">
-            <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
-              <input type="checkbox" name="auto_promote_enabled" value="1" {'checked' if ap_enabled else ''}> Enable auto-promotion
-            </label>
-            <div class="form-group" style="margin:0">
-              <label>Upload threshold (torrents)</label>
-              <input type="number" name="auto_promote_threshold" value="{settings.get('auto_promote_threshold','25')}"
-                     min="1" max="9999" style="width:120px">
-            </div>
           </div>
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
@@ -5581,6 +6576,157 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           </div>
           <button type="submit" class="btn btn-danger"
                   aria-label="Restore database from backup file">&#11014; Restore from Backup</button>
+        </form>
+      </div>
+    </div>'''
+
+    # ── Economy HTML ──────────────────────────────────────────
+    _eco = REGISTRATION_DB.get_economy_stats() if REGISTRATION_DB else {}
+    def _eset(k, default=''):
+        return settings.get(k, default)
+    economy_html = f'''
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-title">📊 Economy Dashboard</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:12px">
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.4rem;font-weight:700;color:var(--accent)">{_eco.get("in_circulation",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">In Circulation</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.4rem;font-weight:700;color:var(--accent)">{_eco.get("in_escrow",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">In Escrow</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.4rem;font-weight:700;color:var(--danger)">{_eco.get("in_debt",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">In Debt</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.4rem;font-weight:700;color:var(--green)">{_eco.get("total_generated",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Total Generated</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.4rem;font-weight:700;color:var(--danger)">{_eco.get("total_destroyed",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Total Destroyed</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.4rem;font-weight:700;color:var(--text)">{_eco.get("net_all_time",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Net All Time</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.4rem;font-weight:700;color:var(--green)">{_eco.get("gen_30d",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Generated (30d)</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.4rem;font-weight:700;color:var(--danger)">{_eco.get("burn_30d",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Destroyed (30d)</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.3rem;font-weight:700;color:var(--green)">{_eco.get("open_bounties",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Open Bounties</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.3rem;font-weight:700;color:var(--accent)">{_eco.get("pending_bounties",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Pending</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.3rem;font-weight:700;color:var(--muted)">{_eco.get("fulfilled_bounties",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Fulfilled</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.3rem;font-weight:700;color:var(--danger)">{_eco.get("expired_bounties",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Expired</div>
+        </div>
+      </div>
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <div class="card-title">Points Earning</div>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="points_earn">
+          <div class="form-group"><label>Login (daily)</label>
+            <input type="number" name="points_login_daily" value="{_eset('points_login_daily','1')}" min="0" max="999" style="width:80px"></div>
+          <div class="form-group"><label>7-day streak bonus</label>
+            <input type="number" name="points_streak_7day" value="{_eset('points_streak_7day','1')}" min="0" max="999" style="width:80px"></div>
+          <div class="form-group"><label>30-day streak bonus</label>
+            <input type="number" name="points_streak_30day" value="{_eset('points_streak_30day','4')}" min="0" max="999" style="width:80px"></div>
+          <div class="form-group"><label>Upload torrent</label>
+            <input type="number" name="points_upload" value="{_eset('points_upload','25')}" min="0" max="9999" style="width:80px"></div>
+          <div class="form-group"><label>Post comment</label>
+            <input type="number" name="points_comment" value="{_eset('points_comment','1')}" min="0" max="999" style="width:80px"></div>
+          <div class="form-group"><label>Max comment points/day</label>
+            <input type="number" name="points_comment_cap" value="{_eset('points_comment_cap','10')}" min="0" max="999" style="width:80px"></div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">Points Spending &amp; Penalties</div>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="points_spend">
+          <div class="form-group"><label>Invite code cost</label>
+            <input type="number" name="points_invite_cost" value="{_eset('points_invite_cost','1000')}" min="1" max="99999" style="width:100px"></div>
+          <div class="form-group"><label>Transfer fee %</label>
+            <input type="number" name="points_transfer_fee_pct" value="{_eset('points_transfer_fee_pct','25')}" min="0" max="99" style="width:80px"></div>
+          <div class="form-group"><label>Standard promotion threshold (pts)</label>
+            <input type="number" name="auto_promote_threshold" value="{_eset('auto_promote_threshold','100')}" min="1" max="99999" style="width:100px"></div>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
+            <input type="checkbox" name="auto_promote_enabled" value="1" {'checked' if _eset('auto_promote_enabled')=='1' else ''}> Enable auto-promotion
+          </label>
+          <div class="form-group"><label>Penalty — admin removes torrent</label>
+            <input type="number" name="points_penalty_torrent" value="{_eset('points_penalty_torrent','25')}" min="0" max="9999" style="width:80px"></div>
+          <div class="form-group"><label>Penalty — admin deletes comment</label>
+            <input type="number" name="points_penalty_comment" value="{_eset('points_penalty_comment','1')}" min="0" max="999" style="width:80px"></div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">Bounty Settings</div>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="bounty_settings">
+          <div class="form-group"><label>Minimum bounty cost (pts)</label>
+            <input type="number" name="bounty_min_cost" value="{_eset('bounty_min_cost','50')}" min="1" max="99999" style="width:100px"></div>
+          <div class="form-group"><label>Requestor refund % (on confirm)</label>
+            <input type="number" name="bounty_refund_pct" value="{_eset('bounty_refund_pct','25')}" min="0" max="100" style="width:80px"></div>
+          <div class="form-group"><label>Claimer payout %</label>
+            <input type="number" name="bounty_claimer_pct" value="{_eset('bounty_claimer_pct','70')}" min="1" max="100" style="width:80px"></div>
+          <div class="form-group"><label>Uploader payout %</label>
+            <input type="number" name="bounty_uploader_pct" value="{_eset('bounty_uploader_pct','15')}" min="0" max="100" style="width:80px"></div>
+          <div class="form-group"><label>Rejection penalty (pts)</label>
+            <input type="number" name="bounty_reject_penalty" value="{_eset('bounty_reject_penalty','10')}" min="0" max="9999" style="width:80px"></div>
+          <div class="form-group"><label>Expiry (days)</label>
+            <input type="number" name="bounty_expiry_days" value="{_eset('bounty_expiry_days','90')}" min="1" max="3650" style="width:100px"></div>
+          <div class="form-group"><label>Auto-confirm vote threshold</label>
+            <input type="number" name="bounty_confirm_votes" value="{_eset('bounty_confirm_votes','3')}" min="1" max="999" style="width:80px"></div>
+          <div class="form-group"><label>Pending confirmation window (hours)</label>
+            <input type="number" name="bounty_pending_hours" value="{_eset('bounty_pending_hours','48')}" min="1" max="720" style="width:80px"></div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">🏆 Leaderboard</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Controls how many entries appear in each leaderboard category.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="leaderboard_settings">
+          <div class="form-group"><label>Top N per category</label>
+            <input type="number" name="leaderboard_top_n" value="{_eset('leaderboard_top_n','10')}" min="3" max="100" style="width:80px">
+          </div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">⚡ Admin Point Grants</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Maximum points an admin can grant or remove per transaction on a user's profile.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="admin_grant_settings">
+          <div class="form-group"><label>Max grant / removal per transaction</label>
+            <input type="number" name="admin_max_point_grant" value="{_eset('admin_max_point_grant','1000')}" min="1" max="999999" style="width:100px">
+          </div>
+          <button type="submit" class="btn btn-primary">Save</button>
         </form>
       </div>
     </div>'''
@@ -5755,20 +6901,42 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     # ── Event log ──────────────────────────────────────────────
     ev_rows = ''
     for e in events:
-        ev_rows += f'<tr><td class="hash">{e["timestamp"][:16]}</td><td>{_h(e["actor"])}</td><td>{_h(e["action"])}</td><td>{_h(e["target"])}</td><td class="hash">{_h(e["detail"])}</td></tr>'
+        # Color-code by action type
+        action = e['action']
+        if 'delete' in action or 'ban' in action or 'lock' in action or 'penalty' in action:
+            acolor = 'var(--danger)'
+        elif 'login' in action or 'register' in action or 'award' in action or 'promote' in action:
+            acolor = 'var(--green)'
+        elif 'bounty' in action or 'points' in action or 'spend' in action:
+            acolor = 'var(--accent)'
+        else:
+            acolor = 'var(--text)'
+        actor_h  = _h(e['actor'])
+        target_h = _h(e['target'])
+        ev_rows += (
+            f'<tr>'
+            f'<td class="hash" style="white-space:nowrap">{e["timestamp"][:16].replace("T"," ")}</td>'
+            f'<td><a href="/manage/user/{actor_h}" class="user-link">{actor_h}</a></td>'
+            f'<td style="color:{acolor};font-family:var(--mono);font-size:0.78rem">{_h(action)}</td>'
+            f'<td style="color:var(--muted)">{target_h}</td>'
+            f'<td class="hash" style="font-size:0.75rem">{_h(e["detail"])}</td>'
+            f'</tr>'
+        )
     if not ev_rows:
-        ev_rows = '<tr><td colspan="5" class="empty">No events yet</td></tr>'
+        ev_rows = '<tr><td colspan="5" class="empty">No matching events</td></tr>'
 
     _tab_settings  = ('<button class="tab" onclick="showTab(\'settings\',this)">Settings</button>'
                       if is_super else '')
     _tab_database  = ('<button class="tab" onclick="showTab(\'database\',this)">Database</button>'
+                      if is_super else '')
+    _tab_economy   = ('<button class="tab" onclick="showTab(\'economy\',this)">Economy</button>'
                       if is_super else '')
     _tab_invites   = ('<button class="tab" onclick="showTab(\'invites\',this)">Invites</button>'
                       if (is_super or user['is_admin']) else '')
     _tab_danger    = ('<button class="tab tab-danger" onclick="showTab(\'danger\',this)"'
                       '>Danger</button>'
                       if is_super else '')
-    _tab_names = ['torrents','users','adduser','trackers','settings','database','invites','danger','events']
+    _tab_names = ['torrents','users','adduser','trackers','settings','database','economy','invites','danger','events']
     if tab and tab in _tab_names:
         _safe_tab = tab.replace("'", '')
         _autotab_js = (
@@ -5797,6 +6965,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     <button class="tab" onclick="showTab('trackers',this)">Trackers</button>
     {_tab_settings}
     {_tab_database}
+    {_tab_economy}
     {_tab_invites}
     {_tab_danger}
     <button class="tab" onclick="showTab('events',this)">Event Log</button>
@@ -5888,15 +7057,57 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
 
   {'<div class="panel" id="panel-settings">' + settings_html + '</div>' if is_super else ''}
   {'<div class="panel" id="panel-database">' + database_html + '</div>' if is_super else ''}
+  {'<div class="panel" id="panel-economy">' + economy_html + '</div>' if is_super else ''}
   {'<div class="panel" id="panel-invites">' + invites_html + '</div>' if (is_super or user['is_admin']) else ''}
   {'<div class="panel" id="panel-danger">' + danger_html + '</div>' if is_super else ''}
 
   <div class="panel" id="panel-events">
     <div class="card">
-      <div class="card-title">Recent Events (last 100)</div>
+      <div class="card-title">Event Log
+        <span style="color:var(--muted);font-size:0.78rem;font-weight:400;margin-left:8px">
+          {ev_total} matching · showing up to 200
+        </span>
+      </div>
+      <form method="GET" action="/manage/admin" style="margin-bottom:16px">
+        <input type="hidden" name="tab" value="events">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <div class="form-group" style="margin:0;flex:1;min-width:160px">
+            <label style="font-size:0.75rem">Search all fields</label>
+            <input type="text" name="eq" value="{_h(eq)}" placeholder="e.g. sally, bounty, 10000"
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
+                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <div class="form-group" style="margin:0;min-width:120px">
+            <label style="font-size:0.75rem">Actor</label>
+            <input type="text" name="eactor" value="{_h(eactor)}" placeholder="e.g. tracy"
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
+                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <div class="form-group" style="margin:0;min-width:140px">
+            <label style="font-size:0.75rem">Action</label>
+            <input type="text" name="eaction" value="{_h(eaction)}" placeholder="e.g. award_points"
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
+                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <div class="form-group" style="margin:0;min-width:120px">
+            <label style="font-size:0.75rem">Target</label>
+            <input type="text" name="etarget" value="{_h(etarget)}" placeholder="e.g. jason"
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
+                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <button type="submit" class="btn btn-primary" style="white-space:nowrap">🔍 Search</button>
+          <a href="/manage/admin?tab=events" class="btn" style="white-space:nowrap">✕ Clear</a>
+        </div>
+      </form>
       <div class="table-wrap"><table>
-        <tr><th scope="col">Time</th><th scope="col">Actor</th><th scope="col">Action</th><th scope="col">Target</th><th scope="col">Detail</th></tr>
-        {ev_rows}
+        <thead><tr>
+          <th scope="col" style="white-space:nowrap">Time</th>
+          <th scope="col">Actor</th>
+          <th scope="col">Action</th>
+          <th scope="col">Target</th>
+          <th scope="col">Detail</th>
+        </tr></thead>
+        <tbody>{ev_rows}</tbody>
       </table></div>
     </div>
   </div>'''
@@ -6118,27 +7329,55 @@ def _render_notifications_page(viewer) -> str:
 
     rows = ''
     for n in notifs:
-        icon  = '💬' if n['type'] == 'reply' else '@ '
-        label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
-        from_h   = _h(n['from_username'])
-        tname_h  = _h(n['torrent_name'])
-        ts_h     = _h((n['created_at'] or '')[:16].replace('T', ' '))
-        url      = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
+        is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
+        ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
+        from_h = _h(n['from_username'])
+        tname_h = _h(n['torrent_name'])
         unread_cls = '' if n['is_read'] else ' unread'
         n_id = n['id']
-        read_js = f"readNotif({n_id},'{url}')"
-        rows += (
-            f'<div class="notif-page-item{unread_cls}">'
-            f'<div>'
-            f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
-            f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
-            f' {label} on '
-            f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
-            f'<div class="notif-page-meta">{ts_h}</div>'
-            f'</div>'
-            f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
-            f'</div>'
-        )
+
+        if is_bounty:
+            bid = str(n['info_hash']).split(':',1)[1]
+            ntype = n['type']
+            icon, label = {
+                'bounty_claimed':          ('🎯', 'claimed your bounty'),
+                'bounty_rejected':         ('✗',  'rejected your claim on'),
+                'bounty_fulfilled':        ('✅', 'fulfilled bounty'),
+                'bounty_contribution':     ('➕', 'added points to your bounty'),
+                'bounty_expired':          ('⏰', 'bounty expired:'),
+                'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
+            }.get(ntype, ('🔔', 'bounty update on'))
+            url = f'/manage/bounty/{bid}'
+            read_js = f"readNotif({n_id},'{url}')"
+            rows += (
+                f'<div class="notif-page-item{unread_cls}">'
+                f'<div>'
+                f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
+                f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                f' {label} '
+                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                f'<div class="notif-page-meta">{ts_h}</div>'
+                f'</div>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
+                f'</div>'
+            )
+        else:
+            icon  = '💬' if n['type'] == 'reply' else '@ '
+            label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
+            url   = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
+            read_js = f"readNotif({n_id},'{url}')"
+            rows += (
+                f'<div class="notif-page-item{unread_cls}">'
+                f'<div>'
+                f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
+                f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                f' {label} on '
+                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                f'<div class="notif-page-meta">{ts_h}</div>'
+                f'</div>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                f'</div>'
+            )
 
     if not rows:
         rows = '<div style="text-align:center;padding:48px;color:var(--muted);font-family:var(--mono);font-size:0.85rem">No notifications yet</div>'
@@ -6248,7 +7487,11 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;width:40%">NAME</td>
             <td style="word-break:break-all">{t["name"]}</td></tr>
         <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">INFO HASH</td>
-            <td class="hash" style="word-break:break-all;font-size:0.82rem">{ih}</td></tr>
+            <td class="hash" style="word-break:break-all;font-size:0.82rem">
+              <span onclick="copyHash(this,'{ih}')"
+                    title="Click to copy"
+                    style="cursor:pointer;border-bottom:1px dashed var(--muted)">{ih}</span>
+            </td></tr>
         <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">TYPE</td>
             <td>{mf}</td></tr>
         <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">TOTAL SIZE</td>
@@ -6321,6 +7564,16 @@ def _render_public_profile(viewer, target_user, torrents: list,
 
     # Safe public fields only
     joined    = (target_user['created_at'] or '')[:10] or '--'
+    pts_val   = target_user['points']       if 'points'       in target_user.keys() else 0
+    streak    = target_user['login_streak'] if 'login_streak' in target_user.keys() else 0
+    pts_color = 'var(--danger)' if pts_val < 0 else 'var(--accent)'
+
+    def _pub_row(label, value):
+        return (f'<tr>'
+                f'<td style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;'
+                f'text-transform:uppercase;color:var(--muted);padding:10px 24px 10px 0;white-space:nowrap">{label}</td>'
+                f'<td style="padding:10px 0">{value}</td>'
+                f'</tr>')
     t_rows    = ''.join(
         _torrent_row(t, vrole, viewer['id'], show_owner=False,
                      show_delete=(is_own or vrole in ('super', 'admin')))
@@ -6345,14 +7598,11 @@ def _render_public_profile(viewer, target_user, torrents: list,
   <div class="card" style="max-width:400px">
     <div class="card-title">Account</div>
     <table style="min-width:unset">
-      <tr>
-        <td style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);padding:10px 24px 10px 0;white-space:nowrap">Member Since</td>
-        <td style="padding:10px 0">{joined}</td>
-      </tr>
-      <tr>
-        <td style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);padding:10px 24px 10px 0;white-space:nowrap">Torrents</td>
-        <td style="padding:10px 0">{total}</td>
-      </tr>
+      {_pub_row('Member Since', joined)}
+      {_pub_row('Points', f'<span style="color:{pts_color};font-weight:bold">{pts_val}</span>'
+                          + (f' <span style="color:var(--muted);font-size:0.8rem">🔥 {streak}-day streak</span>'
+                             if streak > 1 else ''))}
+      {_pub_row('Torrents', str(total))}
     </table>
   </div>
 
@@ -6376,7 +7626,9 @@ def _render_public_profile(viewer, target_user, torrents: list,
 
 def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                         allowlist=None, is_own_profile=False,
-                        page: int = 1, total_pages: int = 1, total: int = 0, base_url: str = ''):
+                        page: int = 1, total_pages: int = 1, total: int = 0, base_url: str = '',
+                        ledger=None, bounty_data=None,
+                        msg: str = '', msg_type: str = 'error'):
     uname   = target_user['username']
     uname_h = _h(uname)          # HTML-safe for output
     t_role = _user_role(target_user)
@@ -6407,12 +7659,15 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         )
 
     credits_val = target_user['credits'] if 'credits' in target_user.keys() else 0
+    pts_val     = target_user['points']  if 'points'  in target_user.keys() else 0
+    streak_val  = target_user['login_streak'] if 'login_streak' in target_user.keys() else 0
     raw_cb = target_user['created_by'] or '--'
     if raw_cb.startswith('invite:'):
         inviter = _h(raw_cb[7:])
         created_by_display = f'Invited by <strong>{inviter}</strong>'
     else:
         created_by_display = _h(raw_cb)
+    pts_color = 'var(--danger)' if pts_val < 0 else 'var(--accent)'
     info_rows = (
         row('Created',          (target_user['created_at'] or '')[:16] or '--')
         + row('Created By',     created_by_display)
@@ -6420,7 +7675,9 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + row('Login Count',    str(lc))
         + row('Password Changed', lpc[:16] if lpc else 'Never recorded')
         + row('Failed Attempts', str(target_user['failed_attempts']))
-        + row('Credits',        f'<span style="color:var(--accent);font-weight:bold">{credits_val}</span>')
+        + row('Points',         f'<span style="color:{pts_color};font-weight:bold">{pts_val}</span>'
+                                + (f' <span style="color:var(--muted);font-size:0.8rem">(🔥 {streak_val}-day streak)</span>'
+                                   if streak_val > 1 else ''))
     )
 
     # ── IP section (superuser only) ───────────────────────────
@@ -6639,17 +7896,33 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                 + hi + '<button class="btn btn-sm btn-danger">Delete User</button></form>'
             )
         hi_referer = '/manage/profile' if is_own_profile else '/manage/admin/user/' + uname_h
+        max_grant  = int(REGISTRATION_DB.get_setting('admin_max_point_grant', '1000')) if REGISTRATION_DB else 1000
         credit_btns = (
+            f'<form method="POST" action="/manage/admin/adjust-credits" '
+            f'style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">'
+            f'<input type="hidden" name="username" value="{uname_h}">'
+            f'<input type="hidden" name="referer" value="{hi_referer}">'
+            f'<input type="number" name="delta" value="10" min="-{max_grant}" max="{max_grant}" '
+            f'style="width:90px;padding:6px 10px;background:var(--card2);border:1px solid var(--border);'
+            f'border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.85rem" '
+            f'title="Positive adds points, negative removes. Max ±{max_grant}.">'
+            f'<button type="submit" class="btn btn-sm btn-green" '
+            f'onclick="var v=parseInt(this.form.delta.value)||0;this.form.delta.value=Math.abs(v)">＋ Grant</button>'
+            f'<button type="submit" class="btn btn-sm btn-danger" '
+            f'onclick="var v=parseInt(this.form.delta.value)||0;this.form.delta.value=-Math.abs(v)">－ Remove</button>'
+            f'</form>'
+            f'<div style="display:flex;gap:6px;margin-top:4px">'
             f'<form method="POST" action="/manage/admin/adjust-credits" style="display:inline">'
-            + f'<input type="hidden" name="username" value="{uname_h}">'
-            + f'<input type="hidden" name="delta" value="1">'
-            + f'<input type="hidden" name="referer" value="{hi_referer}">'
-            + '<button class="btn btn-sm btn-green">&#43; Credit</button></form>'
-            + f'<form method="POST" action="/manage/admin/adjust-credits" style="display:inline">'
-            + f'<input type="hidden" name="username" value="{uname_h}">'
-            + f'<input type="hidden" name="delta" value="-1">'
-            + f'<input type="hidden" name="referer" value="{hi_referer}">'
-            + '<button class="btn btn-sm">&#8722; Credit</button></form>'
+            f'<input type="hidden" name="username" value="{uname_h}">'
+            f'<input type="hidden" name="delta" value="10">'
+            f'<input type="hidden" name="referer" value="{hi_referer}">'
+            f'<button class="btn btn-sm">Quick +10</button></form>'
+            f'<form method="POST" action="/manage/admin/adjust-credits" style="display:inline">'
+            f'<input type="hidden" name="username" value="{uname_h}">'
+            f'<input type="hidden" name="delta" value="-10">'
+            f'<input type="hidden" name="referer" value="{hi_referer}">'
+            f'<button class="btn btn-sm">Quick −10</button></form>'
+            f'</div>'
         )
         actions_card = (
             '<div class="card"><div class="card-title">Actions</div>'
@@ -6675,11 +7948,118 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + actions_card
         + '</div>'
         + _render_invite_section(viewer, target_user, is_own_profile, REGISTRATION_DB)
+        + _render_points_section(viewer, target_user, is_own_profile, ledger, bounty_data)
         + ip_html
         + delete_all_html
         + torrent_html
     )
+    # Profile-level msg banner
+    if msg:
+        col = 'var(--green)' if msg_type == 'success' else 'var(--danger)'
+        msg_card = (f'<div style="background:{col};color:#fff;padding:10px 16px;'
+                    f'border-radius:8px;margin-bottom:16px;font-size:0.9rem">{_h(msg)}</div>')
+        body = msg_card + body
     return _manage_page(('My Profile' if is_own_profile else 'User: ' + uname_h), body, user=viewer)
+
+
+
+def _render_points_section(viewer, target_user, is_own_profile: bool,
+                            ledger, bounty_data) -> str:
+    """Points ledger, transfer form, bounty history, and Basic sandbox teaser."""
+    if not is_own_profile or not REGISTRATION_DB:
+        return ''
+
+    role  = _user_role(target_user)
+    pts   = target_user['points'] if 'points' in target_user.keys() else 0
+    uname = target_user['username']
+    out   = ''
+
+    # Basic sandbox teaser
+    if role == 'basic':
+        threshold  = int(REGISTRATION_DB.get_setting('auto_promote_threshold', '100'))
+        ap_enabled = REGISTRATION_DB.get_setting('auto_promote_enabled', '0') == '1'
+        if ap_enabled:
+            pct = min(100, int(pts / threshold * 100)) if threshold > 0 else 0
+            out += (
+                f'''<div class="card" style="border:1px solid var(--accent)">'''
+                + f'<div class="card-title" style="color:var(--accent)">🔒 Basic Member — Unlock More Features</div>'
+                + f'<p style="color:var(--muted);font-size:0.88rem;margin-bottom:12px">'
+                + f'Reach <strong>{threshold} points</strong> to unlock <strong>Standard</strong> membership:</p>'
+                + '<ul style="color:var(--muted);font-size:0.88rem;margin:0 0 16px 20px;line-height:1.8">'
+                + '<li>🎯 <strong>Bounty Board</strong> — post requests, claim rewards</li>'
+                + '<li>🏆 <strong>Leaderboard</strong> — compete for top holder, earner, uploader & streak rankings</li>'
+                + '<li>👥 <strong>Public Profiles</strong> — view other members</li>'
+                + '<li>💸 <strong>Point Transfers</strong> — send points to friends</li>'
+                + '<li>✅ <strong>Bounty Voting</strong> — vote on fulfillment claims</li></ul>'
+                + f'<div style="background:var(--card2);border-radius:8px;overflow:hidden;height:12px;margin-bottom:8px">'
+                + f'<div style="background:var(--accent);height:100%;width:{pct}%;transition:width 0.3s"></div></div>'
+                + f'<div style="font-size:0.82rem;color:var(--muted)">{pts} / {threshold} points ({pct}%)'
+                + ' — earn by logging in daily, uploading torrents, and commenting</div></div>'
+            )
+        return out
+
+    # Transfer form (Standard+)
+    fee_pct = int(REGISTRATION_DB.get_setting('points_transfer_fee_pct', '25'))
+    out += (
+        '<div class="card">'
+        + '<div class="card-title">💸 Send Points</div>'
+        + f'<p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px">'
+        + f'Transfer points. A <strong>{fee_pct}%</strong> fee is destroyed. Balance: <strong>{pts} pts</strong></p>'
+        + '<form method="POST" action="/manage/points/transfer">'
+        + '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">'
+        + '<div class="form-group" style="margin:0"><label>Recipient</label>'
+        + '<input type="text" name="to_username" maxlength="32" required '
+        + 'style="padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)"></div>'
+        + '<div class="form-group" style="margin:0"><label>Amount</label>'
+        + f'<input type="number" name="amount" min="1" max="{max(0,pts)}" required '
+        + 'style="width:100px;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)"></div>'
+        + f'<button type="submit" class="btn btn-primary" data-confirm="Send? {fee_pct}% fee destroyed.">Send</button>'
+        + '</div></form></div>'
+    )
+
+    # Bounty history
+    if bounty_data:
+        def _brow(b):
+            bid  = b['id']
+            desc = _h(b['description'][:60] + ('\u2026' if len(b['description']) > 60 else ''))
+            badge = _bounty_status_badge(b['status'])
+            p    = f'<span style="color:var(--accent)">{b["total_escrow"]} pts</span>'
+            return (f'<tr><td><a href="/manage/bounty/{bid}">{desc}</a></td>'
+                    f'<td style="text-align:center">{badge}</td>'
+                    f'<td style="text-align:center">{p}</td></tr>')
+
+        cr = ''.join(_brow(b) for b in bounty_data['created'][:10])
+        ff = ''.join(_brow(b) for b in bounty_data['fulfilled'][:10])
+        hdr = '<thead><tr><th>Description</th><th>Status</th><th>Points</th></tr></thead>'
+        if cr or ff:
+            out += '<div class="two-col">'
+            if cr:
+                out += ('<div class="card"><div class="card-title">My Bounties</div>'
+                        + '<div class="table-wrap"><table class="torrent-table">'
+                        + hdr + f'<tbody>{cr}</tbody></table></div>'
+                        + '<a href="/manage/bounty" class="btn btn-sm" style="margin-top:8px">View All →</a></div>')
+            if ff:
+                out += ('<div class="card"><div class="card-title">Bounties I Fulfilled</div>'
+                        + '<div class="table-wrap"><table class="torrent-table">'
+                        + hdr + f'<tbody>{ff}</tbody></table></div></div>')
+            out += '</div>'
+
+    # Points ledger
+    if ledger:
+        rows = ''
+        for e in ledger:
+            d = e['delta']; color = 'var(--green)' if d > 0 else 'var(--danger)'
+            sign = '+' if d > 0 else ''
+            rows += (f'<tr><td class="hash">{_h((e["created_at"] or "")[:16])}</td>'
+                     f'<td style="color:{color};font-weight:700">{sign}{d}</td>'
+                     f'<td style="color:var(--accent)">{e["balance_after"]}</td>'
+                     f'<td>{_h(e["reason"])}</td></tr>')
+        out += ('<div class="card"><div class="card-title">Points History (last 50)</div>'
+                + '<div class="table-wrap"><table class="torrent-table">'
+                + '<thead><tr><th>Date</th><th>Change</th><th>Balance</th><th>Reason</th></tr></thead>'
+                + f'<tbody>{rows}</tbody></table></div></div>')
+
+    return out
 
 
 def _render_invite_section(viewer, target_user, is_own_profile: bool, db) -> str:
@@ -6697,23 +8077,25 @@ def _render_invite_section(viewer, target_user, is_own_profile: bool, db) -> str
     pending = [c for c in codes if not c['consumed_at']]
     consumed = [c for c in codes if c['consumed_at']]
 
-    credits_val = target_user['credits'] if 'credits' in target_user.keys() else 0
+    pts_val   = target_user['points'] if 'points' in target_user.keys() else 0
+    inv_cost  = int(db.get_setting('points_invite_cost', '1000')) if db else 1000
 
-    # Generate button (own profile only, needs credit; admin section has its own flow)
+    # Generate button (own profile only, explicit purchase with points)
     gen_btn = ''
-    if is_own_profile and credits_val > 0:
-        gen_btn = (
-            '<form method="POST" action="/manage/profile/generate-invite" style="display:inline">'
-            + '<button class="btn btn-primary">&#127881; Generate Invite Link'
-            + f' ({credits_val} credit{"s" if credits_val != 1 else ""} remaining)</button></form>'
-        )
-    elif is_own_profile and credits_val == 0:
-        gen_btn = (
-            '<form method="POST" action="/manage/profile/generate-invite" style="display:inline"'
-            + ' data-confirm="You have no credits. Earn credits by uploading torrents.">'
-            + '<button class="btn" style="opacity:0.5;cursor:not-allowed" disabled>'
-            + '&#127881; Generate Invite Link (0 credits remaining)</button></form>'
-        )
+    if is_own_profile:
+        can_afford = pts_val >= inv_cost
+        if can_afford:
+            gen_btn = (
+                f'<form method="POST" action="/manage/profile/generate-invite" style="display:inline">'
+                f'<button class="btn btn-primary"'
+                f' data-confirm="Purchase an invite link for {inv_cost} points?">'
+                f'🎟 Purchase Invite Link ({inv_cost} pts)</button></form>'
+            )
+        else:
+            gen_btn = (
+                f'<button class="btn" style="opacity:0.5;cursor:not-allowed" disabled>'
+                f'🎟 Purchase Invite Link ({inv_cost} pts required · you have {pts_val})</button>'
+            )
 
     rows = ''
     for c in pending:
@@ -7111,6 +8493,10 @@ def main():
                     REGISTRATION_DB.purge_expired_sessions()
                 except Exception as _e:
                     log.warning('purge_expired_sessions failed (non-fatal): %s', _e)
+                try:
+                    REGISTRATION_DB.expire_bounties()
+                except Exception as _e:
+                    log.warning('expire_bounties failed (non-fatal): %s', _e)
             hashes = REGISTRY.all_hashes()
             total_peers = sum(
                 len(REGISTRY._torrents.get(h, {})) for h in hashes
@@ -7119,6 +8505,555 @@ def main():
     except KeyboardInterrupt:
         log.info('Shutting down.')
         sys.exit(0)
+
+
+
+# ── Bounty Board ──────────────────────────────────────────────
+
+def _bounty_status_badge(status: str) -> str:
+    colors = {
+        'open':      'var(--green)',
+        'pending':   'var(--accent)',
+        'fulfilled': 'var(--muted)',
+        'expired':   'var(--danger)',
+    }
+    c = colors.get(status, 'var(--muted)')
+    return (f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;'
+            f'background:{c};color:#fff;font-size:0.75rem;font-weight:700;'
+            f'text-transform:uppercase">{_h(status)}</span>')
+
+
+def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
+    """Render the five-category leaderboard page."""
+
+    def _lb_table(rows, cols):
+        """cols: list of (header, key, formatter_fn) — _rank and _user are special keys"""
+        if not rows:
+            return '<p style="color:var(--muted);font-size:0.85rem">No data yet.</p>'
+        # Find the value col (everything that isn't _rank or _user)
+        val_cols = [(h, k, f) for h, k, f in cols if k not in ('_rank', '_user')]
+        tbody = ''
+        for i, row in enumerate(rows):
+            rank  = i + 1
+            medal = {1: '🥇', 2: '🥈', 3: '🥉'}.get(rank, f'<span style="color:var(--muted);font-size:0.8rem;font-family:var(--mono)">{rank}.</span>')
+            uname   = row.get('username') or '—'
+            uname_h = _h(uname)
+            u_link  = (f'<a href="/manage/user/{uname_h}" class="user-link">{uname_h}</a>'
+                       if uname != '—' else '—')
+            val_cells = ''.join(
+                f'<td style="text-align:right;padding:9px 4px;overflow:hidden;'
+                f'text-overflow:ellipsis;white-space:nowrap;border-bottom:1px solid var(--border)">'
+                f'{f(row.get(k, 0))}</td>'
+                for _, k, f in val_cols
+            )
+            tbody += (f'<tr>'
+                      f'<td style="width:28px;text-align:center;padding:9px 4px;'
+                      f'border-bottom:1px solid var(--border)">{medal}</td>'
+                      f'<td style="padding:9px 6px;overflow:hidden;text-overflow:ellipsis;'
+                      f'white-space:nowrap;border-bottom:1px solid var(--border)">{u_link}</td>'
+                      f'{val_cells}'
+                      f'</tr>')
+        val_headers = ''.join(
+            f'<th style="text-align:right;white-space:nowrap;padding:6px 4px;'
+            f'font-family:var(--mono);font-size:0.7rem;letter-spacing:0.08em;'
+            f'color:var(--muted);text-transform:uppercase">{h}</th>'
+            for h, k, f in val_cols
+        )
+        thead = (f'<tr>'
+                 f'<th style="width:28px;padding:6px 4px"></th>'
+                 f'<th style="text-align:left;padding:6px 4px;font-family:var(--mono);'
+                 f'font-size:0.7rem;letter-spacing:0.08em;color:var(--muted);text-transform:uppercase">Member</th>'
+                 f'{val_headers}</tr>')
+        return (f'<table style="width:100%;border-collapse:collapse;table-layout:fixed">'
+                f'<colgroup><col style="width:28px"><col><col style="width:95px"></colgroup>'
+                f'<thead style="border-bottom:1px solid var(--border)">{thead}</thead>'
+                f'<tbody>{tbody}</tbody></table>')
+
+    def pts(v):
+        color = 'var(--danger)' if int(v) < 0 else 'var(--accent)'
+        return f'<span style="color:{color};font-weight:700">{v:+} pts</span>'
+    def plain_pts(v):
+        color = 'var(--danger)' if int(v) < 0 else 'var(--accent)'
+        return f'<span style="color:{color};font-weight:700">{v} pts</span>'
+    def count(suffix):
+        return lambda v: f'<span style="color:var(--text);font-weight:600">{v}</span> <span style="color:var(--muted)">{suffix}</span>'
+    def streak_fmt(v):
+        return f'<span style="color:var(--accent);font-weight:700">🔥 {v} days</span>'
+
+    cols_holders  = [('Balance',      'points',         plain_pts)]
+    cols_earners  = [('Total Earned', 'total_earned',   plain_pts)]
+    cols_uploaders= [('Torrents',     'torrent_count',  count('torrents'))]
+    cols_hunters  = [('Fulfilled',    'fulfilled_count',count('bounties'))]
+    cols_streaks  = [('Streak',       'login_streak',   streak_fmt)]
+    cols_chatty   = [('Comments',     'comment_count',  count('comments'))]
+
+    def _card(title, icon, rows, cols, desc):
+        return (f'<div class="card">'
+                f'<div class="card-title">{icon} {title}</div>'
+                f'<p style="color:var(--muted);font-size:0.82rem;margin-bottom:12px">{desc}</p>'
+                + _lb_table(rows, cols) +
+                f'</div>')
+
+    uname = viewer['username']
+
+    card_holders   = _card("Top Holders",      "💰", data["holders"],        cols_holders,
+                           "Who's sitting on the most points right now.")
+    card_earners   = _card("All-Time Earners", "📈", data["earners"],        cols_earners,
+                           "Most points ever generated — spending doesn't hurt your rank.")
+    card_uploaders = _card("Top Uploaders",    "📦", data["uploaders"],      cols_uploaders,
+                           "Most torrents registered on the tracker.")
+    card_hunters   = _card("Bounty Hunters",   "🎯", data["bounty_hunters"], cols_hunters,
+                           "Most bounties successfully fulfilled.")
+    card_streaks   = _card("Login Streaks",    "🔥", data["streaks"],        cols_streaks,
+                           "Longest consecutive daily login streak.")
+    card_chatty    = _card("Most Chatty",      "💬", data["chatty"],         cols_chatty,
+                           "Most comments posted — the voices of the community.")
+
+    body = f'''
+    <div class="page-title">🏆 Leaderboard</div>
+    <div class="page-sub">
+      <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
+    </div>
+    <p style="color:var(--muted);font-size:0.85rem;margin-bottom:24px">
+      Top {top_n} in each category. Updated in real time.
+    </p>
+    <div class="lb-grid" style="display:grid;grid-template-columns:repeat(3,minmax(0,340px));gap:20px;max-width:1080px">
+      {card_holders}
+      {card_earners}
+      {card_uploaders}
+      {card_hunters}
+      {card_streaks}
+      {card_chatty}
+    </div>'''
+
+    return _manage_page('Leaderboard', body, user=viewer)
+
+
+def _render_bounty_board(viewer, bounties: list, total: int, page: int, total_pages: int,
+                          sort: str = 'points', status: str = '',
+                          msg: str = '', msg_type: str = 'error') -> str:
+    if not REGISTRATION_DB:
+        return _manage_page('Bounty Board', '<p>Unavailable</p>', user=viewer)
+
+    role    = _user_role(viewer)
+    pts     = viewer['points'] if 'points' in viewer.keys() else 0
+    min_cost= int(REGISTRATION_DB.get_setting('bounty_min_cost', '50'))
+
+    msg_html = ''
+    if msg:
+        col = 'var(--green)' if msg_type == 'success' else 'var(--danger)'
+        msg_html = (f'<div style="background:{col};color:#fff;padding:10px 16px;'
+                    f'border-radius:8px;margin-bottom:16px;font-size:0.9rem">{_h(msg)}</div>')
+
+    # Sort/filter controls
+    def _sort_link(s, label):
+        cls = 'btn btn-sm btn-primary' if sort == s else 'btn btn-sm'
+        return f'<a href="/manage/bounty?sort={s}&status={_h(status)}" class="{cls}">{label}</a>'
+    def _stat_link(s, label):
+        cls = 'btn btn-sm btn-primary' if status == s else 'btn btn-sm'
+        return f'<a href="/manage/bounty?sort={_h(sort)}&status={s}" class="{cls}">{label}</a>'
+
+    controls = (
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:16px">'
+        '<span style="color:var(--muted);font-size:0.82rem">Sort:</span>'
+        + _sort_link('points',  '🏆 Highest Points')
+        + _sort_link('newest',  '🆕 Newest')
+        + '&nbsp;&nbsp;<span style="color:var(--muted);font-size:0.82rem">Filter:</span>'
+        + _stat_link('',          'All')
+        + _stat_link('open',      'Open')
+        + _stat_link('pending',   'Pending')
+        + _stat_link('fulfilled', 'Fulfilled')
+        + _stat_link('expired',   'Expired')
+        + '</div>'
+    )
+
+    # Bounty rows
+    rows = ''
+    for b in bounties:
+        bid   = b['id']
+        desc  = _h(b['description'][:80] + ('…' if len(b['description']) > 80 else ''))
+        badge = _bounty_status_badge(b['status'])
+        pts_disp = f'<span style="color:var(--accent);font-weight:700">{b["total_escrow"]} pts</span>'
+        by    = _h(b['created_by'])
+        exp   = _h((b['expires_at'] or '')[:10])
+        ff    = _h(b['fulfilled_by'] or '')
+        rows += (
+            f'<tr>'
+            f'<td><a href="/manage/bounty/{bid}" style="color:var(--text)">{desc}</a></td>'
+            f'<td style="text-align:center">{pts_disp}</td>'
+            f'<td style="text-align:center">{badge}</td>'
+            f'<td class="hash"><a href="/manage/user/{by}" class="user-link">{by}</a></td>'
+            f'<td class="hash">{ff if ff else "—"}</td>'
+            f'<td class="hash">{exp}</td>'
+            f'<td><a href="/manage/bounty/{bid}" class="btn btn-sm">View →</a></td>'
+            f'</tr>'
+        )
+    if not rows:
+        rows = '<tr><td colspan="7" class="empty">No bounties found</td></tr>'
+
+    table = f'''<div class="table-wrap"><table class="torrent-table">
+      <thead><tr>
+        <th>Description</th><th style="text-align:center">Points</th>
+        <th style="text-align:center">Status</th><th>Posted By</th>
+        <th>Fulfilled By</th><th>Expires</th><th></th>
+      </tr></thead>
+      <tbody>{rows}</tbody>
+    </table></div>'''
+
+    # Pagination
+    def _plink(p):
+        return f'/manage/bounty?sort={sort}&status={status}&page={p}'
+    pag = _pagination_html(page, total_pages, f'/manage/bounty?sort={sort}&status={status}')
+
+    # Create bounty form
+    create_html = ''
+    if role != 'basic':
+        can_afford = pts >= min_cost
+        afford_note = (
+            f'<span style="color:var(--muted);font-size:0.82rem">'
+            f'Costs {min_cost} pts. Your balance: <strong>{pts} pts</strong>.'
+            f'{"" if can_afford else " You need more points."}</span>'
+        )
+        create_html = f'''
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-title">Post a Bounty Request</div>
+      {afford_note}
+      <form method="POST" action="/manage/bounty/create" style="margin-top:12px">
+        <div class="form-group">
+          <label for="bdesc">What are you looking for?</label>
+          <textarea id="bdesc" name="description" rows="3" maxlength="500" required
+            placeholder="Describe the content you want (name, format, quality, etc.)"
+            style="width:100%;background:var(--card2);border:1px solid var(--border);
+                   border-radius:6px;color:var(--text);padding:10px;resize:vertical;
+                   font-family:inherit;font-size:0.9rem"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary" {'disabled' if not can_afford else ''}
+                data-confirm="Post this bounty for {min_cost} points?">
+          🎯 Post Bounty ({min_cost} pts)
+        </button>
+      </form>
+    </div>'''
+
+    body_html = f'''
+    <div class="page-title">🎯 Bounty Board</div>
+    <div class="page-sub">
+      <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
+    </div>
+    {msg_html}
+    {create_html}
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;
+                  flex-wrap:wrap;gap:12px;margin-bottom:12px">
+        <div class="card-title" style="margin:0">Bounty Board ({total})</div>
+      </div>
+      {controls}
+      {table}
+      {pag}
+    </div>'''
+    return _manage_page('Bounty Board', body_html, user=viewer)
+
+
+def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
+                           comments: list, torrent, threshold: int,
+                           msg: str = '', msg_type: str = 'error') -> str:
+    if not REGISTRATION_DB:
+        return _manage_page('Bounty', '<p>Unavailable</p>', user=viewer)
+
+    bid      = bounty['id']
+    role     = _user_role(viewer)
+    uname    = viewer['username']
+    pts      = viewer['points'] if 'points' in viewer.keys() else 0
+    is_owner = uname == bounty['created_by']
+    is_claimer = uname == bounty['claimed_by']
+    status   = bounty['status']
+
+    msg_html = ''
+    if msg:
+        col = 'var(--green)' if msg_type == 'success' else 'var(--danger)'
+        msg_html = (f'<div style="background:{col};color:#fff;padding:10px 16px;'
+                    f'border-radius:8px;margin-bottom:16px;font-size:0.9rem">{_h(msg)}</div>')
+
+    # Contributors list
+    contrib_rows = ''
+    for c in contributions:
+        contrib_rows += (
+            f'<tr><td><a href="/manage/user/{_h(c["username"])}" class="user-link">'
+            f'{_h(c["username"])}</a></td>'
+            f'<td style="color:var(--accent)">{c["amount"]} pts</td>'
+            f'<td class="hash">{_h((c["contributed_at"] or "")[:16])}</td></tr>'
+        )
+    if not contrib_rows:
+        contrib_rows = '<tr><td colspan="3" class="empty">No contributions</td></tr>'
+
+    contrib_html = f'''
+    <div class="card">
+      <div class="card-title">Contributors ({len(contributions)})</div>
+      <div class="table-wrap"><table class="torrent-table">
+        <thead><tr><th>User</th><th>Amount</th><th>Date</th></tr></thead>
+        <tbody>{contrib_rows}</tbody>
+      </table></div>
+    </div>'''
+
+    # Contribute form — anyone active (including owner) can add points
+    contribute_form = ''
+    if status in ('open', 'pending'):
+        contribute_form = f'''
+    <div class="card">
+      <div class="card-title">Add Points to Bounty</div>
+      <p style="color:var(--muted);font-size:0.85rem">
+        Raise the stakes. Points are not refunded. Your balance: <strong>{pts} pts</strong>
+      </p>
+      <form method="POST" action="/manage/bounty/contribute">
+        <input type="hidden" name="bounty_id" value="{bid}">
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+          <input type="number" name="amount" min="1" max="{pts}" value="10"
+                 style="width:100px;padding:8px;background:var(--card2);
+                        border:1px solid var(--border);border-radius:6px;color:var(--text)">
+          <button type="submit" class="btn btn-primary"
+                  data-confirm="Add points to this bounty? This is not refundable.">
+            ➕ Add Points
+          </button>
+        </div>
+      </form>
+    </div>'''
+
+    # Claim form
+    claim_form = ''
+    if status == 'open' and not is_owner:
+        claim_form = f'''
+    <div class="card">
+      <div class="card-title">Claim This Bounty</div>
+      <p style="color:var(--muted);font-size:0.85rem">
+        Found a registered torrent that fulfills this request?
+        Enter its info hash below. First valid claim wins.
+      </p>
+      <form method="POST" action="/manage/bounty/claim">
+        <input type="hidden" name="bounty_id" value="{bid}">
+        <div class="form-group">
+          <label>Info Hash (40 hex characters)</label>
+          <input type="text" name="info_hash" maxlength="40" required
+                 placeholder="e.g. A1B2C3D4..."
+                 style="width:100%;font-family:var(--mono);padding:8px;
+                        background:var(--card2);border:1px solid var(--border);
+                        border-radius:6px;color:var(--text);font-size:0.88rem">
+        </div>
+        <button type="submit" class="btn btn-primary"
+                data-confirm="Submit this claim? The bounty will enter pending state.">
+          🎯 Submit Claim
+        </button>
+      </form>
+    </div>'''
+
+    # Pending confirmation section
+    pending_html = ''
+    if status == 'pending':
+        ih_h  = _h(bounty['claimed_infohash'] or '')
+        cl_h  = _h(bounty['claimed_by'] or '')
+        t_name = _h(torrent['name'] if torrent else 'Unknown torrent')
+        t_link = (f'<a href="/manage/torrent/{(bounty["claimed_infohash"] or "").lower()}"'
+                  f' style="color:var(--accent)">{t_name}</a>'
+                  if torrent else t_name)
+
+        vote_count  = len(votes)
+        already_voted = any(v['username'] == uname for v in votes)
+        can_vote = (not is_owner and not is_claimer and not already_voted
+                    and role not in ('basic',))
+
+        vote_btn = ''
+        if can_vote:
+            vote_btn = (f'<form method="POST" action="/manage/bounty/vote" style="display:inline">'
+                        f'<input type="hidden" name="bounty_id" value="{bid}">'
+                        f'<button class="btn btn-green">✓ Vote Fulfilled ({vote_count}/{threshold})</button>'
+                        f'</form>')
+        elif already_voted:
+            vote_btn = f'<span class="btn btn-sm" style="opacity:.6">You voted ✓ ({vote_count}/{threshold})</span>'
+        else:
+            vote_btn = f'<span style="color:var(--muted);font-size:0.85rem">Community votes: {vote_count}/{threshold}</span>'
+
+        confirm_btn = ''
+        reject_btn  = ''
+        if is_owner:
+            confirm_btn = (f'<form method="POST" action="/manage/bounty/confirm" style="display:inline">'
+                           f'<input type="hidden" name="bounty_id" value="{bid}">'
+                           f'<button class="btn btn-green"'
+                           f' data-confirm="Confirm this bounty is fulfilled? You\'ll receive a partial refund.">✅ Confirm Fulfilled</button>'
+                           f'</form>')
+            reject_btn  = (f'<form method="POST" action="/manage/bounty/reject" style="display:inline">'
+                           f'<input type="hidden" name="bounty_id" value="{bid}">'
+                           f'<button class="btn btn-danger"'
+                           f' data-confirm="Reject this claim? The claimer will be penalised.">✗ Reject Claim</button>'
+                           f'</form>')
+
+        pending_html = f'''
+    <div class="card" style="border:1px solid var(--accent)">
+      <div class="card-title" style="color:var(--accent)">⏳ Pending Confirmation</div>
+      <p style="margin-bottom:8px">
+        Claimed by <a href="/manage/user/{cl_h}" class="user-link">{cl_h}</a>
+        · Torrent: {t_link}
+        · Hash: <span class="hash">{ih_h}</span>
+      </p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        {confirm_btn}
+        {reject_btn}
+        {vote_btn}
+      </div>
+    </div>'''
+
+    # Fulfilled section
+    fulfilled_html = ''
+    if status == 'fulfilled':
+        ih_h = _h(bounty['claimed_infohash'] or '')
+        ff_h = _h(bounty['fulfilled_by'] or '')
+        t_name = _h(torrent['name'] if torrent else 'Unknown')
+        t_link = (f'<a href="/manage/torrent/{(bounty["claimed_infohash"] or "").lower()}"'
+                  f' style="color:var(--green)">{t_name}</a>'
+                  if torrent else t_name)
+
+        # Reconstruct payout breakdown
+        escrow       = bounty['total_escrow']
+        initial_cost = bounty['initial_cost']
+        claimer_pct  = int(REGISTRATION_DB.get_setting('bounty_claimer_pct',  '70')) / 100
+        uploader_pct = int(REGISTRATION_DB.get_setting('bounty_uploader_pct', '15')) / 100
+        refund_pct   = int(REGISTRATION_DB.get_setting('bounty_refund_pct',   '25')) / 100
+        house_pct    = 1 - claimer_pct - uploader_pct
+
+        claimer       = bounty['fulfilled_by'] or ''
+        uploader      = torrent['uploaded_by_username'] if torrent else None
+        same_person   = uploader == claimer
+
+        claimer_pay   = int(escrow * (claimer_pct + (uploader_pct if same_person else 0)))
+        uploader_pay  = 0 if same_person else int(escrow * uploader_pct)
+        house_cut     = escrow - claimer_pay - uploader_pay
+        refund_amt    = int(initial_cost * refund_pct)
+
+        def _prow(label, username, amount, color, note=''):
+            u_link = (f'<a href="/manage/user/{_h(username)}" class="user-link">{_h(username)}</a>'
+                      if username else '—')
+            note_html = f' <span style="color:var(--muted);font-size:0.78rem">{_h(note)}</span>' if note else ''
+            return (f'<tr>'
+                    f'<td>{label}</td>'
+                    f'<td>{u_link}</td>'
+                    f'<td style="text-align:right;color:{color};font-weight:700">{amount:+} pts</td>'
+                    f'<td>{note_html}</td>'
+                    f'</tr>')
+
+        payout_rows = _prow('Claimer', claimer, claimer_pay, 'var(--green)',
+                            f'{int((claimer_pct + (uploader_pct if same_person else 0))*100)}% of escrow'
+                            + (' (claimer + uploader combined)' if same_person else ''))
+        if not same_person and uploader:
+            payout_rows += _prow('Uploader', uploader, uploader_pay, 'var(--green)',
+                                 f'{int(uploader_pct*100)}% of escrow · torrent bonus')
+        payout_rows += _prow('House cut', None, -house_cut, 'var(--danger)',
+                             f'{int(house_pct*100)}% destroyed')
+        payout_rows += _prow('Requestor refund', bounty['created_by'], refund_amt, 'var(--accent)',
+                             f'{int(refund_pct*100)}% of initial {initial_cost} pts · returned from escrow')
+
+        fulfilled_html = f'''
+    <div class="card" style="border:1px solid var(--green)">
+      <div class="card-title" style="color:var(--green)">✅ Fulfilled</div>
+      <p style="margin-bottom:12px">
+        Fulfilled by <a href="/manage/user/{ff_h}" class="user-link">{ff_h}</a>
+        · Torrent: {t_link}
+      </p>
+      <div class="card-title" style="font-size:0.85rem;margin-bottom:8px">Payout Breakdown
+        <span style="color:var(--muted);font-size:0.78rem;font-weight:400">
+          · Total escrow: <strong style="color:var(--accent)">{escrow} pts</strong>
+        </span>
+      </div>
+      <div class="table-wrap"><table class="torrent-table">
+        <thead><tr><th>Role</th><th>Recipient</th><th style="text-align:right">Amount</th><th>Note</th></tr></thead>
+        <tbody>{payout_rows}</tbody>
+      </table></div>
+    </div>'''
+
+    # Comments
+    comment_rows = ''
+    for c in comments:
+        un_h = _h(c['username'])
+        bd_h = _h(c['body'])
+        at_h = _h((c['created_at'] or '')[:16])
+        comment_rows += f'''
+      <div style="padding:12px 0;border-top:1px solid var(--border)">
+        <div style="display:flex;gap:12px;align-items:baseline;margin-bottom:4px">
+          <a href="/manage/user/{un_h}" class="user-link" style="font-weight:600">{un_h}</a>
+          <span class="hash" style="font-size:0.78rem">{at_h}</span>
+        </div>
+        <div style="white-space:pre-wrap;word-break:break-word">{bd_h}</div>
+      </div>'''
+
+    comment_form = ''
+    if status not in ('expired',) and role != 'basic':
+        comment_form = f'''
+      <form method="POST" action="/manage/bounty/comment" style="margin-top:12px">
+        <input type="hidden" name="bounty_id" value="{bid}">
+        <div class="form-group">
+          <textarea name="body" rows="3" maxlength="2000" required
+            placeholder="Ask for clarification, discuss details..."
+            style="width:100%;background:var(--card2);border:1px solid var(--border);
+                   border-radius:6px;color:var(--text);padding:10px;resize:vertical;
+                   font-family:inherit;font-size:0.9rem"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">Post Comment</button>
+      </form>'''
+
+    comments_html = f'''
+    <div class="card" id="bc-{bid}">
+      <div class="card-title">Discussion ({len(comments)})</div>
+      {comment_rows or '<p style="color:var(--muted);font-size:0.88rem">No comments yet.</p>'}
+      {comment_form}
+    </div>'''
+
+    # Info card
+    by_h  = _h(bounty['created_by'])
+    ca_h  = _h((bounty['created_at'] or '')[:16])
+    exp_h = _h(bounty['expires_at'] or '')
+    payout_pct = int(REGISTRATION_DB.get_setting('bounty_claimer_pct', '70'))
+    upload_pct = int(REGISTRATION_DB.get_setting('bounty_uploader_pct', '15'))
+    refund_pct = int(REGISTRATION_DB.get_setting('bounty_refund_pct', '25'))
+    escrow = bounty['total_escrow']
+
+    info_card = f'''
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+        <div>
+          <div class="card-title" style="font-size:1.1rem;margin-bottom:8px">
+            {_h(bounty["description"])}
+          </div>
+          <div style="color:var(--muted);font-size:0.85rem;display:flex;gap:16px;flex-wrap:wrap">
+            <span>By <a href="/manage/user/{by_h}" class="user-link">{by_h}</a></span>
+            <span>Posted {ca_h}</span>
+            <span>Expires {exp_h}</span>
+          </div>
+        </div>
+        <div style="text-align:right">
+          {_bounty_status_badge(status)}
+          <div style="color:var(--accent);font-size:1.4rem;font-weight:700;margin-top:4px">
+            {escrow} pts
+          </div>
+          <div style="color:var(--muted);font-size:0.78rem;margin-top:2px">
+            Claimer: {payout_pct}% · Uploader: {upload_pct}% · Requestor refund: {refund_pct}% of initial
+          </div>
+        </div>
+      </div>
+    </div>'''
+
+    body_html = f'''
+    <div class="page-title">Bounty #{bid}</div>
+    <div class="page-sub">
+      <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
+      &nbsp;&#183;&nbsp;
+      <a href="/manage/bounty" style="color:var(--muted);text-decoration:none">&#10094; Bounty Board</a>
+    </div>
+    {msg_html}
+    {info_card}
+    {pending_html}
+    {fulfilled_html}
+    {contribute_form}
+    {claim_form}
+    {contrib_html}
+    {comments_html}'''
+
+    return _manage_page(f'Bounty #{bid}', body_html, user=viewer)
 
 
 if __name__ == '__main__':

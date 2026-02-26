@@ -184,7 +184,7 @@ When `--redirect-http` is enabled, HTTP requests receive a `301 Moved Permanentl
 | 443 (standard) | `tracker.example.net` |
 | 8443 (non-standard) | `tracker.example.net:8443` |
 
-> **Note:** When using non-privileged ports (8080/8443), the `AmbientCapabilities` and `CapabilityBoundingSet` lines in the service unit are not needed and can be removed. They are only required when binding to ports below 1024 as a non-root user.
+> **Note:** When using non-privileged ports (8080/8443), the `AmbientCapabilities` and `CapabilityBoundingSet` lines in the service unit are not needed and can be removed.
 
 ---
 
@@ -241,37 +241,33 @@ If running on non-standard ports (e.g. 8080/8443) adjust accordingly.
 
 ### Simplifying Firewall Management on Ubuntu (OCI)
 
-On Ubuntu instances in Oracle Cloud, local iptables rules are managed by `netfilter-persistent`. To rely solely on the OCI VCN Security List (simpler for single-instance deployments):
+On Ubuntu instances in Oracle Cloud, local iptables rules are managed by `netfilter-persistent`. To rely solely on the OCI VCN Security List:
 
 ```bash
 sudo systemctl stop netfilter-persistent
 sudo systemctl disable netfilter-persistent
 ```
 
-Make sure your OCI Security List rules are correct before doing this — there will be no secondary layer of protection on the instance itself.
+Make sure your OCI Security List rules are correct before doing this.
 
 ---
 
 ## 8. Memory Considerations and Swap
 
-The tracker is lightweight at idle, but **bulk torrent uploads are memory-intensive**. Parsing hundreds or thousands of `.torrent` files simultaneously requires Python to hold all the raw file data, parsed metadata, piece hash tables, and result strings in memory at once. On low-memory servers this can exhaust available RAM entirely, causing the kernel swap daemon (`kswapd0`) to spike, the server to freeze, and browser connections to time out.
+The tracker is lightweight at idle, but **bulk torrent uploads are memory-intensive**. Parsing hundreds of `.torrent` files simultaneously requires Python to hold all the raw file data, parsed metadata, piece hash tables, and result strings in memory at once.
 
 ### How Much Memory Do You Need?
 
-As a rough guide, bulk uploading 1000–1200 `.torrent` files simultaneously can consume 400–500MB of RAM at peak. On a server with less than 1GB of total RAM (such as Oracle Cloud's free tier micro instance at ~954MB), this will exhaust available memory under normal operating conditions.
-
-Check your current memory situation:
+Bulk uploading 1000–1200 `.torrent` files simultaneously can consume 400–500MB of RAM at peak. On a server with less than 1GB of total RAM (such as Oracle Cloud's free tier micro instance at ~954MB), this will exhaust available memory.
 
 ```bash
 free -h
 cat /proc/meminfo | grep -E "MemTotal|MemAvailable|SwapTotal"
 ```
 
-If `MemAvailable` is below 200MB at idle, or `SwapTotal` is 0, you should add swap before doing any large bulk uploads.
+If `MemAvailable` is below 200MB at idle, or `SwapTotal` is 0, add swap before doing large bulk uploads.
 
 ### Adding a Swapfile
-
-A 2GB swapfile gives the kernel a safety valve — instead of freezing when RAM is exhausted it pages to disk and recovers. This is strongly recommended on any server with less than 2GB of RAM.
 
 ```bash
 sudo fallocate -l 2G /swapfile
@@ -287,9 +283,7 @@ Verify swap is active:
 free -h
 ```
 
-You should see `2.0Gi` under the Swap row. The `/etc/fstab` entry ensures it is re-enabled automatically after a reboot.
-
-> **Note:** With swap in place, large bulk uploads will still temporarily hit swap and be somewhat slower than on a higher-memory server, but they will complete successfully instead of timing out. The tracker and announce handling remain functional throughout.
+You should see `2.0Gi` under the Swap row.
 
 ---
 
@@ -325,24 +319,31 @@ Visit `https://your-domain/manage` and log in with your superuser credentials.
 After logging in, go to **Admin Panel → Settings** tab and configure:
 
 - **Password Complexity** — minimum length and character requirements
-- **Free Signup** — whether new users can self-register, or must use an invite or be created by an admin
-- **Reward System** — whether users earn credits for uploading torrents, and the threshold per credit
+- **Free Signup** — whether new users can self-register or must use an invite
 - **Auto-Promote** — automatically promote Basic users to Standard after a set torrent count
 - **Open Tracker** — whether to accept announces for unregistered torrents
 - **Torrents Per Page** — pagination size for all torrent listings
 - **robots.txt** — content served to web crawlers
 
+Then go to **Admin Panel → Economy** tab and configure the points economy:
+
+- **Points Earn** — how many points users earn per login, per upload, per comment, and streak bonus rates
+- **Points Spend** — invite code cost and point transfer fee percentage
+- **Bounty Settings** — minimum escrow, payout splits, confirmation window, community vote threshold
+- **Leaderboard** — top N entries per category
+- **Admin Point Grants** — maximum points per admin grant/removal transaction
+
 Then go to the **Trackers** tab and add the tracker URLs to include in generated magnet links.
 
 ### 9.4 Creating the First Users
 
-With free signup off (the default), go to **Admin Panel → Add User** to create accounts manually, or use the **Invites** tab to generate invite links and send them to your users.
+With free signup off (the default), go to **Admin Panel → Add User** to create accounts manually, or use the **Invites** tab to generate invite links.
 
 ### 9.5 Database Location
 
 The database is created automatically at the path given by `--db`. The service unit's `ReadWritePaths` must include the directory containing the database file — the default service unit already includes `/opt/tracker`.
 
-SQLite WAL mode requires write access to the directory (not just the `.db` file), since WAL creates `-wal` and `-shm` sidecar files alongside the database.
+SQLite WAL mode requires write access to the directory (not just the `.db` file), since WAL creates `-wal` and `-shm` sidecar files.
 
 ### 9.6 Resetting the Superuser Password
 
@@ -446,14 +447,14 @@ tail -f /var/log/tracker-deploy.log
 A successful deploy looks like:
 
 ```
-[2026-02-24 00:20:01] Change detected on main
-[2026-02-24 00:20:01]   local:  be658e3d...
-[2026-02-24 00:20:01]   remote: c5e91ea6...
-[2026-02-24 00:20:01] Pulling...
-[2026-02-24 00:20:01] Updated to c5e91ea6...
-[2026-02-24 00:20:01] Deploying tracker_server.py → /opt/tracker/tracker_server.py
-[2026-02-24 00:20:01] Restarting tracker...
-[2026-02-24 00:20:01] tracker is running — deploy successful
+[2026-02-26 00:20:01] Change detected on main
+[2026-02-26 00:20:01]   local:  be658e3d...
+[2026-02-26 00:20:01]   remote: c5e91ea6...
+[2026-02-26 00:20:01] Pulling...
+[2026-02-26 00:20:01] Updated to c5e91ea6...
+[2026-02-26 00:20:01] Deploying tracker_server.py → /opt/tracker/tracker_server.py
+[2026-02-26 00:20:01] Restarting tracker...
+[2026-02-26 00:20:01] tracker is running — deploy successful
 ```
 
 When no changes are detected the script exits silently.
