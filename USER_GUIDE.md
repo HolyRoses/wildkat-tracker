@@ -14,18 +14,19 @@ This guide covers the registration mode web interface at `/manage`. It is intend
 6. [Comments and Notifications](#6-comments-and-notifications)
 7. [Your Profile](#7-your-profile)
 8. [User Profiles](#8-user-profiles)
-9. [Searching Torrents](#9-searching-torrents)
-10. [Points Economy](#10-points-economy)
-11. [Bounty Board](#11-bounty-board)
-12. [Leaderboard](#12-leaderboard)
-13. [Admin Panel](#13-admin-panel)
-14. [User Management (Admin)](#14-user-management-admin)
-15. [IP Allowlist and IP Lock](#15-ip-allowlist-and-ip-lock)
-16. [Settings (Admin)](#16-settings-admin)
-17. [Economy Settings (Admin)](#17-economy-settings-admin)
-18. [Invite Codes](#18-invite-codes)
-19. [Database Backup and Restore](#19-database-backup-and-restore)
-20. [Passwords](#20-passwords)
+9. [Direct Messages](#9-direct-messages)
+10. [Searching Torrents](#10-searching-torrents)
+11. [Points Economy](#11-points-economy)
+12. [Bounty Board](#12-bounty-board)
+13. [Leaderboard](#13-leaderboard)
+14. [Admin Panel](#14-admin-panel)
+15. [User Management (Admin)](#15-user-management-admin)
+16. [IP Allowlist and IP Lock](#16-ip-allowlist-and-ip-lock)
+17. [Settings (Admin)](#17-settings-admin)
+18. [Economy Settings (Admin)](#18-economy-settings-admin)
+19. [Invite Codes](#19-invite-codes)
+20. [Database Backup and Restore](#20-database-backup-and-restore)
+21. [Passwords](#21-passwords)
 
 ---
 
@@ -194,11 +195,24 @@ Your profile shows:
 - All your registered torrents with pagination
 - **Danger Zone** — delete all your torrents at once (permanent)
 
+### Layout
+
+Your profile page uses a two-column layout matching other profile views. The left column shows Account Details. The right column stacks: **Actions**, **Invite Codes**, and **Send Points**. Below the two columns are your Bounty history, Points History, Danger Zone, and registered torrents.
+
+### Actions Card
+
+The Actions card contains:
+
+- **Change Password** button
+- **Messaging** — a checkbox to allow or block other users from sending you DMs. Uncheck and save to stop receiving messages. This setting can be changed at any time.
+
 ### Points and Invite Generation
 
-Your current points balance is shown in the **Account Details** card. Points are earned automatically for daily logins (with streak bonuses), torrent uploads, and comments. See [Section 10](#10-points-economy) for full details.
+Your current points balance is shown in the **Account Details** card. Points are earned automatically for daily logins (with streak bonuses), torrent uploads, and comments. See [Section 11](#11-points-economy) for full details.
 
 The **Invite Codes** card shows your invite history. If you have enough points (default 1,000), a **Purchase Invite Link (N pts)** button appears. Clicking it shows a confirmation dialog stating exactly how many points will be spent, then creates a new invite code. If you do not have enough points the button is shown but disabled with the shortfall displayed.
+
+The **Send Points** card lets you transfer points to another user directly from your profile. See [Section 11](#11-points-economy) for transfer details.
 
 ---
 
@@ -221,9 +235,67 @@ Basic users are redirected to their dashboard if they attempt to view a profile.
 
 If you are an Admin or Super, a small **⚙ Admin View** link appears on the public profile page that takes you directly to the full administrative view of that user.
 
+A **📬 Send DM** button appears in the profile sub-header for eligible Standard+ viewers when DMs are enabled site-wide and the profile owner has not disabled DMs. Clicking it opens the compose form pre-addressed to that user.
+
 ---
 
-## 9. Searching Torrents
+## 9. Direct Messages
+
+The Direct Messages system lets Standard+ users send private messages to each other. Navigate to it via the **📬 Messages** button in the navigation bar (Standard+ only).
+
+### The Messages Page
+
+The Messages page has four tabs:
+
+| Tab | Description |
+|-----|-------------|
+| **Inbox** | Messages you have received, newest first. Unread messages are highlighted. |
+| **Sent** | Messages you have sent. |
+| **Compose** | Send a new message. |
+| **Blocked** | Users you have blocked. |
+
+### Composing a Message
+
+Click the **Compose** tab. Fill in:
+
+- **To** — one username or multiple separated by semicolons (e.g. `alice; bob; carol`)
+- **Subject** — optional
+- **Message** — your message body
+
+Click **Send Message**. Each recipient receives a separate DM. All recipients are validated before any messages are sent — if any are invalid the send is aborted and the errors are listed. If the daily send limit allows fewer messages than recipients, the first N recipients receive the message and the rest are reported as skipped.
+
+**Point cost:** each DM sent deducts a configurable number of points (default 5 pts). Multi-recipient sends deduct the total in one transaction. Admins and Super are exempt from point costs and daily limits.
+
+### Conversation Threads
+
+Clicking any message in the Inbox or Sent tab opens the conversation thread with that user. The thread shows the full message history between you two as chat bubbles — your messages on the right, theirs on the left. Reply using the form at the bottom.
+
+The conversation header shows:
+- **❮ Messages** — back to inbox
+- **👤 Name's Profile** — link to the other user's profile
+- **🚫 Block / Unblock** — toggle blocking from within the thread
+
+### Blocking Users
+
+You can block a user from inside a conversation thread or from the **Blocked** tab on the Messages page.
+
+- Blocked users cannot send you DMs
+- You can still send messages to a blocked user
+- The blocked user receives a vague "not accepting messages" error — they cannot tell whether they are blocked or you have simply disabled DMs
+- Admins and Super cannot be blocked
+- Unblock at any time from the Blocked tab or from the conversation thread
+
+### Opting Out of DMs
+
+To stop receiving DMs from anyone, go to your profile → Actions card → uncheck **Allow others to send me DMs** and click **Save**. You can re-enable this at any time. Senders receive the same vague error regardless of whether you have blocked them or opted out.
+
+### Admin — DM Broadcast (Super only)
+
+The Superuser can send a broadcast message to all users at once from the Compose tab. A **Broadcast to all users** checkbox appears in the compose form for Super only.
+
+---
+
+## 10. Searching Torrents
 
 Click the **🔍 Search** button in the navigation bar or navigate to `/manage/search`.
 
@@ -240,7 +312,7 @@ Basic users see only their own torrents in search results. Standard and above se
 
 ---
 
-## 10. Points Economy
+## 11. Points Economy
 
 The points system is the site's internal currency. Points are earned, spent, transferred, and destroyed according to rules the admin configures. There is no way to acquire points outside the system.
 
@@ -262,6 +334,7 @@ Streaks reset if you miss a day. The current streak is shown on your profile and
 | Purchasing an invite code | 1,000 pts (default, configurable by admin) |
 | Creating a bounty | Variable — you set the initial escrow amount |
 | Contributing to a bounty | Variable — you choose how much to add |
+| Sending a direct message | Configurable per-recipient cost (default 5 pts). Exempt for Admin/Super |
 | Sending points to another user | Amount + transfer fee % |
 
 ### Point Transfers
@@ -274,7 +347,7 @@ Points balances can go negative (shown in red). This happens when a user has spe
 
 ---
 
-## 11. Bounty Board
+## 12. Bounty Board
 
 The Bounty Board lets users post point-backed requests for specific content. Navigate to it via the **🎯 Bounties** button in the nav bar (Standard+ only).
 
@@ -325,7 +398,7 @@ The fulfilled bounty detail page shows the full breakdown with exact amounts and
 
 ---
 
-## 12. Leaderboard
+## 13. Leaderboard
 
 Navigate to **🏆 Leaderboard** in the nav bar (Standard+ only). The leaderboard shows the top N users (configurable by admin, default 10) in six categories.
 
@@ -342,7 +415,7 @@ Top 3 in each category receive 🥇🥈🥉 medals. All usernames link to public
 
 ---
 
-## 13. Admin Panel
+## 14. Admin Panel
 
 Accessible to Admin and Super only via the **⚙ Admin Panel** link (visible on the dashboard for admins).
 
@@ -366,23 +439,23 @@ Manage the tracker URLs embedded in generated magnet links. Each tracker can be 
 
 ### Settings Tab
 
-See [Section 16](#16-settings-admin).
+See [Section 17](#17-settings-admin).
 
 ### Database Tab
 
-See [Section 19](#19-database-backup-and-restore). Visible to Super only.
+See [Section 20](#20-database-backup-and-restore). Visible to Super only.
 
 ### Economy Tab
 
-See [Section 17](#17-economy-settings-admin). Visible to Super only.
+See [Section 18](#18-economy-settings-admin). Visible to Super only.
 
 ### Invites Tab
 
-See [Section 18](#18-invite-codes). Visible to Admin and Super.
+See [Section 19](#19-invite-codes). Visible to Admin and Super.
 
 ### Danger Tab
 
-Bulk-delete operations and System Wipe. Visible to Super only. See [Section 14](#14-user-management-admin).
+Bulk-delete operations and System Wipe. Visible to Super only. See [Section 15](#15-user-management-admin).
 
 ### Events Tab
 
@@ -401,7 +474,7 @@ Use the **✕ Clear** button to reset all filters and return to the full unfilte
 
 ---
 
-## 14. User Management (Admin)
+## 15. User Management (Admin)
 
 Click any username in the Users tab to open their management page.
 
@@ -440,7 +513,7 @@ The System Wipe requires a two-step typed confirmation: first type `SYSTEMWIPE` 
 
 ---
 
-## 15. IP Allowlist and IP Lock
+## 16. IP Allowlist and IP Lock
 
 The IP allowlist restricts an account to only log in from specific IP addresses.
 
@@ -463,7 +536,7 @@ IPv4 and IPv6 addresses are both supported and treated separately.
 
 ---
 
-## 16. Settings (Admin)
+## 17. Settings (Admin)
 
 The **Settings** tab controls site-wide behaviour. All changes take effect immediately without restarting the server.
 
@@ -495,9 +568,17 @@ When **on**, the full comment and notification system is active. When **off**, t
 
 The content returned at `/robots.txt`. By default, search engine crawlers are instructed to avoid `/announce`, `/scrape`, and `/manage`.
 
+### Direct Messages
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Enable DMs | on | Master switch — when off, the Messages button is hidden and no DMs can be sent |
+| Point cost per DM | 5 pts | Points deducted per recipient per send. Admins and Super are exempt |
+| Daily send limit | 20 | Maximum DMs a user can send per calendar day. Admins and Super are exempt |
+
 ---
 
-## 17. Economy Settings (Admin)
+## 18. Economy Settings (Admin)
 
 The **Economy** tab (Super only) contains the full economy configuration and live stats dashboard.
 
@@ -558,7 +639,7 @@ Controls how points are awarded:
 
 ---
 
-## 18. Invite Codes
+## 19. Invite Codes
 
 Invite codes allow controlled onboarding without enabling open free signup.
 
@@ -590,7 +671,7 @@ Opening the URL shows a registration form noting who invited you. The link is si
 
 ---
 
-## 19. Database Backup and Restore
+## 20. Database Backup and Restore
 
 The **Database** tab in the Admin Panel (Super only) provides live backup and restore without downtime.
 
@@ -610,7 +691,7 @@ Click **⬆ Restore from Backup**, choose a `.db.gz` file, and confirm. Before t
 
 ---
 
-## 20. Passwords
+## 21. Passwords
 
 ### Showing and Hiding Password Input
 

@@ -577,6 +577,17 @@ def _h(s: str) -> str:
     return _html_mod.escape(str(s), quote=True)
 
 
+def _session_token_for(user) -> str:
+    """Look up the most recent active session token for a user (for CSRF generation in render functions)."""
+    if not REGISTRATION_DB:
+        return ''
+    row = REGISTRATION_DB._conn().execute(
+        'SELECT token FROM sessions WHERE user_id=? ORDER BY id DESC LIMIT 1',
+        (user['id'],)
+    ).fetchone()
+    return row[0] if row else ''
+
+
 def _csrf_token(session_token: str) -> str:
     """Derive CSRF token from session token via HMAC."""
     return hmac.new(_CSRF_SECRET, session_token.encode(), 'sha256').hexdigest()[:32]
@@ -946,8 +957,35 @@ class RegistrationDB:
                 created_at TEXT    NOT NULL,
                 FOREIGN KEY (bounty_id) REFERENCES bounties(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS direct_messages (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender         TEXT    NOT NULL,
+                recipient      TEXT    NOT NULL,
+                subject        TEXT    NOT NULL DEFAULT '',
+                body           TEXT    NOT NULL,
+                sent_at        TEXT    NOT NULL,
+                read_at        TEXT,
+                del_by_sender  INTEGER NOT NULL DEFAULT 0,
+                del_by_recip   INTEGER NOT NULL DEFAULT 0,
+                is_broadcast   INTEGER NOT NULL DEFAULT 0,
+                reply_to_id    INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS dm_blocklist (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id          INTEGER NOT NULL,
+                blocked_username TEXT    NOT NULL,
+                blocked_at       TEXT    NOT NULL,
+                UNIQUE(user_id, blocked_username),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
         ''')
         c.commit()
+        # ── DM opt-out column (migration-safe) ───────────────
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN allow_dms INTEGER NOT NULL DEFAULT 1')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
 
     def _init_defaults(self, announce_urls: list):
         """Seed magnet_trackers and settings if not already present."""
@@ -990,6 +1028,10 @@ class RegistrationDB:
             'leaderboard_top_n':        '10',
             # ── Admin ─────────────────────────────────────────
             'admin_max_point_grant':    '1000',
+            # ── Direct messages ───────────────────────────────
+            'dm_enabled':           '1',
+            'dm_cost':              '5',
+            'dm_daily_limit':       '10',
         }
         for k, v in defaults.items():
             c.execute('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)', (k, v))
@@ -1001,6 +1043,155 @@ class RegistrationDB:
                           (url, order))
                 order += 1
         c.commit()
+
+    # ── Direct Message DB Methods ────────────────────────────
+
+    def send_dm(self, sender: str, recipient: str, subject: str, body: str,
+                is_broadcast: bool = False, reply_to_id: int = None) -> int:
+        """Insert a DM. Returns new message id."""
+        c = self._conn()
+        c.execute(
+            "INSERT INTO direct_messages (sender,recipient,subject,body,sent_at,is_broadcast,reply_to_id)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (sender, recipient, subject[:200], body[:5000],
+             self._ts(), 1 if is_broadcast else 0, reply_to_id)
+        )
+        c.commit()
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_dm_inbox(self, username: str, limit: int = 100) -> list:
+        return self._conn().execute(
+            "SELECT * FROM direct_messages WHERE recipient=? AND del_by_recip=0"
+            " ORDER BY id DESC LIMIT ?",
+            (username, limit)
+        ).fetchall()
+
+    def get_dm_sent(self, username: str, limit: int = 100) -> list:
+        return self._conn().execute(
+            "SELECT * FROM direct_messages WHERE sender=? AND del_by_sender=0"
+            " AND is_broadcast=0 ORDER BY id DESC LIMIT ?",
+            (username, limit)
+        ).fetchall()
+
+    def get_dm(self, msg_id: int) -> object:
+        return self._conn().execute(
+            "SELECT * FROM direct_messages WHERE id=?", (msg_id,)
+        ).fetchone()
+
+    def get_dm_thread(self, msg_id: int, username: str) -> list:
+        """Get a message and all replies in the thread visible to username."""
+        root = self.get_dm(msg_id)
+        if not root:
+            return []
+        # Walk up to find root
+        while root["reply_to_id"]:
+            parent = self.get_dm(root["reply_to_id"])
+            if not parent:
+                break
+            root = parent
+        # Get all messages in thread (root + replies)
+        def collect(mid):
+            msg = self.get_dm(mid)
+            if not msg:
+                return []
+            result = [msg]
+            children = self._conn().execute(
+                "SELECT id FROM direct_messages WHERE reply_to_id=? ORDER BY id",
+                (mid,)
+            ).fetchall()
+            for row in children:
+                result.extend(collect(row[0]))
+            return result
+        return collect(root["id"])
+
+    def get_unread_dm_count(self, username: str) -> int:
+        return self._conn().execute(
+            "SELECT COUNT(*) FROM direct_messages WHERE recipient=? AND read_at IS NULL AND del_by_recip=0",
+            (username,)
+        ).fetchone()[0]
+
+    def mark_dm_read(self, msg_id: int, username: str):
+        c = self._conn()
+        c.execute(
+            "UPDATE direct_messages SET read_at=? WHERE id=? AND recipient=? AND read_at IS NULL",
+            (self._ts(), msg_id, username)
+        )
+        c.commit()
+
+    def mark_all_dm_read(self, username: str):
+        c = self._conn()
+        c.execute(
+            "UPDATE direct_messages SET read_at=? WHERE recipient=? AND read_at IS NULL",
+            (self._ts(), username)
+        )
+        c.commit()
+
+    def delete_dm_sender(self, msg_id: int, username: str):
+        c = self._conn()
+        c.execute("UPDATE direct_messages SET del_by_sender=1 WHERE id=? AND sender=?",
+                  (msg_id, username))
+        c.commit()
+
+    def delete_dm_recip(self, msg_id: int, username: str):
+        c = self._conn()
+        c.execute("UPDATE direct_messages SET del_by_recip=1 WHERE id=? AND recipient=?",
+                  (msg_id, username))
+        c.commit()
+
+    def get_dm_sent_today(self, username: str) -> int:
+        today = self._ts()[:10]
+        return self._conn().execute(
+            "SELECT COUNT(*) FROM direct_messages WHERE sender=? AND sent_at>=? AND is_broadcast=0",
+            (username, today)
+        ).fetchone()[0]
+
+    def dm_blocklist_add(self, user_id: int, blocked_username: str):
+        c = self._conn()
+        c.execute(
+            "INSERT OR IGNORE INTO dm_blocklist (user_id,blocked_username,blocked_at) VALUES (?,?,?)",
+            (user_id, blocked_username, self._ts())
+        )
+        c.commit()
+
+    def dm_blocklist_remove(self, user_id: int, blocked_username: str):
+        c = self._conn()
+        c.execute("DELETE FROM dm_blocklist WHERE user_id=? AND blocked_username=?",
+                  (user_id, blocked_username))
+        c.commit()
+
+    def dm_blocklist_get(self, user_id: int) -> list:
+        return self._conn().execute(
+            "SELECT * FROM dm_blocklist WHERE user_id=? ORDER BY blocked_at DESC",
+            (user_id,)
+        ).fetchall()
+
+    def dm_is_blocked(self, sender: str, recipient_id: int) -> bool:
+        """Returns True if recipient has blocked sender."""
+        row = self._conn().execute(
+            "SELECT 1 FROM dm_blocklist WHERE user_id=? AND blocked_username=?",
+            (recipient_id, sender)
+        ).fetchone()
+        return row is not None
+
+    def dm_toggle_setting(self, user_id: int, allow: bool):
+        """Store per-user DM opt-out in settings-like user field."""
+        # We use the users table — add allow_dms column via migration
+        c = self._conn()
+        c.execute("UPDATE users SET allow_dms=? WHERE id=?", (1 if allow else 0, user_id))
+        c.commit()
+
+    def broadcast_dm(self, sender: str, subject: str, body: str) -> int:
+        """Send a DM to every non-disabled user. Returns count sent."""
+        users = self._conn().execute(
+            "SELECT username FROM users WHERE is_disabled=0 AND username!=?",
+            (sender,)
+        ).fetchall()
+        count = 0
+        for row in users:
+            self.send_dm(sender, row[0], subject, body, is_broadcast=True)
+            count += 1
+        self._log(sender, 'broadcast_dm', '', f'subject={subject[:60]!r} recipients={count}')
+        return count
 
     def get_setting(self, key: str, default: str = '') -> str:
         row = self._conn().execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
@@ -2013,7 +2204,7 @@ class RegistrationDB:
         """Split query into tokens, return (where_fragment, params_list).
         Each token must match either the name (with separators normalised to spaces)
         or the raw name or the info_hash.  Dots/dashes/underscores are treated as
-        spaces so 'rental family' matches 'Rental.Family.2025...'
+        spaces so 'ubuntu server' matches 'Ubuntu.Server.2025...'
         """
         import re
         # Normalise separators in the query too, then split on whitespace
@@ -3904,6 +4095,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_search()
         elif path == '/manage/notifications':
             self._get_notifications()
+        elif path == '/manage/messages':
+            self._get_messages()
+        elif path.startswith('/manage/messages/'):
+            self._get_message_thread(path[len('/manage/messages/'):])
         elif path == '/manage/bounty':
             self._get_bounty_board()
         elif path == '/manage/leaderboard':
@@ -4007,6 +4202,23 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_notification_read(nid)
         elif path == '/manage/notifications/read-all':
             self._post_notification_read_all()
+        elif path == '/manage/messages/send':
+            self._post_dm_send()
+        elif path == '/manage/messages/reply':
+            self._post_dm_reply()
+        elif path == '/manage/messages/delete':
+            self._post_dm_delete()
+        elif path == '/manage/messages/mark-read':
+            self._post_dm_mark_read()
+        elif path == '/manage/messages/block':
+            self._post_dm_block()
+        elif path == '/manage/messages/unblock':
+            self._post_dm_unblock()
+        elif path == '/manage/messages/broadcast':
+            self._post_dm_broadcast()
+        elif path == '/manage/messages/toggle-dms':
+            self._post_dm_toggle()
+
         elif path == '/manage/comment/delete-all':
             self._post_delete_all_comments()
         elif path == '/manage/admin/delete-all-comments-global':
@@ -5018,7 +5230,17 @@ class ManageHandler(BaseHTTPRequestHandler):
             try: v = str(max(1, min(999999, int(fields.get('admin_max_point_grant', '1000')))))
             except: v = '1000'
             REGISTRATION_DB.set_setting('admin_max_point_grant', v, user['username'])
-        self._redirect('/manage/admin?tab=economy' if form_id in ('points_earn','points_spend','bounty_settings','leaderboard_settings','admin_grant_settings') else '/manage/admin')
+        elif form_id == 'dm_settings':
+            val = '1' if fields.get('dm_enabled') == '1' else '0'
+            REGISTRATION_DB.set_setting('dm_enabled', val, user['username'])
+            for key, default, lo, hi in [
+                ('dm_cost',        '5',  0, 9999),
+                ('dm_daily_limit', '10', 1, 999),
+            ]:
+                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except: v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
+        self._redirect('/manage/admin?tab=economy' if form_id in ('points_earn','points_spend','bounty_settings','leaderboard_settings','admin_grant_settings','dm_settings') else '/manage/admin')
 
     # ── Invite & Credit handlers ─────────────────────────────
 
@@ -5176,6 +5398,240 @@ class ManageHandler(BaseHTTPRequestHandler):
         ok, msg = REGISTRATION_DB.transfer_points(user['username'], to_user, amount)
         q = urllib.parse.quote(msg)
         self._redirect(f'/manage/profile?msg={q}&msg_type={"success" if ok else "error"}')
+
+    # ── DM Handlers ─────────────────────────────────────────
+
+    def _get_messages(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        role = _user_role(user)
+        if role == 'basic': return self._redirect('/manage/dashboard')
+        qs   = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        tab      = qs.get('tab', ['inbox'])[0]
+        msg      = qs.get('msg',  [''])[0]
+        msg_type = qs.get('msg_type', ['info'])[0]
+        compose_to = qs.get('to', [''])[0]   # pre-fill recipient from profile Send DM link
+        if compose_to:
+            tab = 'compose'
+        inbox     = REGISTRATION_DB.get_dm_inbox(user['username'])
+        sent      = REGISTRATION_DB.get_dm_sent(user['username'])
+        blocklist = REGISTRATION_DB.dm_blocklist_get(user['id'])
+        self._send_html(_render_messages_page(user, inbox, sent, blocklist,
+                                              tab=tab, msg=msg, msg_type=msg_type,
+                                              compose_to=compose_to))
+
+    def _get_message_thread(self, msg_id_str: str):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        role = _user_role(user)
+        if role == 'basic': return self._redirect('/manage/dashboard')
+        if not msg_id_str.isdigit():
+            return self._redirect('/manage/messages')
+        msg_id = int(msg_id_str)
+        thread = REGISTRATION_DB.get_dm_thread(msg_id, user['username'])
+        if not thread:
+            return self._redirect('/manage/messages')
+        uname = user['username']
+        if not any(m['sender'] == uname or m['recipient'] == uname for m in thread):
+            return self._redirect('/manage/messages')
+        for m in thread:
+            if m['recipient'] == uname and not m['read_at']:
+                REGISTRATION_DB.mark_dm_read(m['id'], uname)
+        qs       = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['info'])[0]
+        self._send_html(_render_message_thread(user, thread, msg_id, msg=msg, msg_type=msg_type))
+
+    def _post_dm_send(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        role = _user_role(user)
+        if role == 'basic': return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        recipient_raw = fields.get('recipient', '').strip()
+        subject       = fields.get('subject', '').strip()[:200]
+        text          = fields.get('body', '').strip()[:5000]
+        uname         = user['username']
+        is_admin_or_super = role in ('admin', 'super')
+
+        if not recipient_raw or not text:
+            return self._redirect('/manage/messages?tab=compose&msg=Missing+recipient+or+body&msg_type=error')
+
+        # Check DMs enabled globally
+        if REGISTRATION_DB.get_setting('dm_enabled', '1') != '1' and not is_admin_or_super:
+            return self._redirect('/manage/messages?msg=DMs+are+disabled&msg_type=error')
+
+        # Split recipients on semicolons, strip whitespace, deduplicate, drop self
+        recipients = [r.strip() for r in recipient_raw.replace(',', ';').split(';')]
+        recipients = list(dict.fromkeys(r for r in recipients if r and r != uname))
+        if not recipients:
+            return self._redirect('/manage/messages?tab=compose&msg=No+valid+recipients&msg_type=error')
+
+        # Pre-validate all recipients before spending any points
+        errors = []
+        valid  = []
+        for recip in recipients:
+            recip_user = REGISTRATION_DB.get_user(recip)
+            if not recip_user:
+                errors.append(f'{recip}: not found')
+                continue
+            if not is_admin_or_super:
+                allow = recip_user['allow_dms'] if 'allow_dms' in recip_user.keys() else 1
+                if not allow:
+                    errors.append(f'{recip}: has disabled DMs')
+                    continue
+                if REGISTRATION_DB.dm_is_blocked(uname, recip_user['id']):
+                    errors.append(f'{recip}: not accepting messages')
+                    continue
+            valid.append(recip_user)
+
+        if not valid:
+            msg = urllib.parse.quote('; '.join(errors))
+            return self._redirect(f'/manage/messages?tab=compose&msg={msg}&msg_type=error')
+
+        if not is_admin_or_super:
+            daily_limit = int(REGISTRATION_DB.get_setting('dm_daily_limit', '10'))
+            sent_today  = REGISTRATION_DB.get_dm_sent_today(uname)
+            remaining   = daily_limit - sent_today
+            if remaining <= 0:
+                return self._redirect(f'/manage/messages?tab=compose&msg=Daily+DM+limit+reached+%28{daily_limit}%2Fday%29&msg_type=error')
+            if len(valid) > remaining:
+                valid = valid[:remaining]
+                errors.append(f'daily limit reached — only sent to first {remaining}')
+            cost = int(REGISTRATION_DB.get_setting('dm_cost', '5'))
+            total_cost = cost * len(valid)
+            if total_cost > 0:
+                ok = REGISTRATION_DB.spend_points(user['id'], total_cost,
+                                                   f'DM to {len(valid)} recipients', 'dm', recipient_raw[:60])
+                if not ok:
+                    return self._redirect(f'/manage/messages?tab=compose&msg=Insufficient+points+%28need+{total_cost}+pts%29&msg_type=error')
+
+        last_id = None
+        for recip_user in valid:
+            last_id = REGISTRATION_DB.send_dm(uname, recip_user['username'], subject, text)
+            REGISTRATION_DB._log(uname, 'dm_send', recip_user['username'], f'subject={subject[:40]!r}')
+
+        sent_count = len(valid)
+        if errors:
+            skipped = urllib.parse.quote(f'Sent to {sent_count}. Skipped: ' + '; '.join(errors))
+            return self._redirect(f'/manage/messages/{last_id}?msg={skipped}&msg_type=info')
+
+        if sent_count == 1:
+            self._redirect(f'/manage/messages/{last_id}?msg=Message+sent&msg_type=success')
+        else:
+            self._redirect(f'/manage/messages/{last_id}?msg=Message+sent+to+{sent_count}+recipients&msg_type=success')
+
+    def _post_dm_reply(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        role = _user_role(user)
+        if role == 'basic': return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        reply_to  = fields.get('reply_to_id', '').strip()
+        text      = fields.get('body', '').strip()[:5000]
+        uname     = user['username']
+        is_admin_or_super = role in ('admin', 'super')
+
+        if not reply_to.isdigit() or not text:
+            return self._redirect('/manage/messages')
+        orig = REGISTRATION_DB.get_dm(int(reply_to))
+        if not orig:
+            return self._redirect('/manage/messages')
+        # Only sender or recipient of original can reply
+        if orig['sender'] != uname and orig['recipient'] != uname:
+            return self._redirect('/manage/messages')
+
+        # Recipient of the reply is the other party
+        recipient = orig['sender'] if orig['recipient'] == uname else orig['recipient']
+        recip_user = REGISTRATION_DB.get_user(recipient)
+
+        if not is_admin_or_super:
+            if REGISTRATION_DB.get_setting('dm_enabled', '1') != '1':
+                return self._redirect(f'/manage/messages/{reply_to}?msg=DMs+are+disabled&msg_type=error')
+            if recip_user:
+                allow = recip_user['allow_dms'] if 'allow_dms' in recip_user.keys() else 1
+                if not allow:
+                    return self._redirect(f'/manage/messages/{reply_to}?msg=User+has+disabled+DMs&msg_type=error')
+                if REGISTRATION_DB.dm_is_blocked(uname, recip_user['id']):
+                    return self._redirect(f'/manage/messages/{reply_to}?msg=This+user+is+not+accepting+messages+at+this+time&msg_type=error')
+            daily_limit = int(REGISTRATION_DB.get_setting('dm_daily_limit', '10'))
+            if REGISTRATION_DB.get_dm_sent_today(uname) >= daily_limit:
+                return self._redirect(f'/manage/messages/{reply_to}?msg=Daily+DM+limit+reached&msg_type=error')
+            cost = int(REGISTRATION_DB.get_setting('dm_cost', '5'))
+            if cost > 0:
+                ok = REGISTRATION_DB.spend_points(user['id'], cost, f'DM reply to {recipient}', 'dm', recipient)
+                if not ok:
+                    return self._redirect(f'/manage/messages/{reply_to}?msg=Insufficient+points&msg_type=error')
+
+        subject = ('Re: ' + orig['subject']) if not orig['subject'].startswith('Re: ') else orig['subject']
+        msg_id = REGISTRATION_DB.send_dm(uname, recipient, subject, text, reply_to_id=int(reply_to))
+        self._redirect(f'/manage/messages/{msg_id}?msg=Reply+sent&msg_type=success')
+
+    def _post_dm_delete(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        msg_id = fields.get('msg_id', '').strip()
+        if not msg_id.isdigit(): return self._redirect('/manage/messages')
+        msg = REGISTRATION_DB.get_dm(int(msg_id))
+        if not msg: return self._redirect('/manage/messages')
+        uname = user['username']
+        if msg['sender'] == uname:
+            REGISTRATION_DB.delete_dm_sender(int(msg_id), uname)
+        elif msg['recipient'] == uname:
+            REGISTRATION_DB.delete_dm_recip(int(msg_id), uname)
+        self._redirect('/manage/messages?msg=Message+deleted&msg_type=success')
+
+    def _post_dm_mark_read(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        REGISTRATION_DB.mark_all_dm_read(user['username'])
+        self._redirect('/manage/messages?msg=All+marked+read&msg_type=success')
+
+    def _post_dm_block(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target = fields.get('username', '').strip()
+        if target and target != user['username']:
+            REGISTRATION_DB.dm_blocklist_add(user['id'], target)
+        self._redirect('/manage/messages?tab=blocked&msg=User+blocked&msg_type=success')
+
+    def _post_dm_unblock(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target = fields.get('username', '').strip()
+        REGISTRATION_DB.dm_blocklist_remove(user['id'], target)
+        self._redirect('/manage/messages?tab=blocked&msg=User+unblocked&msg_type=success')
+
+    def _post_dm_broadcast(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        if user['username'] != SUPER_USER: return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        subject = fields.get('subject', '').strip()[:200]
+        text    = fields.get('body', '').strip()[:5000]
+        if not subject or not text:
+            return self._redirect('/manage/messages?tab=broadcast&msg=Subject+and+body+required&msg_type=error')
+        count = REGISTRATION_DB.broadcast_dm(user['username'], subject, text)
+        self._redirect(f'/manage/messages?tab=sent&msg=Broadcast+sent+to+{count}+users&msg_type=success')
+
+    def _post_dm_toggle(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        allow = fields.get('allow_dms', '0') == '1'
+        REGISTRATION_DB.dm_toggle_setting(user['id'], allow)
+        msg = 'DMs+enabled' if allow else 'DMs+disabled'
+        self._redirect(f'/manage/profile?msg={msg}&msg_type=success')
 
     def _post_profile_generate_invite(self):
         user = self._get_session_user()
@@ -6032,10 +6488,16 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             f'<div class="notif-footer"><a href="/manage/notifications">View all notifications</a></div>'
             f'</div></div>'
         )
+        unread_dm = REGISTRATION_DB.get_unread_dm_count(user['username']) if REGISTRATION_DB else 0
+        dm_badge  = f'<span class="notif-count">{unread_dm}</span>' if unread_dm else ''
+        dm_cls    = 'notif-bell-btn' if unread_dm else 'notif-bell-btn notif-bell-inactive'
+        mail_html = (f'<a href="/manage/messages" class="{dm_cls}" '
+                     f'style="text-decoration:none" aria-label="Messages">'
+                     f'📬{dm_badge}</a>') if role != 'basic' else ''
         nav = (f'<a href="/manage/profile" class="nav-user" style="text-decoration:none">'
                f'<span class="nav-username">{_h(user["username"])}</span> '
                f'<span class="badge badge-{role}">{role_label}</span></a>'
-               + bell_html +
+               + mail_html + bell_html +
                f'<a href="/manage/logout" class="btn btn-sm">Logout</a>')
         center_nav = (
             '<a href="/manage/dashboard" class="nav-btn">🖥 Dashboard</a>'
@@ -6718,6 +7180,25 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         </form>
       </div>
       <div class="card">
+        <div class="card-title">&#x2709; Direct Messages</div>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="dm_settings">
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" name="dm_enabled" value="1" {'checked' if _eset('dm_enabled','1')=='1' else ''}> Enable DM system
+            </label>
+          </div>
+          <div style="display:flex;gap:16px;flex-wrap:wrap">
+            <div class="form-group"><label>Point cost per DM (0 = free)</label>
+              <input type="number" name="dm_cost" value="{_eset('dm_cost','5')}" min="0" max="9999" style="width:100px"></div>
+            <div class="form-group"><label>Daily send limit per user</label>
+              <input type="number" name="dm_daily_limit" value="{_eset('dm_daily_limit','10')}" min="1" max="999" style="width:100px"></div>
+          </div>
+          <p style="color:var(--muted);font-size:0.8rem;margin:0 0 10px">Admins and Super are exempt from cost and daily limits. Super can broadcast to all users.</p>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+            <div class="card">
         <div class="card-title">⚡ Admin Point Grants</div>
         <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
           Maximum points an admin can grant or remove per transaction on a user's profile.
@@ -7322,6 +7803,287 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
     )
 
 
+    @staticmethod
+    def get_setting(k,d=''): return d
+    @staticmethod
+    def get_dm_sent_today(u): return 0
+    @staticmethod
+    def dm_blocklist_get(uid): return []
+
+def _render_messages_page(viewer, inbox, sent, blocklist,
+                           tab='inbox', msg='', msg_type='info', compose_to=''):
+    uname    = viewer['username']
+    role     = _user_role(viewer)
+    is_super = (role == 'super')
+    cost     = int(REGISTRATION_DB.get_setting('dm_cost', '5'))
+    daily    = int(REGISTRATION_DB.get_setting('dm_daily_limit', '10'))
+    sent_today = REGISTRATION_DB.get_dm_sent_today(uname)
+    allow    = viewer['allow_dms'] if 'allow_dms' in viewer.keys() else 1
+    msg_html = ''
+    if msg:
+        clr = 'var(--green)' if msg_type == 'success' else 'var(--red)'
+        msg_html = (f'<div style="background:{clr}22;border:1px solid {clr};'
+                    f'color:{clr};padding:10px 14px;border-radius:6px;margin-bottom:16px">'
+                    f'{_h(msg)}</div>')
+
+    def _row(m, mode='inbox'):
+        is_unread = (not m['read_at']) and mode == 'inbox'
+        other = m['sender'] if mode == 'inbox' else m['recipient']
+        subj  = _h(((m['subject'] if 'subject' in m.keys() else '') or '')[:60] or '(no subject)')
+        ts    = _h(((m['sent_at'] if 'sent_at' in m.keys() else '') or '')[:16].replace('T', ' '))
+        bold  = 'font-weight:700;' if is_unread else ''
+        badge = ('<span style="background:var(--accent);color:#000;font-size:0.65rem;'
+                 'padding:1px 5px;border-radius:3px;margin-left:6px">NEW</span>') if is_unread else ''
+        bcast = ('<span style="background:var(--blue);color:#fff;font-size:0.65rem;'
+                 'padding:1px 5px;border-radius:3px;margin-left:4px">BROADCAST</span>') if (m['is_broadcast'] if 'is_broadcast' in m.keys() else 0) else ''
+        return (f'<tr style="cursor:pointer" onclick="location.href=\'/manage/messages/{m["id"]}\'">'
+                f'<td style="{bold}padding:8px 10px">{_h(other)}{bcast}</td>'
+                f'<td style="{bold}padding:8px 10px">{subj}{badge}</td>'
+                f'<td style="padding:8px 10px;color:var(--muted);white-space:nowrap">{ts}</td>'
+                f'</tr>')
+
+    inbox_rows = (''.join(_row(m, 'inbox') for m in inbox)
+                  or '<tr><td colspan="3" style="padding:20px;text-align:center;'
+                     'color:var(--muted)">No messages</td></tr>')
+    sent_rows  = (''.join(_row(m, 'sent') for m in sent)
+                  or '<tr><td colspan="3" style="padding:20px;text-align:center;'
+                     'color:var(--muted)">No sent messages</td></tr>')
+
+    def _msg_table(rows, header1):
+        return (f'<table style="width:100%;border-collapse:collapse">'
+                f'<thead><tr style="border-bottom:1px solid var(--border)">'
+                f'<th style="text-align:left;padding:8px 10px;color:var(--muted);'
+                f'font-size:0.8rem">{header1}</th>'
+                f'<th style="text-align:left;padding:8px 10px;color:var(--muted);'
+                f'font-size:0.8rem">Subject</th>'
+                f'<th style="text-align:left;padding:8px 10px;color:var(--muted);'
+                f'font-size:0.8rem">Date</th>'
+                f'</tr></thead><tbody>{rows}</tbody></table>')
+
+    inbox_html = _msg_table(inbox_rows, 'From')
+    sent_html  = _msg_table(sent_rows, 'To')
+    unread_count = sum(1 for m in inbox if not m['read_at'])
+
+    block_rows = ''
+    for b in blocklist:
+        bu = _h(b['blocked_username'])
+        block_rows += (
+            f'<tr><td style="padding:8px 10px">{bu}</td>'
+            f'<td style="padding:8px 10px">'
+            f'<form method="POST" action="/manage/messages/unblock" style="display:inline">'
+            f'<input type="hidden" name="username" value="{bu}">'
+            f'<button class="btn btn-sm btn-green">Unblock</button>'
+            f'</form></td></tr>')
+    blocked_html = (
+        f'<table style="width:100%;border-collapse:collapse"><tbody>{block_rows}</tbody></table>'
+        if blocklist else
+        '<div style="color:var(--muted);padding:20px">No blocked users</div>')
+
+    compose_html = (
+        f'<div style="max-width:600px">'
+        f'<form method="POST" action="/manage/messages/send">'
+        
+        f'<div style="margin-bottom:12px">'
+        f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">To (username, or multiple separated by ;)</label>'
+        f'<input type="text" name="recipient" required value="{_h(compose_to)}" placeholder="e.g. cathy; bob; john" style="width:100%;background:var(--card2);'
+        f'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;box-sizing:border-box">'
+        f'</div>'
+        f'<div style="margin-bottom:12px">'
+        f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Subject</label>'
+        f'<input type="text" name="subject" maxlength="200" style="width:100%;background:var(--card2);'
+        f'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;box-sizing:border-box">'
+        f'</div>'
+        f'<div style="margin-bottom:12px">'
+        f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Message</label>'
+        f'<textarea name="body" required rows="6" maxlength="5000" style="width:100%;background:var(--card2);'
+        f'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;'
+        f'box-sizing:border-box;resize:vertical"></textarea>'
+        f'</div>'
+        f'<button type="submit" class="btn">📩 Send</button>'
+        f'</form>')
+    if role not in ('admin', 'super') and cost > 0:
+        compose_html += (f'<p style="color:var(--muted);font-size:0.83rem;margin-top:8px">'
+                         f'Costs {cost} pts per message &middot; {sent_today}/{daily} sent today</p>')
+    compose_html += '</div>'
+
+    broadcast_html = ''
+    if is_super:
+        broadcast_html = (
+            f'<div style="max-width:600px">'
+            f'<div style="background:var(--accent)22;border:1px solid var(--accent);border-radius:6px;'
+            f'padding:12px;margin-bottom:16px;font-size:0.85rem;color:var(--accent)">'
+            f'&#x1F4E2; Broadcast sends to ALL non-disabled users. No point cost.</div>'
+            f'<form method="POST" action="/manage/messages/broadcast">'
+            
+            f'<div style="margin-bottom:12px">'
+            f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Subject</label>'
+            f'<input type="text" name="subject" required maxlength="200" style="width:100%;background:var(--card2);'
+            f'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;box-sizing:border-box">'
+            f'</div>'
+            f'<div style="margin-bottom:12px">'
+            f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Message</label>'
+            f'<textarea name="body" required rows="6" maxlength="5000" style="width:100%;background:var(--card2);'
+            f'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;'
+            f'box-sizing:border-box;resize:vertical"></textarea>'
+            f'</div>'
+            f'<button type="submit" class="btn" style="background:var(--accent)22;border-color:var(--accent);'
+            f'color:var(--accent)" onclick="return confirm(\'Send broadcast DM to all users?\')">'
+            f'&#x1F4E2; Send Broadcast</button>'
+            f'</form></div>')
+
+    tabs = [('inbox',   f'&#x1F4E5; Inbox{" (" + str(unread_count) + ")" if unread_count else ""}'),
+            ('sent',    '&#x1F4E4; Sent'),
+            ('compose', '✍️ Compose'),
+            ('blocked', '&#x1F6AB; Blocked')]
+    if is_super:
+        tabs.append(('broadcast', '&#x1F4E2; Broadcast'))
+
+    content_map = {
+        'inbox':     inbox_html,
+        'sent':      sent_html,
+        'compose':   compose_html,
+        'blocked':   blocked_html,
+        'broadcast': broadcast_html,
+    }
+    tab_buttons = ''
+    tab_contents = ''
+    for tid, tlabel in tabs:
+        tab_cls = ' active' if tid == tab else ''
+        tab_buttons += f'<button class="tab{tab_cls}" onclick="showTab(\'{tid}\',this)">{tlabel}</button>'
+        tab_contents += f'<div id="panel-{tid}" class="panel{" visible" if tid == tab else ""}">{content_map.get(tid,"")}</div>'
+
+    allow_checked = 'checked' if allow else ''
+    toggle_html = (
+        f'<form method="POST" action="/manage/messages/toggle-dms" style="margin-top:8px">'
+        
+        f'<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+        f'<input type="checkbox" name="allow_dms" value="1" {allow_checked} onchange="this.form.submit()">'
+        f' Allow others to send me DMs</label></form>')
+
+    mark_all = ''
+    if unread_count:
+        mark_all = (f'<form method="POST" action="/manage/messages/mark-read" style="display:inline;margin-top:4px">'
+                    
+                    f'<button class="btn btn-sm">&#x2713; Mark all read</button></form>')
+
+    body = (
+        f'<div class="page-title">📬 Messages</div>'
+        f'<div class="page-sub"><a href="/manage/dashboard" style="color:var(--muted);'
+        f'text-decoration:none">&#10094; Dashboard</a></div>'
+        f'{msg_html}'
+        f'{toggle_html}'
+        f'{mark_all}'
+        f'<div class="card" style="margin-top:16px">'
+        f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">{tab_buttons}</div>'
+        f'{tab_contents}</div>')
+    return _manage_page('📬 Messages', body, user=viewer)
+
+
+def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
+    uname = viewer['username']
+    role  = _user_role(viewer)
+    other_party = None
+    for m in thread:
+        if m['sender'] != uname:
+            other_party = m['sender']
+            break
+        if m['recipient'] != uname:
+            other_party = m['recipient']
+            break
+
+    bubbles = ''
+    for m in thread:
+        is_mine = m['sender'] == uname
+        align   = 'flex-end' if is_mine else 'flex-start'
+        bg      = 'var(--accent)22' if is_mine else 'var(--card2)'
+        border  = 'var(--accent)' if is_mine else 'var(--border)'
+        ts      = _h(((m['sent_at'] if 'sent_at' in m.keys() else '') or '')[:16].replace('T', ' '))
+        subj    = _h(((m['subject'] if 'subject' in m.keys() else '') or '')[:80])
+        bcast_badge = ('<span style="background:var(--blue);color:#fff;font-size:0.65rem;'
+                       'padding:1px 5px;border-radius:3px;margin-left:4px">BROADCAST</span>'
+                       ) if (m['is_broadcast'] if 'is_broadcast' in m.keys() else 0) else ''
+        del_form = (
+            f'<form method="POST" action="/manage/messages/delete" style="display:inline;margin-left:8px">'
+            
+            f'<input type="hidden" name="msg_id" value="{m["id"]}">'
+            f'<button class="btn btn-sm" style="font-size:0.7rem;background:var(--red)22;'
+            f'color:var(--red);border-color:var(--red)" '
+            f'onclick="return confirm(\'Delete this message?\')">&#x1F5D1;</button></form>')
+        bubbles += (
+            f'<div style="display:flex;justify-content:{align};margin-bottom:12px">'
+            f'<div style="max-width:75%;background:{bg};border:1px solid {border};'
+            f'border-radius:10px;padding:10px 14px">'
+            f'<div style="font-size:0.75rem;color:var(--muted);margin-bottom:4px">'
+            f'<strong>{_h(m["sender"])}</strong> &#x2192; '
+            f'<strong>{_h(m["recipient"])}</strong>{bcast_badge} &middot; {ts}'
+            f'{del_form}</div>'
+            + (f'<div style="font-size:0.82rem;color:var(--muted);margin-bottom:4px">{subj}</div>' if subj else '')
+            + f'<div style="white-space:pre-wrap;word-break:break-word">{_h(m["body"])}</div>'
+            f'</div></div>')
+
+    last_msg  = thread[-1]
+    reply_html = (
+        f'<div class="card" style="margin-top:16px">'
+        f'<div class="card-title" style="font-size:0.9rem">Reply</div>'
+        f'<form method="POST" action="/manage/messages/reply">'
+        
+        f'<input type="hidden" name="reply_to_id" value="{last_msg["id"]}">'
+        f'<textarea name="body" rows="4" maxlength="5000" placeholder="Write a reply..." '
+        f'style="width:100%;background:var(--card2);border:1px solid var(--border);'
+        f'color:var(--text);padding:8px 12px;border-radius:6px;box-sizing:border-box;'
+        f'resize:vertical;margin-bottom:8px"></textarea>'
+        f'<button type="submit" class="btn btn-sm">&#x21A9; Send Reply</button>'
+        f'</form></div>')
+
+    block_html = ''
+    if other_party:
+        other_user = REGISTRATION_DB.get_user(other_party) if REGISTRATION_DB else None
+        other_role = _user_role(other_user) if other_user else 'basic'
+        # Anyone can block regular users. No one can block admin/super.
+        if other_role not in ('admin', 'super'):
+            blocklist = REGISTRATION_DB.dm_blocklist_get(viewer['id'])
+            already_blocked = any(b['blocked_username'] == other_party for b in blocklist)
+            opu = _h(other_party)
+            if already_blocked:
+                block_html = (
+                    f' &nbsp;&#183;&nbsp; '
+                    f'<form method="POST" action="/manage/messages/unblock" style="display:inline">'
+                    f'<input type="hidden" name="username" value="{opu}">'
+                    f'<button class="btn btn-sm btn-green">'
+                    f'Unblock {opu}</button></form>')
+            else:
+                block_html = (
+                    f' &nbsp;&#183;&nbsp; '
+                    f'<form method="POST" action="/manage/messages/block" style="display:inline">'
+                    f'<input type="hidden" name="username" value="{opu}">'
+                    f'<button class="btn btn-sm btn-danger" onclick="return confirm(\'Block {opu}?\')">'
+                    f'&#x1F6AB; Block {opu}</button></form>')
+
+    profile_link = ''
+    if other_party:
+        opu = _h(other_party)
+        profile_link = (f' &nbsp;&#183;&nbsp; '
+                        f'<a href="/manage/user/{opu}" class="btn btn-sm" '
+                        f'style="text-decoration:none">👤 {opu}\'s Profile</a>')
+
+    msg_html = ''
+    if msg:
+        clr = 'var(--green)' if msg_type == 'success' else 'var(--red)'
+        msg_html = (f'<div style="background:{clr}22;border:1px solid {clr};color:{clr};'
+                    f'padding:10px 14px;border-radius:6px;margin:12px 0">{_h(msg)}</div>')
+
+    body = (
+        f'<div class="page-title">📬 Conversation</div>'
+        f'<div class="page-sub" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+        f'<a href="/manage/messages" style="color:var(--muted);text-decoration:none">&#10094; Messages</a>'
+        f'{profile_link}'
+        f'{block_html}</div>'
+        f'{msg_html}'
+        f'<div style="margin-top:16px">{bubbles}</div>'
+        f'{reply_html}')
+    return _manage_page('📬 Conversation', body, user=viewer)
+
+
 def _render_notifications_page(viewer) -> str:
     if not REGISTRATION_DB:
         return _manage_page('Notifications', '<p>Unavailable</p>', user=viewer)
@@ -7409,6 +8171,25 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     is_owner  = t['uploaded_by_id'] == viewer['id']
     can_del   = is_super or vrole == 'admin' or is_owner
     ih        = t['info_hash']
+
+    # ── Dynamic back link label ───────────────────────────────
+    import re as _re
+    _back_path = back_url.split('?')[0]
+    _bounty_m  = _re.match(r'^/manage/bounty/(\d+)$', _back_path)
+    if _bounty_m:
+        _back_label = f'Bounty #{_bounty_m.group(1)}'
+    else:
+        _back_label = {
+            '/manage/dashboard': 'Dashboard',
+            '/manage/search':    'Search',
+            '/manage/bounty':    'Bounty Board',
+            '/manage/admin':     'Admin Panel',
+        }.get(_back_path, 'Back')
+    _back_html = (
+        f'<a href="{back_url}" style="color:var(--muted);text-decoration:none">&#10094; {_back_label}</a>'
+        + ('' if _back_path == '/manage/dashboard' else
+           ' &nbsp;&#183;&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>')
+    )
     magnet    = REGISTRATION_DB.build_magnet(ih, t['name'],
                     t['total_size'] if 'total_size' in t.keys() else 0)
 
@@ -7476,9 +8257,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     body = f'''
   <div class="page-title">{t["name"]}</div>
   <div class="page-sub">
-    <a href="{back_url}" style="color:var(--muted);text-decoration:none">&#10094; Back</a>
-    &nbsp;&#183;&nbsp;
-    <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
+    {_back_html}
   </div>
 
   <div class="two-col" style="margin-bottom:0">
@@ -7594,6 +8373,7 @@ def _render_public_profile(viewer, target_user, torrents: list,
     Public profile
     &nbsp;&#183;&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
     {admin_link}
+    {'&nbsp;&#183;&nbsp; <a href="/manage/messages?to=' + uname_h + '" class="btn btn-sm">📬 Send DM</a>' if (not is_own and vrole != 'basic' and REGISTRATION_DB and REGISTRATION_DB.get_setting('dm_enabled','1') == '1' and not target_user['is_disabled']) else ''}
   </div>
 
   <div class="card" style="max-width:400px">
@@ -7738,7 +8518,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             )
 
         ip_html = (
-            '<div style="display:flex;flex-direction:column;gap:16px;margin-bottom:16px">'
+            '<div class="two-col">'
             + '<div class="card" style="overflow:hidden">'
             + '<div class="card-title">Recent Login IPs</div>'
             + '<form id="ip-lock-form" method="POST" action="/manage/admin/ip-lock">'
@@ -7777,7 +8557,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     if can_delete_all and total > 0:
         referer = '/manage/profile' if is_own_profile else '/manage/admin/user/' + uname_h
         delete_all_html = (
-            '<div class="card" style="border-color:rgba(224,91,48,0.3);margin-bottom:16px">'
+            '<div class="card" style="border-color:rgba(224,91,48,0.3)">'
             + '<div class="card-title" style="color:var(--accent2)">Danger Zone</div>'
             + '<p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">Permanently delete all '
             + str(total) + ' torrents registered by ' + uname_h + '. This cannot be undone.</p>'
@@ -7832,13 +8612,32 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     t_is_super  = (uname == SUPER_USER)
     t_is_admin  = target_user['is_admin']
     if is_own_profile:
+        # Build invite section inline for right column
+        _invite_html = _render_invite_section(viewer, target_user, True, REGISTRATION_DB)
+        # Build send points inline for right column
+        _points_top  = _render_points_section(viewer, target_user, True, ledger, bounty_data, part='top')
         actions_card = (
+            '<div style="display:flex;flex-direction:column;gap:24px">'
             '<div class="card"><div class="card-title">Actions</div>'
             '<div style="display:flex;flex-direction:column;gap:14px">'
             '<div>'
             '<a href="/manage/password" class="btn btn-primary">Change Password</a>'
             '</div>'
+            '</div>'
+            '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
+            '<div style="font-size:0.85rem;color:var(--muted);margin-bottom:8px">Messaging</div>'
+            '<form method="POST" action="/manage/messages/toggle-dms" style="display:flex;align-items:center;gap:10px">'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            '<input type="checkbox" name="allow_dms" value="1" '
+            + ('checked' if ('allow_dms' in viewer.keys() and viewer['allow_dms']) else '')
+            + '> Allow others to send me DMs</label>'
+            '<button type="submit" class="btn btn-sm">Save</button>'
+            '</form>'
+            '</div>'
             '</div></div>'
+            + _invite_html
+            + _points_top
+            + '</div>'
         )
     elif viewer_role in ('super', 'admin'):
         hi = '<input type="hidden" name="username" value="' + uname_h + '">'
@@ -7935,6 +8734,16 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + '</div>'
             + '</div></div>'
         )
+    # Send DM button — show on other users' profiles (Standard+ only, if DMs enabled)
+    dm_btn = ''
+    if (not is_own_profile
+            and REGISTRATION_DB
+            and REGISTRATION_DB.get_setting('dm_enabled', '1') == '1'
+            and _user_role(viewer) not in ('basic',)
+            and not target_user['is_disabled']):
+        dm_btn = (f' &nbsp;&#183;&nbsp; <a href="/manage/messages?tab=compose&to={uname_h}" '
+                  f'class="btn btn-sm">📬 Send DM</a>')
+
     body = (
         '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;flex-wrap:wrap">'
         + '<div class="page-title">' + uname_h + '</div>'
@@ -7942,17 +8751,19 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + '</div>'
         + '<div class="page-sub" style="margin-bottom:20px">'
         + ('Your profile' if is_own_profile else 'User profile')
-        + nav_links + '</div>'
+        + nav_links
+        + dm_btn + '</div>'
+        + '<div style="display:flex;flex-direction:column;gap:24px">'
         + '<div class="two-col">'
         + '<div class="card"><div class="card-title">Account Details</div>'
         + '<table style="min-width:unset">' + info_rows + '</table></div>'
         + actions_card
         + '</div>'
-        + _render_invite_section(viewer, target_user, is_own_profile, REGISTRATION_DB)
-        + _render_points_section(viewer, target_user, is_own_profile, ledger, bounty_data)
+        + _render_points_section(viewer, target_user, is_own_profile, ledger, bounty_data, part='rest')
         + ip_html
         + delete_all_html
         + torrent_html
+        + '</div>'
     )
     # Profile-level msg banner
     if msg:
@@ -7965,8 +8776,12 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
 
 
 def _render_points_section(viewer, target_user, is_own_profile: bool,
-                            ledger, bounty_data) -> str:
-    """Points ledger, transfer form, bounty history, and Basic sandbox teaser."""
+                            ledger, bounty_data, part: str = 'all') -> str:
+    """Points ledger, transfer form, bounty history, and Basic sandbox teaser.
+       part='top'  — Send Points card only (for two-col placement)
+       part='rest' — bounty tables + ledger (full-width)
+       part='all'  — everything (legacy)
+    """
     if not is_own_profile or not REGISTRATION_DB:
         return ''
 
@@ -8018,6 +8833,11 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
         + '</div></form></div>'
     )
 
+    if part == 'top':
+        return out
+    elif part == 'rest':
+        out = ''  # reset — only return the sections below
+
     # Bounty history
     if bounty_data:
         def _brow(b):
@@ -8033,7 +8853,8 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
         ff = ''.join(_brow(b) for b in bounty_data['fulfilled'][:10])
         hdr = '<thead><tr><th>Description</th><th>Status</th><th>Points</th></tr></thead>'
         if cr or ff:
-            out += '<div class="two-col">'
+            if cr and ff:
+                out += '<div class="two-col">'
             if cr:
                 out += ('<div class="card"><div class="card-title">My Bounties</div>'
                         + '<div class="table-wrap"><table class="torrent-table">'
@@ -8043,7 +8864,8 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
                 out += ('<div class="card"><div class="card-title">Bounties I Fulfilled</div>'
                         + '<div class="table-wrap"><table class="torrent-table">'
                         + hdr + f'<tbody>{ff}</tbody></table></div></div>')
-            out += '</div>'
+            if cr and ff:
+                out += '</div>'
 
     # Points ledger
     if ledger:
@@ -8051,14 +8873,20 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
         for e in ledger:
             d = e['delta']; color = 'var(--green)' if d > 0 else 'var(--danger)'
             sign = '+' if d > 0 else ''
-            rows += (f'<tr><td class="hash">{_h((e["created_at"] or "")[:16])}</td>'
-                     f'<td style="color:{color};font-weight:700">{sign}{d}</td>'
-                     f'<td style="color:var(--accent)">{e["balance_after"]}</td>'
-                     f'<td>{_h(e["reason"])}</td></tr>')
+            rows += (f'<tr style="border-top:1px solid var(--border)">'
+                     f'<td class="hash" style="padding:8px 12px 8px 0;white-space:nowrap;font-size:0.8rem">{_h((e["created_at"] or "")[:16])}</td>'
+                     f'<td style="padding:8px 12px 8px 0;color:{color};font-weight:700;white-space:nowrap">{sign}{d}</td>'
+                     f'<td style="padding:8px 12px 8px 0;color:var(--accent);white-space:nowrap">{e["balance_after"]}</td>'
+                     f'<td style="padding:8px 0;word-break:break-word">{_h(e["reason"])}</td></tr>')
         out += ('<div class="card"><div class="card-title">Points History (last 50)</div>'
-                + '<div class="table-wrap"><table class="torrent-table">'
-                + '<thead><tr><th>Date</th><th>Change</th><th>Balance</th><th>Reason</th></tr></thead>'
-                + f'<tbody>{rows}</tbody></table></div></div>')
+                + '<table style="width:100%;border-collapse:collapse">'
+                + '<thead><tr>'
+                + '<th style="text-align:left;padding:6px 12px 6px 0;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);white-space:nowrap">Date</th>'
+                + '<th style="text-align:left;padding:6px 12px 6px 0;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);white-space:nowrap">Change</th>'
+                + '<th style="text-align:left;padding:6px 12px 6px 0;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);white-space:nowrap">Balance</th>'
+                + '<th style="text-align:left;padding:6px 0;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);width:99%">Reason</th>'
+                + '</tr></thead>'
+                + f'<tbody>{rows}</tbody></table></div>')
 
     return out
 

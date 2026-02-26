@@ -36,7 +36,7 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Session management** — 48-hour HTTPS-only sessions with secure cookie tokens
 - **CSRF protection** — HMAC-SHA256 tokens bound to session, persisted across server restarts, refreshed on every page load
 - **Torrent registry** — upload `.torrent` files to register info hashes; bulk upload of hundreds of files supported
-- **Token search** — queries split into tokens matched independently against torrent names; dots, dashes, and underscores treated as word separators so `rental family` matches `Rental.Family.2025.2160p.WEB`
+- **Token search** — queries split into tokens matched independently against torrent names; dots, dashes, and underscores treated as word separators so `ubuntu 24` matches `Ubuntu.24.04.LTS.amd64`
 - **Info hash click-to-copy** — click the info hash on any torrent detail page to copy it to clipboard instantly; flashes ✓ Copied confirmation
 - **Torrent detail pages** — files, sizes, piece count, piece length, privacy flag, uploader, copy-magnet button
 - **Magnet link generation** — configurable tracker list with per-tracker enable/disable
@@ -46,8 +46,9 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Admin point grants** — text input to grant or remove any amount up to a configurable maximum per transaction; ±10 quick buttons; maximum enforced server-side
 - **Auto-promotion** — promote Basic users to Standard after reaching a configurable torrent upload threshold
 - **Open tracker mode** — toggle in settings to accept announces for any info hash without requiring torrent registration; takes effect immediately without restart
-- **Public profile pages** — Standard+ can view other users' profiles showing points balance, login streak, torrent count, and full paginated torrent list
-- **Three-column navigation bar** — logo left, center nav buttons (🖥 Dashboard, 🔍 Search, 🎯 Bounties, 🏆 Leaderboard), user area with badge and notification bell right; Bounties and Leaderboard hidden for Basic users
+- **Direct messages (DMs)** — private one-to-one messaging between Standard+ users. Threaded conversation view with chat-bubble layout. Compose supports multiple recipients in one send (semicolon-separated). Per-message point cost and daily send limit are enforced before sending; cost is deducted as one transaction for multi-recipient batches. Admins and Super pay no point cost and have no daily limit. Full blocklist management — block or unblock any user from within the conversation thread or from the Blocked tab. Users can opt out of receiving DMs via a toggle in their profile Actions card. Blocked or opted-out users return a vague "not accepting messages" error so the sender cannot determine the reason. Message point cost, daily limit, and global DM enable/disable are all configurable in the admin Settings tab. Broadcast messages (Super only) deliver to all users at once
+- **Public profile pages** — Standard+ can view other users' profiles showing points balance, login streak, torrent count, and full paginated torrent list. A **📬 Send DM** button appears on all viewable profiles for eligible senders
+- **Three-column navigation bar** — logo left, center nav buttons (🖥 Dashboard, 🔍 Search, 🎯 Bounties, 🏆 Leaderboard, 📬 Messages), user area with badge and notification bell right; Bounties, Leaderboard, and Messages hidden for Basic users
 - **Password complexity enforcement** — minimum length, uppercase, lowercase, digit, and symbol requirements; all configurable
 - **Brute-force lockout** — accounts locked after 5 consecutive failed login attempts
 - **Danger zone** — bulk-delete all torrents globally, all torrents per user, or all non-super user accounts; all gated by confirmation dialogs
