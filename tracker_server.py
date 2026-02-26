@@ -4279,6 +4279,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                                               msg=msg, msg_type=msg_type))
 
 
+    def _post_comment(self):
         user = self._get_session_user()
         if not user: return self._redirect('/manage')
         body   = self._read_body()
