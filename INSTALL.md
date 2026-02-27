@@ -252,9 +252,17 @@ Make sure your OCI Security List rules are correct before doing this.
 
 ---
 
-## 8. Memory Considerations and Swap
+## 8. Memory Considerations, Upload Limits, and Swap
 
-The tracker is lightweight at idle, but **bulk torrent uploads are memory-intensive**. Parsing hundreds of `.torrent` files simultaneously requires Python to hold all the raw file data, parsed metadata, piece hash tables, and result strings in memory at once.
+The tracker is lightweight at idle, but **bulk torrent uploads are memory-intensive**. Parsing many `.torrent` files in one request requires Python to hold raw upload data and parsed metadata in memory.
+
+Registration mode now includes server-side upload guardrails (configurable in Admin Settings):
+
+- Max request size (default: **100 MB**)
+- Max files per upload (default: **1000**)
+- Max per-file size (default: **10 MB**)
+
+When a batch exceeds file-count or per-file limits, valid files are still processed and invalid ones are skipped with a clear summary.
 
 ### How Much Memory Do You Need?
 
@@ -323,6 +331,7 @@ After logging in, go to **Admin Panel → Settings** tab and configure:
 - **Auto-Promote** — automatically promote Basic users to Standard after a set torrent count
 - **Open Tracker** — whether to accept announces for unregistered torrents
 - **Torrents Per Page** — pagination size for all torrent listings
+- **Upload Limits** — max request size, max files per upload, and max per-file size
 - **robots.txt** — content served to web crawlers
 
 Then go to **Admin Panel → Economy** tab and configure the points economy:

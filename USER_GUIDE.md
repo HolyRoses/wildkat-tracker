@@ -83,7 +83,7 @@ From the Dashboard you can:
 - **Filter the current page** — type in the filter box to narrow the visible list by name
 - **Navigate pages** — pagination controls appear when there are more torrents than fit on one page
 
-The **navigation bar** runs across the top of every page with three zones: the 🐈 WILDKAT logo on the left, center navigation buttons (🖥 Dashboard, 🔍 Search, 🎯 Bounties, 🏆 Leaderboard), and your username/badge, notification bell, and logout on the right. The Bounties and Leaderboard buttons are hidden for Basic users.
+The **navigation bar** runs across the top of every page with three zones: the 🐈 WILDKAT logo on the left, center navigation buttons (🖥 Dashboard, 🔍 Search, 🎯 Bounties, 🏆 Leaderboard, 📬 Messages), and your username/badge, notification bell, and logout on the right. The Bounties, Leaderboard, and Messages buttons are hidden for Basic users.
 
 ---
 
@@ -110,6 +110,16 @@ If a torrent with the same info hash is already registered the upload is silentl
 
 You can select and upload multiple `.torrent` files at once. The result summary shows how many were registered, how many were skipped, and if any failed to parse.
 
+### Upload Limits and Partial Success
+
+The upload form enforces server-side limits configured by admins:
+
+- Max request size (MB)
+- Max files per upload
+- Max per-file size (MB)
+
+If a batch includes files over per-file limits (or files beyond the max file count), valid files are still processed and registered. The result summary reports registered, skipped duplicates, skipped over-limit, and invalid files.
+
 ---
 
 ## 5. Torrent Detail Pages
@@ -131,6 +141,8 @@ The detail page shows:
 Below the info card is the **file list** — every file in the torrent with its exact size.
 
 The **Copy Magnet Link** button builds a magnet URI from the info hash, torrent name, total size, and the active tracker URLs configured in the Admin Panel.
+
+If there are confidently linked active members in the swarm, a full-width **Members Currently Sharing This Torrent** card appears with member links and last activity times. If no linked members are active, the card is not shown.
 
 The **Delete** button appears if you own the torrent or are an Admin/Super.
 
@@ -160,7 +172,7 @@ Admins and Super can **lock** comments on a torrent from the Actions card. When 
 
 ### The Notification Bell
 
-When someone replies to your comment, @mentions you, or bounty events occur (claim, confirmation, rejection, payout), a 🔔 badge appears in the navigation bar.
+When someone replies to your comment, @mentions you, or bounty events occur, a 🔔 badge appears in the navigation bar.
 
 **Bell dropdown** — click the bell to see your 5 most recent unread notifications. Each item shows who acted, what they did, and which torrent or bounty it relates to. Click any item to mark it read and navigate to the relevant page.
 
@@ -172,9 +184,11 @@ In addition to comment notifications, the bell delivers bounty-related events:
 
 | Icon | Event |
 |------|-------|
+| 📣 | Someone posted a new bounty |
+| @ | Someone @mentioned you in bounty discussion |
 | 🎯 | Someone claimed your bounty |
 | ✗ | Your claim was rejected |
-| ✅ | A bounty you claimed was confirmed |
+| ✅ | Your bounty claim was accepted |
 | ➕ | Someone added points to your bounty |
 | ⏰ | Your bounty expired without being fulfilled |
 | 💰 | Someone fulfilled a bounty using your upload |
@@ -204,7 +218,11 @@ Your profile page uses a two-column layout matching other profile views. The lef
 The Actions card contains:
 
 - **Change Password** button
-- **Messaging** — a checkbox to allow or block other users from sending you DMs. Uncheck and save to stop receiving messages. This setting can be changed at any time.
+- **Messaging & Privacy toggles**:
+  - Allow others to send me DMs
+  - Show my online status to others
+  - Bounty alerts (new bounty notifications)
+  - Allow linking my torrent swarm activity
 
 ### Points and Invite Generation
 
@@ -228,6 +246,12 @@ A public profile shows:
 - **Login Streak** (if active)
 - Total torrent count
 - Their full paginated torrent list
+
+When the profile owner has activity-linking enabled and has active, confidently linked swarm participation, a full-width card appears:
+
+- **Currently sharing N torrents** — list of clickable torrent links plus last activity time
+
+If the profile owner opts out of torrent activity linking, this card is hidden for everyone (including the owner).
 
 **What is not shown** on a public profile: login count, last login, failed login attempts, created-by, password history, IP addresses, or any administrative controls.
 
@@ -263,6 +287,8 @@ Click the **Compose** tab. Fill in:
 - **Message** — your message body
 
 Click **Send Message**. Each recipient receives a separate DM. All recipients are validated before any messages are sent — if any are invalid the send is aborted and the errors are listed. If the daily send limit allows fewer messages than recipients, the first N recipients receive the message and the rest are reported as skipped.
+
+In compose/reply textareas, **Enter sends** and **Shift+Enter inserts a newline**.
 
 **Point cost:** each DM sent deducts a configurable number of points (default 5 pts). Multi-recipient sends deduct the total in one transaction. Admins and Super are exempt from point costs and daily limits.
 
@@ -320,10 +346,10 @@ The points system is the site's internal currency. Points are earned, spent, tra
 
 | Activity | Points |
 |----------|--------|
-| Daily login | Configurable base amount (default: 10 pts) |
-| Login streak bonus | Multiplier per consecutive day (default: +1 pt/day, up to a cap) |
-| Registering a torrent | Configurable per upload (default: 5 pts) |
-| Posting a comment | Configurable per comment (default: 2 pts) |
+| Daily login | Configurable base amount (default: 1 pt) |
+| Login streak bonus | Milestone bonuses (default: +1 at 7 days, +4 at 30 days) |
+| Registering a torrent | Configurable per upload (default: 25 pts) |
+| Posting a comment | Configurable per comment (default: 1 pt, daily cap applies) |
 
 Streaks reset if you miss a day. The current streak is shown on your profile and the leaderboard.
 
@@ -574,7 +600,10 @@ The content returned at `/robots.txt`. By default, search engine crawlers are in
 |---------|---------|-------------|
 | Enable DMs | on | Master switch — when off, the Messages button is hidden and no DMs can be sent |
 | Point cost per DM | 5 pts | Points deducted per recipient per send. Admins and Super are exempt |
-| Daily send limit | 20 | Maximum DMs a user can send per calendar day. Admins and Super are exempt |
+| Daily send limit | 10 | Maximum DMs a user can send per calendar day. Admins and Super are exempt |
+| Upload max request size | 100 MB | Maximum total HTTP request body accepted by `/manage/upload` |
+| Upload max files | 1000 | Maximum files accepted in one upload batch |
+| Upload max per-file size | 10 MB | Maximum size for an individual `.torrent` file |
 
 ---
 
@@ -600,18 +629,19 @@ Controls how points are awarded:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Daily login points | 10 | Points awarded per day on login |
-| Login streak bonus | 1 | Additional points per streak day |
-| Max streak bonus | 50 | Cap on streak bonus per day |
-| Torrent upload points | 5 | Points per torrent registered |
-| Comment points | 2 | Points per comment posted |
+| Daily login points | 1 | Points awarded per day on login |
+| 7-day streak bonus | 1 | Extra points when user hits a 7-day streak |
+| 30-day streak bonus | 4 | Extra points when user hits a 30-day streak |
+| Torrent upload points | 25 | Points per torrent registered |
+| Comment points | 1 | Points per comment posted |
+| Comment points daily cap | 10 | Maximum comment points earned per day |
 
 ### Points Spend Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | Invite code cost | 1,000 pts | Points spent to purchase an invite link |
-| Point transfer fee | 10% | Percentage destroyed on peer-to-peer transfers |
+| Point transfer fee | 25% | Percentage destroyed on peer-to-peer transfers |
 
 ### Bounty Settings
 
@@ -619,7 +649,7 @@ Controls how points are awarded:
 |---------|---------|-------------|
 | Minimum bounty escrow | 50 pts | Minimum initial escrow to create a bounty |
 | Claimer payout % | 70% | Percentage of escrow paid to the claimer |
-| Uploader bonus % | 10% | Additional bonus if claimer ≠ uploader |
+| Uploader bonus % | 15% | Additional bonus if claimer ≠ uploader |
 | House cut % | 5% | Percentage destroyed |
 | Requestor refund % | 25% | Partial refund of initial cost to requestor |
 | Pending confirmation window | 48 hrs | Hours before an unconfirmed claim auto-expires |

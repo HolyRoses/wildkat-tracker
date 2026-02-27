@@ -259,6 +259,45 @@ class PeerRegistry:
         downloaded = self._downloaded.get(ih_hex, 0)
         return complete, incomplete, downloaded
 
+    def get_active_ip_last_seen(self, ih_hex: str) -> list[tuple[str, float]]:
+        """Return unique active peer IPs for a torrent with most recent seen time."""
+        with self._lock:
+            self._ensure(ih_hex)
+            self._purge_stale(ih_hex)
+            peers = list(self._torrents[ih_hex].values())
+        ip_latest: dict[str, float] = {}
+        for p in peers:
+            ip = p.get('ip', '')
+            if not ip:
+                continue
+            seen = float(p.get('last_seen', 0))
+            prev = ip_latest.get(ip, 0.0)
+            if seen > prev:
+                ip_latest[ip] = seen
+        return sorted(ip_latest.items(), key=lambda x: x[1], reverse=True)
+
+    def snapshot_active_ips_by_hash(self) -> dict[str, dict[str, float]]:
+        """Return {info_hash: {ip: last_seen}} for all active torrents."""
+        with self._lock:
+            out: dict[str, dict[str, float]] = {}
+            for ih_hex in list(self._torrents.keys()):
+                self._ensure(ih_hex)
+                self._purge_stale(ih_hex)
+                if not self._torrents[ih_hex]:
+                    continue
+                ip_latest: dict[str, float] = {}
+                for p in self._torrents[ih_hex].values():
+                    ip = p.get('ip', '')
+                    if not ip:
+                        continue
+                    seen = float(p.get('last_seen', 0))
+                    prev = ip_latest.get(ip, 0.0)
+                    if seen > prev:
+                        ip_latest[ip] = seen
+                if ip_latest:
+                    out[ih_hex] = ip_latest
+            return out
+
     def all_hashes(self):
         with self._lock:
             return list(self._torrents.keys())
@@ -1022,6 +1061,16 @@ class RegistrationDB:
             self._conn().commit()
         except Exception:
             pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN bounty_alerts INTEGER NOT NULL DEFAULT 1')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN link_torrent_activity INTEGER NOT NULL DEFAULT 1')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
 
     def _init_defaults(self, announce_urls: list):
         """Seed magnet_trackers and settings if not already present."""
@@ -1032,6 +1081,9 @@ class RegistrationDB:
             'auto_promote_enabled':   '0',
             'auto_promote_threshold': '100',
             'torrents_per_page':       '50',
+            'upload_max_content_mb':  '100',
+            'upload_max_files':       '1000',
+            'upload_max_file_mb':     '10',
             'robots_txt':              'User-agent: *\nDisallow: /announce\nDisallow: /scrape\nDisallow: /manage\n',
             'pw_min_length':     '12',
             'pw_require_upper':  '1',
@@ -1054,6 +1106,7 @@ class RegistrationDB:
             # ── Bounty system ─────────────────────────────────
             'bounty_min_cost':          '50',
             'bounty_refund_pct':        '25',
+            'activity_link_max_login_age_days': '30',
             'bounty_claimer_pct':       '70',
             'bounty_uploader_pct':      '15',
             'bounty_reject_penalty':    '10',
@@ -1492,6 +1545,59 @@ class RegistrationDB:
             (user_id, limit)
         ).fetchall()
 
+    def get_unique_recent_user_for_ip(self, ip: str, max_age_days: int):
+        """Return a unique opted-in user row for IP if confidence is unambiguous."""
+        days = max(1, min(365, int(max_age_days)))
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat(timespec='seconds')
+        rows = self._conn().execute(
+            '''SELECT DISTINCT u.id, u.username
+               FROM users u
+               JOIN login_history lh ON lh.user_id=u.id
+               WHERE lh.ip_address=?
+                 AND lh.logged_in_at>=?
+                 AND u.is_disabled=0
+                 AND COALESCE(u.link_torrent_activity, 1)=1''',
+            (ip, cutoff)
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        return rows[0]
+
+    def get_recent_unique_ip_user_map(self, max_age_days: int) -> dict[str, str]:
+        """Return {ip: username} where each IP maps to exactly one eligible user."""
+        days = max(1, min(365, int(max_age_days)))
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat(timespec='seconds')
+        rows = self._conn().execute(
+            '''SELECT lh.ip_address AS ip, MIN(u.username) AS username
+               FROM login_history lh
+               JOIN users u ON u.id=lh.user_id
+               WHERE lh.logged_in_at>=?
+                 AND u.is_disabled=0
+                 AND COALESCE(u.link_torrent_activity, 1)=1
+               GROUP BY lh.ip_address
+               HAVING COUNT(DISTINCT u.id)=1''',
+            (cutoff,)
+        ).fetchall()
+        return {r['ip']: r['username'] for r in rows}
+
+    def get_torrents_by_hashes(self, info_hashes: list[str]) -> list:
+        """Fetch registered torrents for a set of info hashes."""
+        if not info_hashes:
+            return []
+        out = []
+        # SQLite default max variables is commonly 999; chunk defensively.
+        chunk = 500
+        for i in range(0, len(info_hashes), chunk):
+            part = [h.upper() for h in info_hashes[i:i + chunk] if h]
+            if not part:
+                continue
+            placeholders = ','.join('?' for _ in part)
+            out.extend(self._conn().execute(
+                f'SELECT info_hash, name FROM torrents WHERE info_hash IN ({placeholders})',
+                part
+            ).fetchall())
+        return out
+
     def add_ip_allowlist(self, user_id: int, ip: str, actor: str) -> bool:
         try:
             self._conn().execute(
@@ -1567,14 +1673,29 @@ class RegistrationDB:
             return True
         return False
 
-    def change_password(self, username: str, new_password: str, actor: str):
+    def change_password(self, username: str, new_password: str, actor: str,
+                        keep_session_token: str = ''):
         ph, salt = _hash_password(new_password)
-        self._conn().execute(
+        c = self._conn()
+        c.execute(
             'UPDATE users SET password_hash=?, salt=?, failed_attempts=0, is_locked=0, '
             'last_password_change=? WHERE username=?',
             (ph, salt, self._ts(), username)
         )
-        self._conn().commit()
+        # Revoke active sessions after a password change.
+        # If keep_session_token is provided, preserve only that current session.
+        if keep_session_token:
+            c.execute(
+                'DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE username=?) '
+                'AND token != ?',
+                (username, keep_session_token)
+            )
+        else:
+            c.execute(
+                'DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE username=?)',
+                (username,)
+            )
+        c.commit()
         self._log(actor, 'change_password', username)
 
     def set_admin(self, username: str, is_admin: bool, actor: str):
@@ -1919,6 +2040,17 @@ class RegistrationDB:
         c.execute('INSERT INTO bounty_contributions (bounty_id,username,amount,contributed_at) VALUES (?,?,?,?)',
                   (bid, username, min_cost, self._ts()))
         c.commit()
+        # Notify opted-in non-basic users, excluding creator.
+        recipients = c.execute(
+            '''SELECT username FROM users
+               WHERE is_disabled=0
+                 AND COALESCE(bounty_alerts, 1)=1
+                 AND username != ?
+                 AND (is_standard=1 OR is_admin=1 OR username=?)''',
+            (username, SUPER_USER)
+        ).fetchall()
+        for r in recipients:
+            self._notify_bounty(r['username'], 'bounty_new', username, bid, description, 0)
         self._log(username, 'bounty_create', str(bid), description[:60])
         return True, str(bid)
 
@@ -2547,7 +2679,14 @@ class RegistrationDB:
         ).fetchone()
         if row is None:
             return None
-        return self.get_user_by_id(row['user_id'])
+        user = self.get_user_by_id(row['user_id'])
+        if user is None:
+            return None
+        # Disabled/locked users must not keep using existing sessions.
+        if user['is_disabled'] or user['is_locked']:
+            self.delete_session(token)
+            return None
+        return user
 
     def delete_session(self, token: str):
         self._conn().execute('DELETE FROM sessions WHERE token=?', (token,))
@@ -3224,6 +3363,49 @@ def _fmt_uptime(seconds: float) -> str:
     if hours:   parts.append(f'{hours}h')
     parts.append(f'{minutes}m')
     return ' '.join(parts)
+
+def _fmt_elapsed_compact(start_iso: str, end_iso: str) -> str:
+    """Format elapsed wall time as compact d/h/m string."""
+    if not start_iso or not end_iso:
+        return ''
+    try:
+        sdt = datetime.datetime.fromisoformat(start_iso)
+        edt = datetime.datetime.fromisoformat(end_iso)
+        total = int((edt - sdt).total_seconds())
+        if total < 0:
+            total = 0
+        days, rem = divmod(total, 86400)
+        hours, rem = divmod(rem, 3600)
+        mins, _ = divmod(rem, 60)
+        if days > 0:
+            return f'{days}d {hours}h {mins}m'
+        if hours > 0:
+            return f'{hours}h {mins}m'
+        return f'{mins}m'
+    except Exception:
+        return ''
+
+def _bounty_speed_emoji(start_iso: str, end_iso: str) -> str:
+    """Gamified speed badge for bounty completion time."""
+    if not start_iso or not end_iso:
+        return ''
+    try:
+        sdt = datetime.datetime.fromisoformat(start_iso)
+        edt = datetime.datetime.fromisoformat(end_iso)
+        total = int((edt - sdt).total_seconds())
+        if total < 0:
+            total = 0
+        if total < 10 * 60:
+            return '🚀'
+        if total < 60 * 60:
+            return '⚡'
+        if total < 6 * 60 * 60:
+            return '🔥'
+        if total < 24 * 60 * 60:
+            return '✅'
+        return '🏁'
+    except Exception:
+        return ''
 
 def _fmt_num(n: int) -> str:
     return f'{n:,}'
@@ -4113,6 +4295,104 @@ def _online_dot_html(status: str, label: str = '') -> str:
         return dot + f'<span style="font-size:0.8rem;color:var(--muted)">{label}</span>'
     return dot
 
+def _fmt_seen_ago(ts: float) -> str:
+    """Compact relative time for recent peer activity."""
+    try:
+        delta = max(0, int(time.time() - float(ts)))
+    except Exception:
+        return ''
+    if delta < 60:
+        return 'just now'
+    if delta < 3600:
+        return f'{delta // 60}m ago'
+    if delta < 86400:
+        h, rem = divmod(delta, 3600)
+        return f'{h}h {rem // 60}m ago'
+    d, rem = divmod(delta, 86400)
+    return f'{d}d {rem // 3600}h ago'
+
+def _linked_swarm_members(info_hash: str) -> list[dict]:
+    """Return uniquely linked active swarm members for a torrent."""
+    if not REGISTRATION_DB:
+        return []
+    try:
+        max_age_days = int(REGISTRATION_DB.get_setting('activity_link_max_login_age_days', '30'))
+    except Exception:
+        max_age_days = 30
+    ip_rows = REGISTRY.get_active_ip_last_seen(info_hash.upper())
+    by_user: dict[str, dict] = {}
+    for ip, last_seen in ip_rows:
+        u = REGISTRATION_DB.get_unique_recent_user_for_ip(ip, max_age_days)
+        if not u:
+            continue
+        uname = u['username']
+        prev = by_user.get(uname)
+        if (not prev) or (last_seen > prev['last_seen']):
+            by_user[uname] = {'username': uname, 'last_seen': last_seen, 'ip': ip}
+    return sorted(by_user.values(), key=lambda m: m['last_seen'], reverse=True)
+
+def _linked_active_torrents_for_username(username: str) -> list[dict]:
+    """Return active registered torrents currently linked to one member."""
+    if not REGISTRATION_DB or not username:
+        return []
+    try:
+        max_age_days = int(REGISTRATION_DB.get_setting('activity_link_max_login_age_days', '30'))
+    except Exception:
+        max_age_days = 30
+    ip_user = REGISTRATION_DB.get_recent_unique_ip_user_map(max_age_days)
+    if not ip_user:
+        return []
+    snap = REGISTRY.snapshot_active_ips_by_hash()
+    ih_last: dict[str, float] = {}
+    for ih, ip_map in snap.items():
+        for ip, last_seen in ip_map.items():
+            if ip_user.get(ip) == username:
+                prev = ih_last.get(ih, 0.0)
+                if last_seen > prev:
+                    ih_last[ih] = last_seen
+                break
+    if not ih_last:
+        return []
+    torrents = REGISTRATION_DB.get_torrents_by_hashes(list(ih_last.keys()))
+    out = []
+    for t in torrents:
+        ih = t['info_hash']
+        out.append({
+            'info_hash': ih,
+            'name': t['name'],
+            'last_seen': ih_last.get(ih, 0.0),
+        })
+    return sorted(out, key=lambda x: x['last_seen'], reverse=True)
+
+def _render_profile_sharing_card(target_user) -> str:
+    """Full-width profile card listing torrents currently shared by this member."""
+    if not target_user:
+        return ''
+    if ('link_torrent_activity' in target_user.keys()) and (not target_user['link_torrent_activity']):
+        return ''
+    username = target_user['username']
+    active = _linked_active_torrents_for_username(username)
+    if not active:
+        return ''
+    rows = ''.join(
+        '<tr>'
+        f'<td><a href="/manage/torrent/{_h(t["info_hash"]).lower()}" class="user-link">{_h(t["name"])}</a></td>'
+        f'<td class="hash">{_h(_fmt_seen_ago(t["last_seen"]))}</td>'
+        '</tr>'
+        for t in active
+    )
+    return (
+        '<div class="card">'
+        f'<div class="card-title">Currently sharing {len(active)} torrent{"s" if len(active) != 1 else ""}</div>'
+        '<div class="table-wrap"><table class="torrent-table"><thead><tr>'
+        '<th scope="col">Torrent</th>'
+        '<th scope="col" style="width:180px">Last Activity</th>'
+        '</tr></thead><tbody>'
+        + rows +
+        '</tbody></table></div>'
+        '</div>'
+    )
+
 
 class ManageHandler(BaseHTTPRequestHandler):
     """Handles all /manage/* routes."""
@@ -4240,6 +4520,28 @@ class ManageHandler(BaseHTTPRequestHandler):
         self._body_cache = self.rfile.read(length) if length else b''
         return self._body_cache
 
+    def _drain_request_body(self, length: int) -> None:
+        """Consume and discard request body bytes to keep the connection stable."""
+        remaining = max(0, int(length))
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
+    def _get_upload_limits(self) -> tuple[int, int, int]:
+        """Return (max_content_mb, max_files, max_file_mb) from settings with safe bounds."""
+        def _as_int(key: str, default: str, lo: int, hi: int) -> int:
+            try:
+                v = int(REGISTRATION_DB.get_setting(key, default))
+            except Exception:
+                v = int(default)
+            return max(lo, min(hi, v))
+        max_content_mb = _as_int('upload_max_content_mb', '100', 1, 2048)
+        max_files      = _as_int('upload_max_files', '1000', 1, 50000)
+        max_file_mb    = _as_int('upload_max_file_mb', '10', 1, 1024)
+        return max_content_mb, max_files, max_file_mb
+
     def log_message(self, fmt, *args):
         log.debug('MANAGE %s %s', self.address_string(), fmt % args)
 
@@ -4306,10 +4608,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                 self._send_html('<h1>Not Found</h1>', 404)
         elif path.startswith('/manage/torrent/lock/'):
             ih = path[len('/manage/torrent/lock/'):]
-            self._get_toggle_comments_lock(ih, True)
+            self._redirect(f'/manage/torrent/{ih}')
         elif path.startswith('/manage/torrent/unlock/'):
             ih = path[len('/manage/torrent/unlock/'):]
-            self._get_toggle_comments_lock(ih, False)
+            self._redirect(f'/manage/torrent/{ih}')
         elif path.startswith('/manage/torrent/'):
             ih = path[len('/manage/torrent/'):]
             self._get_torrent_detail(ih)
@@ -4324,6 +4626,34 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not self._require_https():
             return
         path = urllib.parse.urlparse(self.path).path.rstrip('/')
+
+        # Upload body-size guard before CSRF parsing to avoid loading huge bodies into RAM.
+        if path == '/manage/upload':
+            max_content_mb, _, _ = self._get_upload_limits()
+            max_content_bytes = max_content_mb * 1024 * 1024
+            try:
+                content_len = int(self.headers.get('Content-Length', '0'))
+            except Exception:
+                content_len = 0
+            if content_len > max_content_bytes:
+                # Keep UX consistent: show a normal dashboard error instead of a raw 413 page.
+                # Drain the oversized body so clients do not see connection-reset errors.
+                self._drain_request_body(content_len)
+                user = self._get_session_user()
+                if not user:
+                    self._redirect('/manage')
+                    return
+                torrents = REGISTRATION_DB.list_torrents(user_id=user['id'])
+                self._send_html(
+                    _render_dashboard(
+                        user,
+                        torrents,
+                        (f'Upload rejected: request size is over the configured '
+                         f'limit ({max_content_mb} MB).'),
+                        'error'
+                    )
+                )
+                return
 
         # ── CSRF validation ──────────────────────────────
         # Login and signup have no session yet; everything else must carry
@@ -4356,6 +4686,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_upload()
         elif path == '/manage/delete-torrent':
             self._post_delete_torrent()
+        elif path == '/manage/torrent/lock':
+            self._post_toggle_comments_lock(True)
+        elif path == '/manage/torrent/unlock':
+            self._post_toggle_comments_lock(False)
         elif path == '/manage/password':
             self._post_change_password()
         elif path == '/manage/admin/add-user':
@@ -4567,18 +4901,24 @@ class ManageHandler(BaseHTTPRequestHandler):
         fields, _ = _parse_multipart(self.headers, body)
         username = fields.get('username', '').strip()
         password = fields.get('password', '')
-        log.debug('LOGIN attempt user=%r ip=%s', username, self.client_address[0])
+        client_ip = self.client_address[0]
+        log.debug('LOGIN attempt user=%r ip=%s', username, client_ip)
         user = REGISTRATION_DB.authenticate(username, password)
         if user is None:
             log.debug('LOGIN failed user=%r', username)
             REGISTRATION_DB._log(username or '(unknown)', 'login_failed',
-                                 self.client_address[0])
+                                 client_ip)
+            self._send_html(_render_login('Invalid credentials.'))
+            return
+        if not REGISTRATION_DB.is_ip_allowed(user['id'], client_ip):
+            log.warning('LOGIN blocked by IP allowlist user=%r ip=%s', username, client_ip)
+            REGISTRATION_DB._log(username, 'login_ip_blocked', client_ip)
             self._send_html(_render_login('Invalid credentials.'))
             return
         token = REGISTRATION_DB.create_session(user['id'])
-        REGISTRATION_DB.record_login_ip(user['id'], self.client_address[0])
+        REGISTRATION_DB.record_login_ip(user['id'], client_ip)
         REGISTRATION_DB.daily_login_check(user['id'])
-        REGISTRATION_DB._log(username, 'login', self.client_address[0])
+        REGISTRATION_DB._log(username, 'login', client_ip)
         log.debug('LOGIN success user=%r token=%s...', username, token[:8])
         self.send_response(303)
         try:
@@ -4595,6 +4935,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         user = self._get_session_user()
         if not user:
             return self._redirect('/manage')
+        max_content_mb, max_files, max_file_mb = self._get_upload_limits()
+        max_file_bytes = max_file_mb * 1024 * 1024
         body = self._read_body()
         log.debug('UPLOAD body_len=%d content_type=%r',
                   len(body), self.headers.get('Content-Type', '')[:60])
@@ -4611,12 +4953,22 @@ class ManageHandler(BaseHTTPRequestHandler):
             file_list = [raw_files]
         else:
             file_list = raw_files
-        added, skipped, errors = [], [], []
-        for fname, file_data in file_list:
+        added = []
+        skipped_duplicate = 0
+        skipped_too_large = 0
+        skipped_invalid   = 0
+        skipped_over_max_files = 0
+        for idx, (fname, file_data) in enumerate(file_list):
+            if idx >= max_files:
+                skipped_over_max_files += 1
+                continue
+            if len(file_data) > max_file_bytes:
+                skipped_too_large += 1
+                continue
             try:
                 ih, name, total_size, meta = parse_torrent(file_data)
-            except Exception as e:
-                errors.append(f'{fname}: {e}')
+            except Exception:
+                skipped_invalid += 1
                 continue
             ok = REGISTRATION_DB.register_torrent(ih, name, total_size, user['id'], user['username'], meta=meta)
             if ok:
@@ -4625,15 +4977,30 @@ class ManageHandler(BaseHTTPRequestHandler):
                 REGISTRATION_DB.check_auto_promote(user['id'])
                 added.append(name)
             else:
-                skipped.append(f'{name} (already registered)')
+                skipped_duplicate += 1
         parts = []
-        if added:   parts.append(f'{len(added)} registered: ' + ', '.join(added))
-        if skipped: parts.append(f'{len(skipped)} skipped: ' + ', '.join(skipped))
-        if errors:  parts.append(f'{len(errors)} failed: ' + '; '.join(errors))
+        if added:
+            parts.append(f'{len(added)} registered')
+        if skipped_duplicate:
+            parts.append(f'{skipped_duplicate} duplicates skipped')
+        if skipped_too_large:
+            parts.append(f'{skipped_too_large} skipped (file > {max_file_mb} MB)')
+        if skipped_invalid:
+            parts.append(f'{skipped_invalid} invalid torrent files skipped')
+        if skipped_over_max_files:
+            parts.append(f'{skipped_over_max_files} skipped (max files per upload is {max_files})')
+        # Include a short preview of registered torrent names when practical.
+        if added:
+            preview = ', '.join(added[:8])
+            if len(added) > 8:
+                preview += ', ...'
+            parts.append(f'registered: {preview}')
         msg = ' | '.join(parts) if parts else 'No files processed.'
-        msg_type = 'error' if errors and not added else 'success'
+        msg_type = 'success' if added else 'error'
         log.debug('UPLOAD result msg=%r msg_type=%r added=%d skipped=%d errors=%d',
-                  msg[:80], msg_type, len(added), len(skipped), len(errors))
+                  msg[:80], msg_type, len(added),
+                  skipped_duplicate + skipped_too_large + skipped_invalid + skipped_over_max_files,
+                  skipped_invalid)
         torrents = REGISTRATION_DB.list_torrents(user_id=user['id'])
         self._send_html(_render_dashboard(user, torrents, msg, msg_type))
 
@@ -4648,10 +5015,18 @@ class ManageHandler(BaseHTTPRequestHandler):
         if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
         qs   = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         sort = qs.get('sort', ['points'])[0]
-        filt = qs.get('status', [''])[0]
+        raw_status = qs.get('status', [None])[0]
+        if raw_status is None:
+            filt = 'open'
+        elif raw_status in ('', 'all'):
+            filt = 'all'
+        elif raw_status in ('open', 'pending', 'fulfilled', 'expired'):
+            filt = raw_status
+        else:
+            filt = 'open'
         page = max(1, int(qs.get('page', ['1'])[0]) if qs.get('page', ['1'])[0].isdigit() else 1)
         per_page = 20
-        status_filter = filt if filt in ('open', 'pending', 'fulfilled', 'expired') else None
+        status_filter = None if filt == 'all' else filt
         bounties, total = REGISTRATION_DB.list_bounties(
             status=status_filter, sort=sort, page=page, per_page=per_page)
         total_pages = max(1, (total + per_page - 1) // per_page)
@@ -4822,9 +5197,14 @@ class ManageHandler(BaseHTTPRequestHandler):
         REGISTRATION_DB.mark_all_notifications_read(user['id'])
         self._redirect('/manage/notifications')
 
-    def _get_toggle_comments_lock(self, ih: str, lock: bool):
+    def _post_toggle_comments_lock(self, lock: bool):
         user = self._get_session_user()
         if not user: return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        if not ih:
+            return self._redirect('/manage/dashboard')
         if _user_role(user) not in ('super', 'admin'):
             return self._redirect(f'/manage/torrent/{ih.lower()}')
         t = REGISTRATION_DB.get_torrent(ih.upper())
@@ -4890,7 +5270,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         pw_errors = _validate_password(new, pw_settings)
         if pw_errors:
             return self._send_html(_render_password_page(user, 'Password does not meet requirements: ' + '; '.join(pw_errors)))
-        REGISTRATION_DB.change_password(user['username'], new, user['username'])
+        current_token = getattr(self, '_valid_token', '') or self._get_session_token()
+        REGISTRATION_DB.change_password(
+            user['username'], new, user['username'], keep_session_token=current_token
+        )
         self._redirect('/manage/dashboard')
 
     def _post_add_user(self):
@@ -4943,7 +5326,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not is_super and t_user['is_admin']:
             return self._redirect('/manage/admin')
         REGISTRATION_DB.delete_user(target, user['username'])
-        self._redirect('/manage/admin')
+        self._redirect('/manage/admin?tab=users')
 
     def _get_db_backup(self):
         user = self._get_session_user()
@@ -5371,6 +5754,17 @@ class ManageHandler(BaseHTTPRequestHandler):
             except Exception:
                 val = '50'
             REGISTRATION_DB.set_setting('torrents_per_page', val, user['username'])
+        elif form_id == 'upload_limits':
+            for key, default, lo, hi in [
+                ('upload_max_content_mb', '100', 1, 2048),
+                ('upload_max_files',      '1000', 1, 50000),
+                ('upload_max_file_mb',    '10',  1, 1024),
+            ]:
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except Exception:
+                    v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
         elif form_id == 'auto_promote':
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('auto_promote_enabled', val, user['username'])
@@ -5580,6 +5974,11 @@ class ManageHandler(BaseHTTPRequestHandler):
         if text:
             cid = REGISTRATION_DB.add_bounty_comment(bounty_id, user['username'], text)
             REGISTRATION_DB.award_comment_points(user['id'], cid)
+            bounty = REGISTRATION_DB.get_bounty(bounty_id)
+            if bounty:
+                _deliver_bounty_comment_notifications(
+                    cid, bounty_id, bounty['description'], user['username'], text
+                )
         self._redirect(f'/manage/bounty/{bounty_id}#bc-{bounty_id}')
 
     def _post_points_transfer(self):
@@ -5613,15 +6012,18 @@ class ManageHandler(BaseHTTPRequestHandler):
                 bid   = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
                 icons = {
+                    'bounty_new':             ('📣', 'has posted a bounty for'),
+                    'bounty_mention':         ('@',  'mentioned you in bounty'),
                     'bounty_claimed':         ('🎯', 'claimed your bounty'),
                     'bounty_rejected':        ('✗',  'rejected your claim on'),
-                    'bounty_fulfilled':       ('✅', 'fulfilled bounty'),
+                    'bounty_fulfilled':       ('✅', 'has accepted your bounty for'),
                     'bounty_contribution':    ('➕', 'added points to your bounty'),
                     'bounty_expired':         ('⏰', 'bounty expired:'),
                     'bounty_uploader_payout': ('💰', 'fulfilled a bounty using your upload:'),
                 }
                 icon, label = icons.get(ntype, ('🔔', 'bounty update on'))
-                url = f'/manage/bounty/{bid}'
+                anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
+                url = f'/manage/bounty/{bid}{anchor}'
             else:
                 icon  = '💬' if n['type'] == 'reply' else '@'
                 label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
@@ -5977,12 +6379,27 @@ class ManageHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         allow       = fields.get('allow_dms',   '0') == '1'
-        show_online = fields.get('show_online', '0') == '1'
+        full_privacy_submit = fields.get('form_scope', '') == 'profile_privacy'
+        if full_privacy_submit:
+            show_online = fields.get('show_online', '0') == '1'
+            bounty_alerts = fields.get('bounty_alerts', '0') == '1'
+            link_torrent_activity = fields.get('link_torrent_activity', '0') == '1'
+        else:
+            show_online = ('show_online' not in user.keys() or user['show_online'])
+            bounty_alerts = ('bounty_alerts' not in user.keys() or user['bounty_alerts'])
+            link_torrent_activity = ('link_torrent_activity' not in user.keys() or user['link_torrent_activity'])
         REGISTRATION_DB.dm_toggle_setting(user['id'], allow)
         REGISTRATION_DB._conn().execute(
             'UPDATE users SET show_online=? WHERE id=?', (1 if show_online else 0, user['id']))
+        REGISTRATION_DB._conn().execute(
+            'UPDATE users SET bounty_alerts=? WHERE id=?', (1 if bounty_alerts else 0, user['id']))
+        REGISTRATION_DB._conn().execute(
+            'UPDATE users SET link_torrent_activity=? WHERE id=?', (1 if link_torrent_activity else 0, user['id']))
         REGISTRATION_DB._conn().commit()
-        self._redirect('/manage/profile?msg=Privacy+settings+saved&msg_type=success')
+        if full_privacy_submit:
+            self._redirect('/manage/profile?msg=Profile+settings+saved&msg_type=success')
+        else:
+            self._redirect('/manage/messages?msg=DM+settings+saved&msg_type=success')
 
     def _post_profile_generate_invite(self):
         user = self._get_session_user()
@@ -6675,6 +7092,38 @@ function _injectCsrf(form){
     form.appendChild(inp);
   }
 }
+function _submitFormWithCsrf(form){
+  if (!form) return;
+  if (form.requestSubmit){
+    form.requestSubmit();
+    return;
+  }
+  _injectCsrf(form);
+  form.submit();
+}
+function _bindEnterToSendComments(){
+  var selectors = [
+    'form[action="/manage/comment/post"] textarea[name="body"]',
+    'form[action="/manage/bounty/comment"] textarea[name="body"]'
+  ];
+  selectors.forEach(function(sel){
+    document.querySelectorAll(sel).forEach(function(ta){
+      if (ta.dataset.enterSendBound === '1') return;
+      ta.dataset.enterSendBound = '1';
+      ta.addEventListener('keydown', function(e){
+        // Match DM behavior: Enter sends, Shift+Enter inserts newline.
+        if (e.key === 'Enter' && !e.shiftKey){
+          // Ignore IME composition and modified-enter shortcuts.
+          if (e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
+          e.preventDefault();
+          if (!ta.value || !ta.value.trim()) return;
+          _submitFormWithCsrf(ta.closest('form'));
+        }
+      });
+    });
+  });
+}
+document.addEventListener('DOMContentLoaded', _bindEnterToSendComments);
 document.addEventListener('submit', function(e){
   var f = e.target, msg = f.dataset.confirm;
   if(f.method && f.method.toUpperCase()==='POST') _injectCsrf(f);
@@ -6727,7 +7176,6 @@ function toggleNotifDropdown(e) {
   if (!opening) return;
   // Fetch fresh notifications every time the dropdown opens
   var body = d.querySelector('.notif-dropdown-body');
-  if (body) body.innerHTML = '<div class="notif-empty" style="padding:16px;text-align:center;color:var(--muted);font-size:0.82rem">Loading…</div>';
   fetch('/manage/notifications/preview', {credentials:'same-origin'})
     .then(function(r){ return r.ok ? r.json() : null; })
     .then(function(data){
@@ -6923,9 +7371,11 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 bid = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
                 icon, label = {
+                    'bounty_new':              ('📣', 'has posted a bounty for'),
+                    'bounty_mention':          ('@',  'mentioned you in bounty'),
                     'bounty_claimed':          ('🎯', 'claimed your bounty'),
                     'bounty_rejected':         ('✗',  'rejected your claim on'),
-                    'bounty_fulfilled':        ('✅', 'fulfilled bounty'),
+                    'bounty_fulfilled':        ('✅', 'has accepted your bounty for'),
                     'bounty_contribution':     ('➕', 'added points to your bounty'),
                     'bounty_expired':          ('⏰', 'bounty expired:'),
                     'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
@@ -6934,9 +7384,10 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 from_h  = _h(n['from_username'])
                 ts_h    = _h((n['created_at'] or '')[:16].replace('T', ' '))
                 n_id    = n['id']
+                anchor  = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
                 dropdown_items += (
                     f'<button class="notif-item" '
-                    f'onclick="readNotif({n_id},\'/manage/bounty/{bid}\')"'
+                    f'onclick="readNotif({n_id},\'/manage/bounty/{bid}{anchor}\')"'
                     f' aria-label="bounty notification from {from_h}">'
                     f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
                     f'<div class="notif-item-text"><em>{tname_h}</em></div>'
@@ -7000,7 +7451,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
     alert = ''
     if msg:
         cls = 'alert-error' if msg_type == 'error' else 'alert-success'
-        prefix = '⚠ ' if msg_type == 'error' else '✓ '
+        prefix = '⚠️ ' if msg_type == 'error' else '✅ '
         alert = f'<div class="alert {cls}" role="alert">{prefix}{msg}</div>'
 
     head = _MANAGE_HEAD.format(title=title, favicon=fav, css=_MANAGE_CSS)
@@ -7100,22 +7551,22 @@ def _fmt_size(b: int) -> str:
 
 def _torrent_header(show_owner: bool = False) -> str:
     if show_owner:
-        # 6 cols: 33+27+10+8+10+12 = 100%
+        # 6 cols: 39+21+10+8+10+12 = 100%
         return (
             '<tr>'
-            '<th scope="col" style="width:33%">Name</th>'
-            '<th scope="col" style="width:27%">Info Hash</th>'
+            '<th scope="col" style="width:39%">Name</th>'
+            '<th scope="col" style="width:21%">Info Hash</th>'
             '<th scope="col" style="width:10%">Owner</th>'
             '<th scope="col" style="width:8%;white-space:nowrap">Size</th>'
             '<th scope="col" style="width:10%;white-space:nowrap">Registered</th>'
             '<th scope="col" style="width:12%;min-width:100px">Action</th>'
             '</tr>'
         )
-    # 5 cols: 36+36+8+8+12 = 100%
+    # 5 cols: 44+28+8+8+12 = 100%
     return (
         '<tr>'
-        '<th scope="col" style="width:36%">Name</th>'
-        '<th scope="col" style="width:36%">Info Hash</th>'
+        '<th scope="col" style="width:44%">Name</th>'
+        '<th scope="col" style="width:28%">Info Hash</th>'
         '<th scope="col" style="width:8%;white-space:nowrap">Size</th>'
         '<th scope="col" style="width:8%;white-space:nowrap">Registered</th>'
         '<th scope="col" style="width:12%;min-width:100px">Action</th>'
@@ -7230,6 +7681,21 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
         '<a href="/manage/admin" class="dash-nav-btn">&#9881;&#65039; Admin Panel</a>'
         if is_admin else '')
     search_link = '<a href="/manage/search" class="dash-nav-btn">&#128269; Search</a>'
+    try:
+        max_content_mb = int(REGISTRATION_DB.get_setting('upload_max_content_mb', '100')) if REGISTRATION_DB else 100
+    except Exception:
+        max_content_mb = 100
+    try:
+        max_files = int(REGISTRATION_DB.get_setting('upload_max_files', '1000')) if REGISTRATION_DB else 1000
+    except Exception:
+        max_files = 1000
+    try:
+        max_file_mb = int(REGISTRATION_DB.get_setting('upload_max_file_mb', '10')) if REGISTRATION_DB else 10
+    except Exception:
+        max_file_mb = 10
+    upload_limits_hint = (f'Limits: {max_content_mb} MB/request \u2022 '
+                          f'{max_files} files/upload \u2022 '
+                          f'{max_file_mb} MB/file')
 
     body = f'''
   <style>
@@ -7254,8 +7720,9 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
         <div class="form-group" style="margin:0">
           <label>Torrent File (.torrent)</label>
           <input type="file" name="torrent" accept=".torrent" multiple required>
+          <div style="color:var(--muted);font-size:0.82rem;margin-top:6px">{upload_limits_hint}</div>
         </div>
-        <div style="display:flex;align-items:flex-end">
+        <div style="display:flex;align-items:flex-start;padding-top:32px">
           <button type="submit" class="btn btn-primary">Register</button>
         </div>
       </div>
@@ -7329,6 +7796,9 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     # ── Settings HTML ─────────────────────────────────────────
     def _checked(k): return 'checked' if settings.get(k,'1') == '1' else ''
     tpp = settings.get('torrents_per_page', '50')
+    upload_max_content_mb = settings.get('upload_max_content_mb', '100')
+    upload_max_files = settings.get('upload_max_files', '1000')
+    upload_max_file_mb = settings.get('upload_max_file_mb', '10')
     robots_txt_val = settings.get('robots_txt', 'User-agent: *\nDisallow: /')
     ap_enabled = settings.get('auto_promote_enabled', '0') == '1'
     settings_html = f'''
@@ -7413,6 +7883,33 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
             <input type="checkbox" name="comments_enabled" value="1" {'checked' if settings.get('comments_enabled','1')=='1' else ''}> Enable comments &amp; notifications
           </label>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">Upload Limits</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Configure request and file limits for torrent uploads. Requests over the
+          content-size limit are rejected with HTTP 413. Files beyond the per-upload
+          cap are skipped, and valid files before the cap are still processed.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="upload_limits">
+          <div class="form-group">
+            <label>Max request size (MB)</label>
+            <input type="number" name="upload_max_content_mb" value="{upload_max_content_mb}"
+                   min="1" max="2048" style="width:120px">
+          </div>
+          <div class="form-group">
+            <label>Max files per upload</label>
+            <input type="number" name="upload_max_files" value="{upload_max_files}"
+                   min="1" max="50000" style="width:120px">
+          </div>
+          <div class="form-group">
+            <label>Max file size (MB)</label>
+            <input type="number" name="upload_max_file_mb" value="{upload_max_file_mb}"
+                   min="1" max="1024" style="width:120px">
+          </div>
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
       </div>
@@ -8103,6 +8600,23 @@ def _deliver_notifications(cid: int, ih: str, tname: str,
             REGISTRATION_DB.add_notification(
                 muser['id'], 'mention', uname, ih, tname, cid)
 
+def _deliver_bounty_comment_notifications(comment_id: int, bounty_id: int,
+                                          bounty_desc: str, uname: str, text: str):
+    """Send @mention notifications for bounty comments."""
+    if not REGISTRATION_DB:
+        return
+    mentioned = set(_MENTION_RE.findall(text))
+    poster = REGISTRATION_DB.get_user(uname)
+    poster_id = poster['id'] if poster else -1
+    for mname in mentioned:
+        if mname == uname:
+            continue
+        muser = REGISTRATION_DB.get_user(mname)
+        if muser and muser['id'] != poster_id and not muser['is_disabled']:
+            REGISTRATION_DB._notify_bounty(
+                mname, 'bounty_mention', uname, bounty_id, bounty_desc, comment_id
+            )
+
 _MENTION_RE = re.compile(r'@([a-zA-Z0-9._-]+)')
 
 def _render_comment_body(body: str) -> str:
@@ -8460,9 +8974,10 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
     allow_checked = 'checked' if allow else ''
     toggle_html = (
         f'<form method="POST" action="/manage/messages/toggle-dms" style="margin-top:8px">'
+        f'<input type="hidden" name="form_scope" value="messages_quick">'
         
         f'<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
-        f'<input type="checkbox" name="allow_dms" value="1" {allow_checked} onchange="this.form.submit()">'
+        f'<input type="checkbox" name="allow_dms" value="1" {allow_checked} onchange="_submitFormWithCsrf(this.form)">'
         f' Allow others to send me DMs</label></form>')
 
     mark_all = ''
@@ -8565,7 +9080,7 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
                     f' &nbsp;&#183;&nbsp; '
                     f'<form method="POST" action="/manage/messages/block" style="display:inline">'
                     f'<input type="hidden" name="username" value="{opu}">'
-                    f'<button class="btn btn-sm btn-danger" onclick="return confirm(\'Block {opu}?\')">'
+                    f'<button class="btn btn-sm btn-danger">'
                     f'&#x1F6AB; Block {opu}</button></form>')
 
     profile_link = ''
@@ -8765,14 +9280,17 @@ def _render_notifications_page(viewer) -> str:
             bid = str(n['info_hash']).split(':',1)[1]
             ntype = n['type']
             icon, label = {
+                'bounty_new':              ('📣', 'has posted a bounty for'),
+                'bounty_mention':          ('@',  'mentioned you in bounty'),
                 'bounty_claimed':          ('🎯', 'claimed your bounty'),
                 'bounty_rejected':         ('✗',  'rejected your claim on'),
-                'bounty_fulfilled':        ('✅', 'fulfilled bounty'),
+                'bounty_fulfilled':        ('✅', 'has accepted your bounty for'),
                 'bounty_contribution':     ('➕', 'added points to your bounty'),
                 'bounty_expired':          ('⏰', 'bounty expired:'),
                 'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
             }.get(ntype, ('🔔', 'bounty update on'))
-            url = f'/manage/bounty/{bid}'
+            anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
+            url = f'/manage/bounty/{bid}{anchor}'
             read_js = f"readNotif({n_id},'{url}')"
             rows += (
                 f'<div class="notif-page-item{unread_cls}">'
@@ -8883,6 +9401,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     pc = t['piece_count'] if 'piece_count' in t.keys() else 0
     priv = 'Yes' if (t['is_private'] if 'is_private' in t.keys() else 0) else 'No'
     mf   = 'Multi-file' if (t['is_multifile'] if 'is_multifile' in t.keys() else 0) else 'Single-file'
+    swarm_members = _linked_swarm_members(ih)
 
     # Delete button
     del_btn = ''
@@ -8901,11 +9420,21 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     if role in ('super', 'admin'):
         locked = t['comments_locked'] if 'comments_locked' in t.keys() else 0
         if locked:
-            lock_btn = (f'<a href="/manage/torrent/unlock/{ih.lower()}" class="btn btn-sm"'
-                        f' aria-label="Unlock comments for this torrent">&#x1F513; Unlock Comments</a>')
+            lock_btn = (
+                f'<form method="POST" action="/manage/torrent/unlock" style="display:inline">'
+                f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<button type="submit" class="btn btn-sm"'
+                f' aria-label="Unlock comments for this torrent">&#x1F513; Unlock Comments</button>'
+                f'</form>'
+            )
         else:
-            lock_btn = (f'<a href="/manage/torrent/lock/{ih.lower()}" class="btn btn-sm btn-danger"'
-                        f' aria-label="Lock comments for this torrent">&#x1F512; Lock Comments</a>')
+            lock_btn = (
+                f'<form method="POST" action="/manage/torrent/lock" style="display:inline">'
+                f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<button type="submit" class="btn btn-sm btn-danger"'
+                f' aria-label="Lock comments for this torrent">&#x1F512; Lock Comments</button>'
+                f'</form>'
+            )
         tname_esc = t['name'].replace('"', '&quot;').replace("'", '&#39;')
         del_comments_btn = (
             f'<form method="POST" action="/manage/comment/delete-all" style="display:inline"'
@@ -8914,6 +9443,28 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             f'<button type="submit" class="btn btn-sm btn-danger"'
             f' aria-label="Delete all comments on this torrent">&#x1F5D1; Delete All Comments</button>'
             f'</form>'
+        )
+
+    swarm_card = ''
+    if swarm_members:
+        member_rows = ''.join(
+            '<tr>'
+            f'<td><a href="/manage/user/{_h(m["username"])}" class="user-link">{_h(m["username"])}</a></td>'
+            f'<td class="hash">{_h(_fmt_seen_ago(m["last_seen"]))}</td>'
+            '</tr>'
+            for m in swarm_members
+        )
+        swarm_card = (
+            '<div class="card">'
+            '<div class="card-title">Members Currently Sharing This Torrent</div>'
+            f'<div style="color:var(--muted);font-size:0.82rem;margin-bottom:12px">{len(swarm_members)} member{"s" if len(swarm_members) != 1 else ""} currently sharing</div>'
+            '<div class="table-wrap"><table style="min-width:unset"><thead><tr>'
+            '<th scope="col" style="width:60%">Member</th>'
+            '<th scope="col" style="width:40%">Last Activity</th>'
+            '</tr></thead><tbody>'
+            + member_rows +
+            '</tbody></table></div>'
+            '</div>'
         )
 
     body = f'''
@@ -8926,27 +9477,31 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     <div class="card">
       <div class="card-title">Torrent Info</div>
       <table style="min-width:unset">
-        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;width:40%">NAME</td>
-            <td style="word-break:break-all">{t["name"]}</td></tr>
-        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">INFO HASH</td>
+        <colgroup>
+          <col style="width:28%">
+          <col style="width:72%">
+        </colgroup>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">NAME</td>
+            <td style="word-break:break-word;overflow-wrap:anywhere">{t["name"]}</td></tr>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">INFO HASH</td>
             <td class="hash" style="word-break:break-all;font-size:0.82rem">
               <span onclick="copyHash(this,'{ih}')"
                     title="Click to copy"
                     style="cursor:pointer;border-bottom:1px dashed var(--muted)">{ih}</span>
             </td></tr>
-        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">TYPE</td>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">TYPE</td>
             <td>{mf}</td></tr>
-        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">TOTAL SIZE</td>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">TOTAL SIZE</td>
             <td>{_fmt_size(t["total_size"] if "total_size" in t.keys() else 0)}</td></tr>
-        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">PIECE SIZE</td>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">PIECE SIZE</td>
             <td>{pl_str}</td></tr>
-        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">PIECE COUNT</td>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">PIECE COUNT</td>
             <td>{pc:,}</td></tr>
-        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">PRIVATE</td>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">PRIVATE</td>
             <td>{priv}</td></tr>
-        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">REGISTERED BY</td>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">REGISTERED BY</td>
             <td><a href="/manage/user/{t["uploaded_by_username"]}" class="user-link">{t["uploaded_by_username"]}</a></td></tr>
-        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em">REGISTERED AT</td>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">REGISTERED AT</td>
             <td class="hash">{t["registered_at"][:16].replace("T", " ")}</td></tr>
       </table>
     </div>
@@ -8960,6 +9515,8 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
       </div>
     </div>
   </div>
+
+  {swarm_card}
 
   <div class="card">
     {files_html}
@@ -9025,6 +9582,7 @@ def _render_public_profile(viewer, target_user, torrents: list,
         t_rows = '<tr><td colspan="5" class="empty">No torrents registered</td></tr>'
 
     base_url = f'/manage/user/{uname}'
+    sharing_card = _render_profile_sharing_card(target_user)
 
     body = f'''
   <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;flex-wrap:wrap">
@@ -9051,6 +9609,8 @@ def _render_public_profile(viewer, target_user, torrents: list,
       {_pub_row('Torrents', str(total))}
     </table>
   </div>
+
+  {sharing_card}
 
   <div class="card">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:12px">
@@ -9084,6 +9644,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         'standard': '<span class="badge badge-standard">STANDARD</span>',
         'basic':    '<span class="badge badge-basic">BASIC</span>',
     }[t_role]
+    sharing_card = _render_profile_sharing_card(target_user)
 
     status_badges = ''
     if target_user['is_locked']:
@@ -9167,8 +9728,12 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + 'if(!cbs.length){alert("Select at least one IP.");return;}'
             + 'var ips=Array.from(cbs).map(function(c){return c.value;}).join(",");'
             + 'var f=document.getElementById("ip-lock-form");'
-            + 'var h=document.createElement("input");h.type="hidden";h.name="selected_ips";h.value=ips;'
-            + 'f.appendChild(h);f.submit();}'
+            + 'var old=f.querySelector(\'input[name="selected_ips"]\');if(old){old.remove();}'
+            + 'var h=document.createElement("input");h.type="hidden";h.name="selected_ips";h.value=ips;f.appendChild(h);'
+            + 'if(!f.querySelector(\'input[name="_csrf"]\')){'
+            + 'var m=document.cookie.match(/(?:^|;[ \\t]*)wkcsrf=([^;]+)/);'
+            + 'var c=document.createElement("input");c.type="hidden";c.name="_csrf";c.value=(m?m[1]:"");f.appendChild(c);}'
+            + 'f.submit();}'
             + '</script>'
         )
 
@@ -9292,6 +9857,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
             '<div style="font-size:0.85rem;color:var(--muted);margin-bottom:8px">Messaging &amp; Privacy</div>'
             '<form method="POST" action="/manage/messages/toggle-dms" style="display:flex;flex-direction:column;gap:10px">'
+            '<input type="hidden" name="form_scope" value="profile_privacy">'
             '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
             '<input type="checkbox" name="allow_dms" value="1" '
             + ('checked' if ('allow_dms' in viewer.keys() and viewer['allow_dms']) else '')
@@ -9300,6 +9866,14 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<input type="checkbox" name="show_online" value="1" '
             + ('checked' if ('show_online' not in viewer.keys() or viewer['show_online']) else '')
             + '> Show my online status to others</label>'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            '<input type="checkbox" name="bounty_alerts" value="1" '
+            + ('checked' if ('bounty_alerts' not in viewer.keys() or viewer['bounty_alerts']) else '')
+            + '> Bounty alerts (new bounty notifications)</label>'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            '<input type="checkbox" name="link_torrent_activity" value="1" '
+            + ('checked' if ('link_torrent_activity' not in viewer.keys() or viewer['link_torrent_activity']) else '')
+            + '> Allow linking my torrent swarm activity</label>'
             '<div><button type="submit" class="btn btn-sm">Save</button></div>'
             '</form>'
             '</div>'
@@ -9431,6 +10005,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + _render_points_section(viewer, target_user, is_own_profile, ledger, bounty_data, part='rest')
         + ip_html
         + delete_all_html
+        + sharing_card
         + torrent_html
         + '</div>'
     )
@@ -10127,7 +10702,7 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
 
 
 def _render_bounty_board(viewer, bounties: list, total: int, page: int, total_pages: int,
-                          sort: str = 'points', status: str = '',
+                          sort: str = 'points', status: str = 'open',
                           msg: str = '', msg_type: str = 'error') -> str:
     if not REGISTRATION_DB:
         return _manage_page('Bounty Board', '<p>Unavailable</p>', user=viewer)
@@ -10156,7 +10731,7 @@ def _render_bounty_board(viewer, bounties: list, total: int, page: int, total_pa
         + _sort_link('points',  '🏆 Highest Points')
         + _sort_link('newest',  '🆕 Newest')
         + '&nbsp;&nbsp;<span style="color:var(--muted);font-size:0.82rem">Filter:</span>'
-        + _stat_link('',          'All')
+        + _stat_link('all',       'All')
         + _stat_link('open',      'Open')
         + _stat_link('pending',   'Pending')
         + _stat_link('fulfilled', 'Fulfilled')
@@ -10405,6 +10980,10 @@ def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
         t_link = (f'<a href="/manage/torrent/{(bounty["claimed_infohash"] or "").lower()}"'
                   f' style="color:var(--green)">{t_name}</a>'
                   if torrent else t_name)
+        elapsed = _fmt_elapsed_compact(bounty['created_at'] or '', bounty['fulfilled_at'] or '')
+        speed_emoji = _bounty_speed_emoji(bounty['created_at'] or '', bounty['fulfilled_at'] or '')
+        elapsed_html = (f'<div style="color:var(--green);font-weight:700;margin:0 0 8px 0">'
+                        f'BOUNTY FULFILLED in {elapsed} {speed_emoji}</div>') if elapsed else ''
 
         # Reconstruct payout breakdown
         escrow       = bounty['total_escrow']
@@ -10448,6 +11027,7 @@ def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
         fulfilled_html = f'''
     <div class="card" style="border:1px solid var(--green)">
       <div class="card-title" style="color:var(--green)">✅ Fulfilled</div>
+      {elapsed_html}
       <p style="margin-bottom:12px">
         Fulfilled by <a href="/manage/user/{ff_h}" class="user-link">{ff_h}</a>
         · Torrent: {t_link}
@@ -10467,10 +11047,10 @@ def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
     comment_rows = ''
     for c in comments:
         un_h = _h(c['username'])
-        bd_h = _h(c['body'])
+        bd_h = _render_comment_body(c['body'])
         at_h = _h((c['created_at'] or '')[:16])
         comment_rows += f'''
-      <div style="padding:12px 0;border-top:1px solid var(--border)">
+      <div id="bcmt-{c['id']}" style="padding:12px 0;border-top:1px solid var(--border)">
         <div style="display:flex;gap:12px;align-items:baseline;margin-bottom:4px">
           <a href="/manage/user/{un_h}" class="user-link" style="font-weight:600">{un_h}</a>
           <span class="hash" style="font-size:0.78rem">{at_h}</span>
