@@ -1,6 +1,7 @@
 # Wildkat Tracker — User Guide
 
 This guide covers the registration mode web interface at `/manage`. It is intended for both regular users and administrators.
+It focuses on UI operations and behavior. Server deployment and OS-level setup are covered in `INSTALL.md`.
 
 ---
 
@@ -223,6 +224,8 @@ The Actions card contains:
   - Show my online status to others
   - Bounty alerts (new bounty notifications)
   - Allow linking my torrent swarm activity
+  - Use Gravatar avatar
+  - Gravatar email or MD5 hash input (stores only the hash)
 
 ### Points and Invite Generation
 
@@ -241,11 +244,17 @@ Standard, Admin, and Super users can view public profiles of other users by clic
 A public profile shows:
 
 - The user's role badge
+- Status (Online / Recently active / Offline, unless hidden by the user)
 - Member Since date
 - **Points** balance (color-coded)
 - **Login Streak** (if active)
 - Total torrent count
 - Their full paginated torrent list
+
+Status behaviour:
+- **Online** — user has an active web session
+- **Recently active** — no active session, but seen within the recent activity window
+- **Offline** — no active session and outside the recent activity window
 
 When the profile owner has activity-linking enabled and has active, confidently linked swarm participation, a full-width card appears:
 
@@ -601,9 +610,20 @@ The content returned at `/robots.txt`. By default, search engine crawlers are in
 | Enable DMs | on | Master switch — when off, the Messages button is hidden and no DMs can be sent |
 | Point cost per DM | 5 pts | Points deducted per recipient per send. Admins and Super are exempt |
 | Daily send limit | 10 | Maximum DMs a user can send per calendar day. Admins and Super are exempt |
+
+### Upload Limits
+
+| Setting | Default | Description |
+|---------|---------|-------------|
 | Upload max request size | 100 MB | Maximum total HTTP request body accepted by `/manage/upload` |
 | Upload max files | 1000 | Maximum files accepted in one upload batch |
 | Upload max per-file size | 10 MB | Maximum size for an individual `.torrent` file |
+
+### Gravatar Integration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Enable Gravatar avatars | off | Global switch for external Gravatar avatar rendering in the web UI. Users may supply email or MD5 hash; stored value is hash-only |
 
 ---
 

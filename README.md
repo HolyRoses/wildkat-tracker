@@ -23,40 +23,20 @@ A lightweight, self-hosted BitTorrent tracker with full HTTP, HTTPS, and UDP sup
 
 Enable with `--registration`. Adds a full user and torrent management web interface at `/manage`.
 
-- **Four-tier role system** — Super, Admin, Standard, Basic — with granular permission boundaries at each level
-- **Superuser account** — designated at startup via `--super-user`; cannot be deleted or demoted; full unrestricted access
-- **User registration** — open signup (configurable), invite-only via invite codes, or admin-created accounts
-- **Invite code system** — admins generate single-use invite URLs from the Invites tab; Standard+ users can purchase invite codes with points (default 1,000 pts); consumed invites record who was invited and by whom
-- **Points economy** — a full site-wide economy replacing the old credits system. Users earn points for daily logins (with streak multipliers), torrent uploads, and comments. Points are spent on invite codes, bounties, and peer-to-peer transfers. All economy parameters are configurable from the admin Economy tab
-- **Login streaks** — consecutive daily login bonus multipliers; current streak is visible on profiles and the leaderboard
-- **Bounty board** — users post point-backed content requests. Others contribute to raise the prize, then claim with an info hash when they have the content. Requestor confirms or rejects; community can vote to auto-confirm. Payout splits between claimer, uploader (if different), and a configurable requestor refund; house cut percentage is destroyed (deflationary)
-- **Point transfers** — Standard+ users can send points directly to other users, subject to a configurable fee percentage that is destroyed rather than redistributed
-- **Leaderboard** — six ranked categories: Top Holders, All-Time Earners, Top Uploaders, Bounty Hunters, Login Streaks, Most Chatty. Top N per category is configurable. Standard+ only; Basic users see a teaser listing locked features
-- **Economy admin dashboard** — live stats showing points in circulation, in escrow, in debt, 30-day generation and destruction flow, breakdown by transaction type, and open/pending/fulfilled bounty counts; plus full settings for every economy parameter
-- **Session management** — 48-hour HTTPS-only sessions with secure cookie tokens
-- **CSRF protection** — HMAC-SHA256 tokens bound to session, persisted across server restarts, refreshed on every page load
-- **Torrent registry** — upload `.torrent` files to register info hashes; bulk upload of hundreds of files supported
-- **Upload guardrails with partial success** — configurable request size, file-count, and per-file size limits; oversized/invalid files are skipped while valid files in the same batch still register
-- **Token search** — queries split into tokens matched independently against torrent names; dots, dashes, and underscores treated as word separators so `ubuntu 24` matches `Ubuntu.24.04.LTS.amd64`
-- **Info hash click-to-copy** — click the info hash on any torrent detail page to copy it to clipboard instantly; flashes ✓ Copied confirmation
-- **Torrent detail pages** — files, sizes, piece count, piece length, privacy flag, uploader, copy-magnet button, and a live members-sharing card when confidently linked members are active
-- **Magnet link generation** — configurable tracker list with per-tracker enable/disable
-- **IP allowlist** — pin accounts to known IP addresses; build allowlist directly from login history
-- **Admin panel** — ten tabs: torrents, users, add user, trackers, settings, database, economy, invites, danger, events
-- **Searchable event log** — filter events by free text across all fields, by actor, by action type, or by target; color-coded rows (red for deletions/bans, green for logins/uploads/awards, amber for points/bounties); shows total matching count
-- **Admin point grants** — text input to grant or remove any amount up to a configurable maximum per transaction; ±10 quick buttons; maximum enforced server-side
-- **Auto-promotion** — promote Basic users to Standard after reaching a configurable torrent upload threshold
-- **Open tracker mode** — toggle in settings to accept announces for any info hash without requiring torrent registration; takes effect immediately without restart
-- **Direct messages (DMs)** — private one-to-one messaging between Standard+ users. Threaded conversation view with chat-bubble layout. Compose supports multiple recipients in one send (semicolon-separated). Per-message point cost and daily send limit are enforced before sending; cost is deducted as one transaction for multi-recipient batches. Admins and Super pay no point cost and have no daily limit. Full blocklist management — block or unblock any user from within the conversation thread or from the Blocked tab. Users can opt out of receiving DMs via a toggle in their profile Actions card. Blocked or opted-out users return a vague "not accepting messages" error so the sender cannot determine the reason. Message point cost, daily limit, and global DM enable/disable are all configurable in the admin Settings tab. Broadcast messages (Super only) deliver to all users at once. Enter-to-send behavior is supported in DM compose/reply and mirrored in torrent/bounty comment boxes (Shift+Enter inserts newline)
-- **Public profile pages** — Standard+ can view other users' profiles showing points balance, login streak, torrent count, and full paginated torrent list. A **📬 Send DM** button appears on all viewable profiles for eligible senders
-- **Profile controls** — per-user toggles for DM opt-in, online status visibility, bounty alerts, and torrent activity linking
-- **Swarm activity linking (strict confidence)** — only uniquely matched, recent login-IP members are linked; ambiguous/no-match IPs are discarded. Includes profile "Currently sharing N torrents" and torrent-level sharing cards
-- **Three-column navigation bar** — logo left, center nav buttons (🖥 Dashboard, 🔍 Search, 🎯 Bounties, 🏆 Leaderboard, 📬 Messages), user area with badge and notification bell right; Bounties, Leaderboard, and Messages hidden for Basic users
-- **Password complexity enforcement** — minimum length, uppercase, lowercase, digit, and symbol requirements; all configurable
-- **Brute-force lockout** — accounts locked after 5 consecutive failed login attempts
-- **Danger zone** — bulk-delete all torrents globally, all torrents per user, or all non-super user accounts; all gated by confirmation dialogs
-- **robots.txt** — configurable via admin settings
-- **SQLite backend** — WAL mode, per-thread connections, 10-second busy timeout with retry logic
+- **Roles and access control** — Super, Admin, Standard, and Basic with clear permissions
+- **Account onboarding** — admin-created users, invite links, or open signup (configurable)
+- **Torrent management UI** — upload `.torrent` files, browse/search listings, inspect detail pages, copy hashes/magnets
+- **Upload safety limits** — request-size, file-count, and per-file caps with partial-success batch handling
+- **Profile and privacy controls** — DM opt-in, online status visibility, bounty alerts, torrent activity linking, optional Gravatar
+- **Direct messages** — threaded inbox/sent/compose/blocked flow with optional point cost and daily limits
+- **Comments and notifications** — threaded comments, @mentions, bell dropdown, and full notifications page
+- **Points economy** — earning, spending, transfers, streaks, and ledger-backed accounting
+- **Bounty board** — posting, claiming, confirming, contributing, voting, and payout splitting
+- **Leaderboard** — ranked categories for points, uploads, streaks, and bounty activity
+- **Admin panel** — torrents, users, add user, trackers, settings, database, economy, invites, danger, events
+- **Operational controls** — IP allowlists, open-tracker switch, configurable `robots.txt`, database backup/restore
+
+For full operational detail, see [USER_GUIDE.md](USER_GUIDE.md). For deployment and hardening steps, see [INSTALL.md](INSTALL.md).
 
 ### Security
 

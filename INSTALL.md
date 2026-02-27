@@ -1,5 +1,8 @@
 # Wildkat Tracker — Installation Guide
 
+This document covers deployment, TLS, service setup, and first-run configuration.
+For day-to-day operation and UI workflows, use `USER_GUIDE.md`.
+
 ## Requirements
 
 - Ubuntu 24.04 (or any modern Linux with systemd)
@@ -256,7 +259,7 @@ Make sure your OCI Security List rules are correct before doing this.
 
 The tracker is lightweight at idle, but **bulk torrent uploads are memory-intensive**. Parsing many `.torrent` files in one request requires Python to hold raw upload data and parsed metadata in memory.
 
-Registration mode now includes server-side upload guardrails (configurable in Admin Settings):
+Registration mode includes server-side upload guardrails (configurable in Admin Settings):
 
 - Max request size (default: **100 MB**)
 - Max files per upload (default: **1000**)
@@ -332,6 +335,7 @@ After logging in, go to **Admin Panel → Settings** tab and configure:
 - **Open Tracker** — whether to accept announces for unregistered torrents
 - **Torrents Per Page** — pagination size for all torrent listings
 - **Upload Limits** — max request size, max files per upload, and max per-file size
+- **Gravatar Integration** — enable or disable Gravatar avatars site-wide
 - **robots.txt** — content served to web crawlers
 
 Then go to **Admin Panel → Economy** tab and configure the points economy:

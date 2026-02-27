@@ -790,7 +790,9 @@ class RegistrationDB:
                 longest_streak        INTEGER NOT NULL DEFAULT 0,
                 last_login_date       TEXT,
                 comment_pts_date      TEXT,
-                comment_pts_today     INTEGER NOT NULL DEFAULT 0
+                comment_pts_today     INTEGER NOT NULL DEFAULT 0,
+                gravatar_opt_in       INTEGER NOT NULL DEFAULT 0,
+                gravatar_hash         TEXT
             );
             CREATE TABLE IF NOT EXISTS invite_codes (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1071,6 +1073,16 @@ class RegistrationDB:
             self._conn().commit()
         except Exception:
             pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN gravatar_opt_in INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN gravatar_hash TEXT')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
 
     def _init_defaults(self, announce_urls: list):
         """Seed magnet_trackers and settings if not already present."""
@@ -1121,6 +1133,7 @@ class RegistrationDB:
             'dm_enabled':           '1',
             'dm_cost':              '5',
             'dm_daily_limit':       '10',
+            'gravatar_enabled':     '0',
         }
         for k, v in defaults.items():
             c.execute('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)', (k, v))
@@ -2687,6 +2700,15 @@ class RegistrationDB:
             self.delete_session(token)
             return None
         return user
+
+    def has_active_session(self, user_id: int) -> bool:
+        """True when user currently has any non-expired session."""
+        now = datetime.datetime.now().isoformat(timespec='seconds')
+        row = self._conn().execute(
+            'SELECT 1 FROM sessions WHERE user_id=? AND expires_at>? LIMIT 1',
+            (user_id, now)
+        ).fetchone()
+        return row is not None
 
     def delete_session(self, token: str):
         self._conn().execute('DELETE FROM sessions WHERE token=?', (token,))
@@ -4260,13 +4282,19 @@ def _is_typing(username: str, other: str) -> bool:
 
 
 def _online_status(user_row) -> str:
-    """Return 'online', 'recent', or 'offline' based on last_seen.
+    """Return 'online', 'recent', or 'offline'.
+    Online requires an active web session; recent/offline are derived from last_seen.
     Returns 'hidden' if user has disabled show_online."""
     if user_row is None:
         return 'offline'
     show = user_row['show_online'] if 'show_online' in user_row.keys() else 1
     if not show:
         return 'hidden'
+    try:
+        if REGISTRATION_DB and ('id' in user_row.keys()) and REGISTRATION_DB.has_active_session(user_row['id']):
+            return 'online'
+    except Exception:
+        pass
     last = user_row['last_seen'] if 'last_seen' in user_row.keys() else None
     if not last:
         return 'offline'
@@ -4274,8 +4302,6 @@ def _online_status(user_row) -> str:
         import datetime as _dt
         delta = _dt.datetime.now() - _dt.datetime.fromisoformat(last)
         mins = delta.total_seconds() / 60
-        if mins <= _ONLINE_MINUTES:
-            return 'online'
         if mins <= _RECENT_MINUTES:
             return 'recent'
         return 'offline'
@@ -4294,6 +4320,73 @@ def _online_dot_html(status: str, label: str = '') -> str:
     if label:
         return dot + f'<span style="font-size:0.8rem;color:var(--muted)">{label}</span>'
     return dot
+
+def _online_badge_html(status: str) -> str:
+    """Return a compact presence badge for profile headers."""
+    if status == 'hidden':
+        return ''
+    cfg = {
+        'online':  ('Online', 'var(--green)', 'rgba(52,211,153,0.15)'),
+        'recent':  ('Recently active', 'var(--accent)', 'rgba(245,166,35,0.16)'),
+        'offline': ('Offline', 'var(--muted)', 'rgba(138,147,189,0.14)'),
+    }
+    label, color, bg = cfg.get(status, cfg['offline'])
+    return (
+        '<span style="display:inline-flex;align-items:center;gap:6px;'
+        'padding:3px 9px;border-radius:6px;'
+        f'border:1px solid {color};background:{bg};'
+        f'color:{color};font-size:0.78rem;">'
+        f'<span aria-hidden="true" style="width:7px;height:7px;border-radius:50%;background:{color};display:inline-block"></span>'
+        f'{label}</span>'
+    )
+
+def _gravatar_enabled() -> bool:
+    if not REGISTRATION_DB:
+        return False
+    return REGISTRATION_DB.get_setting('gravatar_enabled', '0') == '1'
+
+def _gravatar_url(user_row, size: int = 48) -> str:
+    if not _gravatar_enabled() or not user_row:
+        return ''
+    if ('gravatar_opt_in' in user_row.keys()) and (not user_row['gravatar_opt_in']):
+        return ''
+    gh = (user_row['gravatar_hash'] or '').strip().lower() if 'gravatar_hash' in user_row.keys() else ''
+    if not re.fullmatch(r'[a-f0-9]{32}', gh):
+        return ''
+    return f'https://www.gravatar.com/avatar/{gh}?s={max(16, min(256, int(size)))}&d=identicon&r=g'
+
+def _normalize_gravatar_identity(raw: str) -> tuple[str | None, str | None]:
+    """Accept either an email or an MD5 hash; return (hash, error)."""
+    text = (raw or '').strip()
+    if not text:
+        return None, None
+    low = text.lower()
+    if re.fullmatch(r'[a-f0-9]{32}', low):
+        return low, None
+    # Keep validation intentionally simple: something@something
+    if re.fullmatch(r'[^@\s]+@[^@\s]+', text):
+        return hashlib.md5(low.encode('utf-8')).hexdigest(), None
+    return None, 'Invalid Gravatar value. Use email (name@domain) or a 32-char MD5 hash.'
+
+def _avatar_html(user_row, size: int = 24) -> str:
+    url = _gravatar_url(user_row, size=size)
+    radius = '50%'
+    if url:
+        return (
+            f'<img src="{url}" alt="" referrerpolicy="no-referrer" loading="lazy" '
+            f'style="width:{size}px;height:{size}px;border-radius:{radius};object-fit:cover;'
+            f'border:1px solid var(--border);background:var(--card2)">'
+        )
+    label = '?'
+    if user_row and ('username' in user_row.keys()) and user_row['username']:
+        label = _h(user_row['username'][0].upper())
+    return (
+        f'<span aria-hidden="true" '
+        f'style="display:inline-flex;align-items:center;justify-content:center;'
+        f'width:{size}px;height:{size}px;border-radius:{radius};border:1px solid var(--border);'
+        f'background:var(--card2);color:var(--muted);font-family:var(--mono);'
+        f'font-size:{max(10, int(size * 0.45))}px">{label}</span>'
+    )
 
 def _fmt_seen_ago(ts: float) -> str:
     """Compact relative time for recent peer activity."""
@@ -5833,6 +5926,9 @@ class ManageHandler(BaseHTTPRequestHandler):
                 try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
                 except: v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
+        elif form_id == 'gravatar_settings':
+            val = '1' if fields.get('gravatar_enabled') == '1' else '0'
+            REGISTRATION_DB.set_setting('gravatar_enabled', val, user['username'])
         self._redirect('/manage/admin?tab=economy' if form_id in ('points_earn','points_spend','bounty_settings','leaderboard_settings','admin_grant_settings','dm_settings') else '/manage/admin')
 
     # ── Invite & Credit handlers ─────────────────────────────
@@ -6384,18 +6480,48 @@ class ManageHandler(BaseHTTPRequestHandler):
             show_online = fields.get('show_online', '0') == '1'
             bounty_alerts = fields.get('bounty_alerts', '0') == '1'
             link_torrent_activity = fields.get('link_torrent_activity', '0') == '1'
+            gravatar_opt_in = fields.get('gravatar_opt_in', '0') == '1'
+            gravatar_identity = fields.get('gravatar_identity',
+                                           fields.get('gravatar_email', '')).strip()
         else:
             show_online = ('show_online' not in user.keys() or user['show_online'])
             bounty_alerts = ('bounty_alerts' not in user.keys() or user['bounty_alerts'])
             link_torrent_activity = ('link_torrent_activity' not in user.keys() or user['link_torrent_activity'])
+            gravatar_opt_in = ('gravatar_opt_in' in user.keys() and user['gravatar_opt_in'])
+            gravatar_identity = ''
         REGISTRATION_DB.dm_toggle_setting(user['id'], allow)
-        REGISTRATION_DB._conn().execute(
-            'UPDATE users SET show_online=? WHERE id=?', (1 if show_online else 0, user['id']))
-        REGISTRATION_DB._conn().execute(
-            'UPDATE users SET bounty_alerts=? WHERE id=?', (1 if bounty_alerts else 0, user['id']))
-        REGISTRATION_DB._conn().execute(
-            'UPDATE users SET link_torrent_activity=? WHERE id=?', (1 if link_torrent_activity else 0, user['id']))
-        REGISTRATION_DB._conn().commit()
+        c = REGISTRATION_DB._conn()
+        if full_privacy_submit and _gravatar_enabled():
+            gravatar_hash = (user['gravatar_hash'] if 'gravatar_hash' in user.keys() else None)
+            if gravatar_opt_in and gravatar_identity:
+                parsed_hash, gravatar_err = _normalize_gravatar_identity(gravatar_identity)
+                if gravatar_err:
+                    msg = urllib.parse.quote_plus(gravatar_err)
+                    return self._redirect(f'/manage/profile?msg={msg}&msg_type=error')
+                gravatar_hash = parsed_hash
+            c.execute(
+                '''UPDATE users
+                   SET show_online=?, bounty_alerts=?, link_torrent_activity=?,
+                       gravatar_opt_in=?, gravatar_hash=?
+                   WHERE id=?''',
+                (1 if show_online else 0,
+                 1 if bounty_alerts else 0,
+                 1 if link_torrent_activity else 0,
+                 1 if gravatar_opt_in else 0,
+                 gravatar_hash if gravatar_opt_in else None,
+                 user['id'])
+            )
+        else:
+            c.execute(
+                '''UPDATE users
+                   SET show_online=?, bounty_alerts=?, link_torrent_activity=?
+                   WHERE id=?''',
+                (1 if show_online else 0,
+                 1 if bounty_alerts else 0,
+                 1 if link_torrent_activity else 0,
+                 user['id'])
+            )
+        c.commit()
         if full_privacy_submit:
             self._redirect('/manage/profile?msg=Profile+settings+saved&msg_type=success')
         else:
@@ -7432,8 +7558,9 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
         mail_html = (f'<a id="nav-mail" href="/manage/messages" class="{dm_cls}" '
                      f'style="text-decoration:none" aria-label="Messages">'
                      f'📬{dm_badge}</a>') if role != 'basic' else ''
-        nav = (f'<a href="/manage/profile" class="nav-user" style="text-decoration:none">'
-               f'<span class="nav-username">{_h(user["username"])}</span> '
+        nav_avatar = _avatar_html(user, 22)
+        nav = (f'<a href="/manage/profile" class="nav-user" style="text-decoration:none;display:inline-flex;align-items:center;gap:8px">'
+               f'{nav_avatar}<span class="nav-username">{_h(user["username"])}</span> '
                f'<span class="badge badge-{role}">{role_label}</span></a>'
                + mail_html + bell_html +
                f'<a href="/manage/logout" class="btn btn-sm">Logout</a>')
@@ -7549,7 +7676,28 @@ def _fmt_size(b: int) -> str:
     return f'{b/1024**3:.2f} GB'
 
 
-def _torrent_header(show_owner: bool = False) -> str:
+def _torrent_header(show_owner: bool = False, hide_info_hash: bool = False) -> str:
+    if hide_info_hash:
+        if show_owner:
+            # 5 cols: 58+12+8+10+12 = 100%
+            return (
+                '<tr>'
+                '<th scope="col" style="width:58%">Name</th>'
+                '<th scope="col" style="width:12%">Owner</th>'
+                '<th scope="col" style="width:8%;white-space:nowrap">Size</th>'
+                '<th scope="col" style="width:10%;white-space:nowrap">Registered</th>'
+                '<th scope="col" style="width:12%;min-width:100px">Action</th>'
+                '</tr>'
+            )
+        # 4 cols: 72+8+8+12 = 100%
+        return (
+            '<tr>'
+            '<th scope="col" style="width:72%">Name</th>'
+            '<th scope="col" style="width:8%;white-space:nowrap">Size</th>'
+            '<th scope="col" style="width:8%;white-space:nowrap">Registered</th>'
+            '<th scope="col" style="width:12%;min-width:100px">Action</th>'
+            '</tr>'
+        )
     if show_owner:
         # 6 cols: 39+21+10+8+10+12 = 100%
         return (
@@ -7575,7 +7723,8 @@ def _torrent_header(show_owner: bool = False) -> str:
 
 
 def _torrent_row(t, viewer_role: str, viewer_id: int,
-                 show_owner: bool = False, show_delete: bool = True) -> str:
+                 show_owner: bool = False, show_delete: bool = True,
+                 hide_info_hash: bool = False) -> str:
     """Render a unified <tr> for any torrent table."""
     is_super   = viewer_role == 'super'
     is_admin   = viewer_role in ('super', 'admin')
@@ -7600,10 +7749,11 @@ def _torrent_row(t, viewer_role: str, viewer_id: int,
                 if show_owner else '')
     name_lower = _html_mod.escape(t['name'].lower())
 
+    info_hash_td = '' if hide_info_hash else f'<td class="hash" style="word-break:break-all">{ih}</td>'
     return (
         f'<tr data-name="{name_lower}">'
         f'<td style="word-break:break-word;overflow-wrap:anywhere"><a href="/manage/torrent/{ih}" class="user-link">{name_esc}</a></td>'
-        f'<td class="hash" style="word-break:break-all">{ih}</td>'
+        f'{info_hash_td}'
         f'{owner_td}'
         f'<td class="hash" style="white-space:nowrap">{size_str}</td>'
         f'<td class="hash">{reg_date}</td>'
@@ -7621,11 +7771,12 @@ def _render_search(user, torrents: list, query: str = '',
 
     srole = _user_role(user)
     t_rows = ''.join(
-        _torrent_row(t, srole, user['id'], show_owner=is_admin, show_delete=False)
+        _torrent_row(t, srole, user['id'], show_owner=is_admin, show_delete=False,
+                     hide_info_hash=True)
         for t in torrents
     )
     if not t_rows:
-        cols = 6 if is_admin else 5
+        cols = 5 if is_admin else 4
         t_rows = f'<tr><td colspan="{cols}" class="empty">No results found</td></tr>'
 
     q_enc = urllib.parse.quote(query)
@@ -7653,7 +7804,7 @@ def _render_search(user, torrents: list, query: str = '',
        style="padding:6px 12px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem;width:220px">
     </div>
     <div class="table-wrap"><table id="search-torrent-table" class="torrent-table">
-      {_torrent_header(show_owner=is_admin)}
+      {_torrent_header(show_owner=is_admin, hide_info_hash=True)}
       {t_rows}
     </table></div>
     {pagination}
@@ -7670,11 +7821,12 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
 
     viewer_role = _user_role(user)
     torrent_rows = ''.join(
-        _torrent_row(t, viewer_role, user['id'], show_owner=is_standard, show_delete=is_super)
+        _torrent_row(t, viewer_role, user['id'], show_owner=is_standard, show_delete=is_super,
+                     hide_info_hash=True)
         for t in torrents
     )
     if not torrent_rows:
-        cols = 6 if is_standard else 5
+        cols = 5 if is_standard else 4
         torrent_rows = f'<tr><td colspan="{cols}" class="empty">No torrents registered yet</td></tr>'
 
     admin_link = (
@@ -7735,7 +7887,7 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
        style="padding:6px 12px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem;width:240px">
     </div>
     <div class="table-wrap"><table id="dash-torrent-table" class="torrent-table">
-      {_torrent_header(is_standard)}
+      {_torrent_header(is_standard, hide_info_hash=True)}
       {torrent_rows}
     </table></div>
     {_pagination_html(page, total_pages, '/manage/dashboard')}
@@ -7910,6 +8062,20 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             <input type="number" name="upload_max_file_mb" value="{upload_max_file_mb}"
                    min="1" max="1024" style="width:120px">
           </div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">Gravatar Integration</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Allows members to opt in to Gravatar avatars. The tracker stores only an MD5
+          hash value provided from the profile form, never the raw email address.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="gravatar_settings">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
+            <input type="checkbox" name="gravatar_enabled" value="1" {'checked' if settings.get('gravatar_enabled','0')=='1' else ''}> Enable Gravatar avatars
+          </label>
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
       </div>
@@ -9566,6 +9732,7 @@ def _render_public_profile(viewer, target_user, torrents: list,
     pts_val   = target_user['points']       if 'points'       in target_user.keys() else 0
     streak    = target_user['login_streak'] if 'login_streak' in target_user.keys() else 0
     pts_color = 'var(--danger)' if pts_val < 0 else 'var(--accent)'
+    status_badge = _online_badge_html(_online_status(target_user))
 
     def _pub_row(label, value):
         return (f'<tr>'
@@ -9584,8 +9751,10 @@ def _render_public_profile(viewer, target_user, torrents: list,
     base_url = f'/manage/user/{uname}'
     sharing_card = _render_profile_sharing_card(target_user)
 
+    avatar_html = _avatar_html(target_user, 34)
     body = f'''
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;flex-wrap:wrap">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
+    {avatar_html}
     <div class="page-title">{uname_h}</div>
     {role_badge}
   </div>
@@ -9597,11 +9766,11 @@ def _render_public_profile(viewer, target_user, torrents: list,
   </div>
 
   <div class="card" style="max-width:400px">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+    <div style="display:flex;align-items:center;margin-bottom:12px">
       <div class="card-title" style="margin:0">Account</div>
-      {_online_dot_html(_online_status(target_user), 'Online now' if _online_status(target_user)=='online' else 'Recently active' if _online_status(target_user)=='recent' else '')}
     </div>
     <table style="min-width:unset">
+      {_pub_row('Status', status_badge if status_badge else '--')}
       {_pub_row('Member Since', joined)}
       {_pub_row('Points', f'<span style="color:{pts_color};font-weight:bold">{pts_val}</span>'
                           + (f' <span style="color:var(--muted);font-size:0.8rem">🔥 {streak}-day streak</span>'
@@ -9842,6 +10011,32 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     t_is_super  = (uname == SUPER_USER)
     t_is_admin  = target_user['is_admin']
     if is_own_profile:
+        gravatar_on = _gravatar_enabled()
+        gravatar_checked = ('checked' if ('gravatar_opt_in' in viewer.keys() and viewer['gravatar_opt_in']) else '')
+        gravatar_section = ''
+        if gravatar_on:
+            gravatar_section = (
+                '<div style="margin-top:8px;padding-top:10px;border-top:1px solid var(--border)">'
+                '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+                f'<input type="checkbox" name="gravatar_opt_in" value="1" {gravatar_checked}> '
+                'Use Gravatar avatar'
+                '</label>'
+                '<label style="display:block;margin-top:8px;font-size:0.84rem;color:var(--muted)">'
+                'Gravatar email or MD5 hash (optional)'
+                '<input type="text" name="gravatar_identity" autocomplete="off" '
+                'placeholder="you@example.com or 4fca794da0cf08804f99048d3c8b39c1" '
+                'style="margin-top:6px;width:100%;padding:8px;background:var(--card2);'
+                'border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.84rem">'
+                '</label>'
+                '<div style="margin-top:6px;font-size:0.76rem;color:var(--muted)">'
+                'Tip: you can hash your email with MD5 and paste the hash directly.'
+                '</div>'
+                '<div style="margin-top:8px;font-size:0.78rem;color:var(--muted)" '
+                'title="Privacy note: your raw email is not stored. We keep only the MD5 hash. Hashes can still be correlated or guessed for predictable emails, and avatar fetches contact a third-party service (Gravatar).">'
+                'Privacy note: hash-only storage, possible hash correlation risk, and third-party Gravatar fetches.'
+                '</div>'
+                '</div>'
+            )
         # Build invite section inline for right column
         _invite_html = _render_invite_section(viewer, target_user, True, REGISTRATION_DB)
         # Build send points inline for right column
@@ -9874,7 +10069,8 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<input type="checkbox" name="link_torrent_activity" value="1" '
             + ('checked' if ('link_torrent_activity' not in viewer.keys() or viewer['link_torrent_activity']) else '')
             + '> Allow linking my torrent swarm activity</label>'
-            '<div><button type="submit" class="btn btn-sm">Save</button></div>'
+            + gravatar_section
+            + '<div><button type="submit" class="btn btn-sm">Save</button></div>'
             '</form>'
             '</div>'
             '</div></div>'
@@ -9987,8 +10183,10 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         dm_btn = (f' &nbsp;&#183;&nbsp; <a href="/manage/messages?tab=compose&to={uname_h}" '
                   f'class="btn btn-sm">📬 Send DM</a>')
 
+    avatar_html = _avatar_html(target_user, 34)
     body = (
-        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;flex-wrap:wrap">'
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">'
+        + avatar_html
         + '<div class="page-title">' + uname_h + '</div>'
         + role_badge + status_badges
         + '</div>'
