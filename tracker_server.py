@@ -7090,18 +7090,47 @@ function showTab(name, btn) {
 }
 function confirmAction(msg) {
   return new Promise(function(resolve) {
+    var prev = document.activeElement;
     var o = document.createElement('div');
     o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:9999;display:flex;align-items:center;justify-content:center';
+    o.setAttribute('role','alertdialog');
+    o.setAttribute('aria-modal','true');
+    o.setAttribute('aria-labelledby','_ca_title');
+    o.setAttribute('aria-describedby','_ca_body');
     o.innerHTML = '<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px 32px;max-width:560px;width:92%;text-align:center">'
-      + '<div style="font-family:var(--mono);font-size:0.68rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--muted);margin-bottom:12px">Confirm Action</div>'
-      + '<div style="font-size:0.92rem;margin-bottom:24px;line-height:1.5;color:var(--text);word-break:break-word;overflow-wrap:anywhere">' + msg + '</div>'
+      + '<div id="_ca_title" style="font-family:var(--mono);font-size:0.68rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--muted);margin-bottom:12px">Confirm Action</div>'
+      + '<div id="_ca_body" style="font-size:0.92rem;margin-bottom:24px;line-height:1.5;color:var(--text);word-break:break-word;overflow-wrap:anywhere">' + msg + '</div>'
       + '<div style="display:flex;gap:12px;justify-content:center">'
       + '<button id="_ca_no" class="btn">Cancel</button>'
       + '<button id="_ca_yes" class="btn btn-danger">Confirm</button>'
       + '</div></div>';
     document.body.appendChild(o);
-    document.getElementById('_ca_yes').onclick = function(){ document.body.removeChild(o); resolve(true); };
-    document.getElementById('_ca_no').onclick  = function(){ document.body.removeChild(o); resolve(false); };
+    var noBtn = document.getElementById('_ca_no');
+    var yesBtn = document.getElementById('_ca_yes');
+    function _close(ok){
+      if (o.parentNode) o.parentNode.removeChild(o);
+      if (prev && prev.focus) prev.focus();
+      resolve(ok);
+    }
+    noBtn.onclick  = function(){ _close(false); };
+    yesBtn.onclick = function(){ _close(true); };
+    yesBtn.focus();
+    o.addEventListener('keydown', function(e){
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        _close(false);
+        return;
+      }
+      if (e.key === 'Tab') {
+        var focusables = [noBtn, yesBtn];
+        var idx = focusables.indexOf(document.activeElement);
+        if (idx < 0) idx = 0;
+        if (e.shiftKey) idx = (idx + focusables.length - 1) % focusables.length;
+        else idx = (idx + 1) % focusables.length;
+        e.preventDefault();
+        focusables[idx].focus();
+      }
+    });
   });
 }
 function initiateSystemWipe() {
@@ -7249,7 +7278,22 @@ function _bindEnterToSendComments(){
     });
   });
 }
+function _bindFormLabels(){
+  var i = 0;
+  document.querySelectorAll('.form-group label:not([for])').forEach(function(label){
+    var wrap = label.closest('.form-group');
+    if (!wrap) return;
+    var ctrl = wrap.querySelector('input, textarea, select');
+    if (!ctrl) return;
+    if (!ctrl.id) {
+      i += 1;
+      ctrl.id = 'auto-field-' + i;
+    }
+    label.setAttribute('for', ctrl.id);
+  });
+}
 document.addEventListener('DOMContentLoaded', _bindEnterToSendComments);
+document.addEventListener('DOMContentLoaded', _bindFormLabels);
 document.addEventListener('submit', function(e){
   var f = e.target, msg = f.dataset.confirm;
   if(f.method && f.method.toUpperCase()==='POST') _injectCsrf(f);
@@ -7295,10 +7339,12 @@ function copyInvite(btn, path) {
 }
 function toggleNotifDropdown(e) {
   e.stopPropagation();
+  var btn = document.getElementById('nav-bell');
   var d = document.getElementById('notif-dropdown');
   if (!d) return;
   var opening = !d.classList.contains('open');
   d.classList.toggle('open');
+  if (btn) btn.setAttribute('aria-expanded', opening ? 'true' : 'false');
   if (!opening) return;
   // Fetch fresh notifications every time the dropdown opens
   var body = d.querySelector('.notif-dropdown-body');
@@ -7329,8 +7375,21 @@ function _esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 document.addEventListener('click', function() {
+  var btn = document.getElementById('nav-bell');
   var d = document.getElementById('notif-dropdown');
   if (d) d.classList.remove('open');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+});
+document.addEventListener('keydown', function(e){
+  if (e.key !== 'Escape') return;
+  var btn = document.getElementById('nav-bell');
+  var d = document.getElementById('notif-dropdown');
+  if (!d || !d.classList.contains('open')) return;
+  d.classList.remove('open');
+  if (btn) {
+    btn.setAttribute('aria-expanded', 'false');
+    btn.focus();
+  }
 });
 function readNotif(id, url) {
   fetch('/manage/notifications/read/' + id, {method:'POST',
@@ -7542,7 +7601,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             dropdown_items = '<div class="notif-empty">No unread notifications</div>'
         bell_html = (
             f'<div class="notif-wrap">'
-            f'<button id="nav-bell" class="{bell_cls}" onclick="toggleNotifDropdown(event)" aria-label="Notifications">'
+            f'<button id="nav-bell" class="{bell_cls}" onclick="toggleNotifDropdown(event)" aria-label="Notifications" aria-haspopup="true" aria-controls="notif-dropdown" aria-expanded="false">'
             f'🔔{badge_html}</button>'
             f'<div class="notif-dropdown" id="notif-dropdown">'
             f'<div class="notif-dropdown-header">'
@@ -7788,8 +7847,8 @@ def _render_search(user, torrents: list, query: str = '',
   <div class="card" style="margin-bottom:0">
     <form method="GET" action="/manage/search" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
       <div class="form-group" style="flex:1;margin:0;min-width:240px">
-        <label>Search by name or info hash</label>
-        <input type="text" name="q" value="{query}" placeholder="Enter name or hash..." autofocus
+        <label for="search-q">Search by name or info hash</label>
+        <input id="search-q" type="text" name="q" value="{query}" placeholder="Enter name or hash..." autofocus
                style="font-size:1rem">
       </div>
       <button type="submit" class="btn btn-primary" style="margin-bottom:1px">Search</button>
@@ -7870,8 +7929,8 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
     <form method="POST" action="/manage/upload" enctype="multipart/form-data">
       <div class="two-col">
         <div class="form-group" style="margin:0">
-          <label>Torrent File (.torrent)</label>
-          <input type="file" name="torrent" accept=".torrent" multiple required>
+          <label for="dash-upload-torrent">Torrent File (.torrent)</label>
+          <input id="dash-upload-torrent" type="file" name="torrent" accept=".torrent" multiple required>
           <div style="color:var(--muted);font-size:0.82rem;margin-top:6px">{upload_limits_hint}</div>
         </div>
         <div style="display:flex;align-items:flex-start;padding-top:32px">
@@ -9651,9 +9710,9 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             <td style="word-break:break-word;overflow-wrap:anywhere">{t["name"]}</td></tr>
         <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">INFO HASH</td>
             <td class="hash" style="word-break:break-all;font-size:0.82rem">
-              <span onclick="copyHash(this,'{ih}')"
-                    title="Click to copy"
-                    style="cursor:pointer;border-bottom:1px dashed var(--muted)">{ih}</span>
+              <button type="button" onclick="copyHash(this,'{ih}')" title="Click to copy"
+                      aria-label="Copy info hash"
+                      style="cursor:pointer;border:none;background:none;padding:0;color:inherit;font:inherit;border-bottom:1px dashed var(--muted)">{ih}</button>
             </td></tr>
         <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">TYPE</td>
             <td>{mf}</td></tr>
