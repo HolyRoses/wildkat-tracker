@@ -2632,15 +2632,41 @@ class RegistrationDB:
     def system_wipe(self, actor: str):
         """Wipe all data except the super user account and system settings."""
         c = self._conn()
+        # Keep only the super account itself; wipe all runtime/user-generated data.
         c.execute('DELETE FROM users WHERE username != ?', (actor,))
         c.execute('DELETE FROM torrents')
         c.execute('DELETE FROM comments')
         c.execute('DELETE FROM notifications')
         c.execute('DELETE FROM invite_codes')
+        c.execute('DELETE FROM points_ledger')
+        c.execute('DELETE FROM bounties')
+        c.execute('DELETE FROM bounty_contributions')
+        c.execute('DELETE FROM bounty_votes')
+        c.execute('DELETE FROM bounty_comments')
+        c.execute('DELETE FROM direct_messages')
+        c.execute('DELETE FROM dm_blocklist')
+        c.execute('DELETE FROM ip_allowlist')
+        c.execute('DELETE FROM login_history')
         c.execute('DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users)')
+        # Reset mutable account state for remaining account(s).
+        c.execute(
+            '''UPDATE users
+               SET is_locked=0,
+                   is_disabled=0,
+                   failed_attempts=0,
+                   last_login=NULL,
+                   login_count=0,
+                   credits=0,
+                   credits_awarded=0,
+                   points=0,
+                   login_streak=0,
+                   longest_streak=0,
+                   last_login_date=NULL,
+                   comment_pts_date=NULL,
+                   comment_pts_today=0,
+                   last_seen=NULL'''
+        )
         c.execute('DELETE FROM events')
-        c.execute('DELETE FROM ip_allowlist WHERE user_id NOT IN (SELECT id FROM users)')
-        c.execute('DELETE FROM login_history WHERE user_id NOT IN (SELECT id FROM users)')
         c.commit()
         self._log(actor, 'SYSTEM_WIPE', '', 'All data wiped except super account')
 
@@ -8770,7 +8796,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           </div>
           <div class="form-group" style="margin:0;min-width:120px">
             <label style="font-size:0.75rem">Actor</label>
-            <input type="text" name="eactor" value="{_h(eactor)}" placeholder="e.g. tracy"
+            <input type="text" name="eactor" value="{_h(eactor)}" placeholder="e.g. thomas"
                    style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
                           border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
           </div>
@@ -8782,7 +8808,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           </div>
           <div class="form-group" style="margin:0;min-width:120px">
             <label style="font-size:0.75rem">Target</label>
-            <input type="text" name="etarget" value="{_h(etarget)}" placeholder="e.g. jason"
+            <input type="text" name="etarget" value="{_h(etarget)}" placeholder="e.g. patrick"
                    style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
                           border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
           </div>
