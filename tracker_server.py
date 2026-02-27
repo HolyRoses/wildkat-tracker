@@ -132,7 +132,7 @@ def bencode(obj) -> bytes:
 
 class PeerRegistry:
     """
-    Stores peers per info_hash.
+        Stores peers per info_hash.
 
     Structure:
         _torrents[info_hash_hex] = {
@@ -147,7 +147,6 @@ class PeerRegistry:
         }
         _downloaded[info_hash_hex] = int   # completed event counter
     """
-
     def __init__(self):
         self._lock = threading.Lock()
         self._torrents: dict[str, dict] = {}
@@ -274,7 +273,6 @@ REGISTRY = PeerRegistry()
 
 class StatsTracker:
     """Thread-safe statistics with today / yesterday / all-time buckets."""
-
     def __init__(self):
         self._lock   = threading.Lock()
         self.start_time = time.time()
@@ -986,6 +984,44 @@ class RegistrationDB:
             self._conn().commit()
         except Exception:
             pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN last_seen TEXT')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        # ── conversation_id migration ────────────────────────────────────────
+        try:
+            self._conn().execute(
+                'ALTER TABLE direct_messages ADD COLUMN conversation_id INTEGER')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        # Backfill: top-level messages own their conversation
+        self._conn().execute(
+            'UPDATE direct_messages SET conversation_id=id WHERE reply_to_id IS NULL AND conversation_id IS NULL')
+        self._conn().commit()
+        # Backfill replies: walk up reply chain to find root, assign its id
+        max_depth = 20
+        for _ in range(max_depth):
+            changed = self._conn().execute(
+                '''UPDATE direct_messages SET conversation_id=(
+                       SELECT COALESCE(p.conversation_id, p.id)
+                       FROM direct_messages p WHERE p.id=direct_messages.reply_to_id
+                   )
+                   WHERE reply_to_id IS NOT NULL AND conversation_id IS NULL'''
+            ).rowcount
+            self._conn().commit()
+            if not changed:
+                break
+        # Any still-null replies (broken chains) get their own id as fallback
+        self._conn().execute(
+            'UPDATE direct_messages SET conversation_id=id WHERE conversation_id IS NULL')
+        self._conn().commit()
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN show_online INTEGER NOT NULL DEFAULT 1')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
 
     def _init_defaults(self, announce_urls: list):
         """Seed magnet_trackers and settings if not already present."""
@@ -1047,74 +1083,110 @@ class RegistrationDB:
     # ── Direct Message DB Methods ────────────────────────────
 
     def send_dm(self, sender: str, recipient: str, subject: str, body: str,
-                is_broadcast: bool = False, reply_to_id: int = None) -> int:
-        """Insert a DM. Returns new message id."""
+                is_broadcast: bool = False, reply_to_id: int = None,
+                conversation_id: int = None) -> int:
+        """Insert a DM. Returns new message id.
+        conversation_id: pass the root message id to keep replies in same thread.
+        If None and reply_to_id given, it is looked up from the parent.
+        If None and no reply_to_id, the new message becomes its own conversation root.
+        """
         c = self._conn()
+        # Resolve conversation_id for replies if not explicitly given
+        if conversation_id is None and reply_to_id is not None:
+            parent = c.execute(
+                'SELECT conversation_id, id FROM direct_messages WHERE id=?',
+                (reply_to_id,)
+            ).fetchone()
+            if parent:
+                conversation_id = parent['conversation_id'] or parent['id']
         c.execute(
-            "INSERT INTO direct_messages (sender,recipient,subject,body,sent_at,is_broadcast,reply_to_id)"
-            " VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO direct_messages (sender,recipient,subject,body,sent_at,is_broadcast,reply_to_id,conversation_id)"
+            " VALUES (?,?,?,?,?,?,?,?)",
             (sender, recipient, subject[:200], body[:5000],
-             self._ts(), 1 if is_broadcast else 0, reply_to_id)
+             self._ts(), 1 if is_broadcast else 0, reply_to_id, conversation_id)
         )
         c.commit()
-        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        new_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # New top-level message: set its own id as conversation_id
+        if conversation_id is None:
+            c.execute('UPDATE direct_messages SET conversation_id=? WHERE id=?',
+                      (new_id, new_id))
+            c.commit()
+        return new_id
 
     def get_dm_inbox(self, username: str, limit: int = 100) -> list:
-        return self._conn().execute(
-            "SELECT * FROM direct_messages WHERE recipient=? AND del_by_recip=0"
-            " ORDER BY id DESC LIMIT ?",
-            (username, limit)
+        """Return one row per conversation the user is a recipient in.
+        Row is the root message of each conversation (lowest id with that conversation_id),
+        annotated with total message count and unread count."""
+        rows = self._conn().execute(
+            '''SELECT m.*, COUNT(all_m.id) as msg_count,
+                      SUM(CASE WHEN all_m.recipient=? AND all_m.read_at IS NULL
+                               AND all_m.del_by_recip=0 THEN 1 ELSE 0 END) as unread_count,
+                      MAX(all_m.sent_at) as last_activity
+               FROM direct_messages m
+               JOIN direct_messages all_m ON all_m.conversation_id=m.conversation_id
+               WHERE m.id=m.conversation_id
+               AND EXISTS (
+                   SELECT 1 FROM direct_messages r
+                   WHERE r.conversation_id=m.conversation_id
+                   AND r.recipient=? AND r.del_by_recip=0
+               )
+               GROUP BY m.conversation_id
+               ORDER BY last_activity DESC LIMIT ?''',
+            (username, username, limit)
         ).fetchall()
+        return rows
 
     def get_dm_sent(self, username: str, limit: int = 100) -> list:
-        return self._conn().execute(
-            "SELECT * FROM direct_messages WHERE sender=? AND del_by_sender=0"
-            " AND is_broadcast=0 ORDER BY id DESC LIMIT ?",
+        """Return one row per conversation the user initiated (is sender of root)."""
+        rows = self._conn().execute(
+            '''SELECT m.*, COUNT(all_m.id) as msg_count,
+                      MAX(all_m.sent_at) as last_activity
+               FROM direct_messages m
+               JOIN direct_messages all_m ON all_m.conversation_id=m.conversation_id
+               WHERE m.id=m.conversation_id
+               AND m.sender=? AND m.del_by_sender=0 AND m.is_broadcast=0
+               GROUP BY m.conversation_id
+               ORDER BY last_activity DESC LIMIT ?''',
             (username, limit)
         ).fetchall()
+        return rows
 
     def get_dm(self, msg_id: int) -> object:
         return self._conn().execute(
             "SELECT * FROM direct_messages WHERE id=?", (msg_id,)
         ).fetchone()
 
-    def get_dm_thread(self, msg_id: int, username: str) -> list:
-        """Get a message and all replies in the thread visible to username."""
-        root = self.get_dm(msg_id)
-        if not root:
-            return []
-        # Walk up to find root
-        while root["reply_to_id"]:
-            parent = self.get_dm(root["reply_to_id"])
-            if not parent:
-                break
-            root = parent
-        # Get all messages in thread (root + replies)
-        def collect(mid):
-            msg = self.get_dm(mid)
-            if not msg:
-                return []
-            result = [msg]
-            children = self._conn().execute(
-                "SELECT id FROM direct_messages WHERE reply_to_id=? ORDER BY id",
-                (mid,)
-            ).fetchall()
-            for row in children:
-                result.extend(collect(row[0]))
-            return result
-        return collect(root["id"])
+    def get_dm_thread(self, conversation_id: int, username: str) -> list:
+        """Return all messages in a conversation ordered chronologically.
+        The conversation_id IS the id of the root message.
+        Only returns messages where the user is sender or recipient and has not deleted."""
+        return self._conn().execute(
+            '''SELECT * FROM direct_messages
+               WHERE conversation_id=?
+               AND (
+                   (sender=? AND del_by_sender=0)
+                   OR (recipient=? AND del_by_recip=0)
+               )
+               ORDER BY id ASC''',
+            (conversation_id, username, username)
+        ).fetchall()
 
     def get_unread_dm_count(self, username: str) -> int:
+        """Count conversations with at least one unread message for this user."""
         return self._conn().execute(
-            "SELECT COUNT(*) FROM direct_messages WHERE recipient=? AND read_at IS NULL AND del_by_recip=0",
+            '''SELECT COUNT(DISTINCT conversation_id) FROM direct_messages
+               WHERE recipient=? AND read_at IS NULL AND del_by_recip=0''',
             (username,)
         ).fetchone()[0]
 
-    def mark_dm_read(self, msg_id: int, username: str):
+    def mark_dm_read(self, conversation_id: int, username: str):
+        """Mark all unread messages in a conversation as read for this user."""
         c = self._conn()
         c.execute(
-            "UPDATE direct_messages SET read_at=? WHERE id=? AND recipient=? AND read_at IS NULL",
-            (self._ts(), msg_id, username)
+            '''UPDATE direct_messages SET read_at=?
+               WHERE conversation_id=? AND recipient=? AND read_at IS NULL''',
+            (self._ts(), conversation_id, username)
         )
         c.commit()
 
@@ -1136,6 +1208,31 @@ class RegistrationDB:
         c = self._conn()
         c.execute("UPDATE direct_messages SET del_by_recip=1 WHERE id=? AND recipient=?",
                   (msg_id, username))
+        c.commit()
+
+    def delete_dm_conversation(self, conversation_id: int, username: str):
+        """Soft-delete an entire conversation for this user only.
+        Sets del_by_sender on messages they sent, del_by_recip on messages they received.
+        Then hard-deletes any rows where both sides have deleted (fully orphaned).
+        The other party's view is completely unaffected.
+        """
+        c = self._conn()
+        c.execute(
+            """UPDATE direct_messages SET del_by_sender=1
+               WHERE conversation_id=? AND sender=?""",
+            (conversation_id, username)
+        )
+        c.execute(
+            """UPDATE direct_messages SET del_by_recip=1
+               WHERE conversation_id=? AND recipient=?""",
+            (conversation_id, username)
+        )
+        # Hard-delete rows that both parties have now flagged — no orphan data
+        c.execute(
+            """DELETE FROM direct_messages
+               WHERE conversation_id=? AND del_by_sender=1 AND del_by_recip=1""",
+            (conversation_id,)
+        )
         c.commit()
 
     def get_dm_sent_today(self, username: str) -> int:
@@ -1309,6 +1406,15 @@ class RegistrationDB:
 
     def get_user_by_id(self, uid: int) -> sqlite3.Row | None:
         return self._conn().execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
+
+    def update_last_seen(self, uid: int) -> None:
+        """Stamp last_seen for online presence tracking. Fire-and-forget."""
+        try:
+            now = datetime.datetime.now().isoformat(timespec='seconds')
+            self._conn().execute('UPDATE users SET last_seen=? WHERE id=?', (now, uid))
+            self._conn().commit()
+        except Exception:
+            pass
 
     def list_users(self, page: int = 1, per_page: int = 50) -> list:
         offset = (page - 1) * per_page
@@ -3831,7 +3937,6 @@ function copyUrl(url, btn) {{
 
 class RedirectHandler(BaseHTTPRequestHandler):
     """Redirect plain HTTP → HTTPS."""
-
     redirect_host = ''  # set at startup
 
     def do_GET(self):
@@ -3937,9 +4042,80 @@ WEB_CONFIG: dict = {}   # populated at startup by main()
 
 
 
+# ── In-memory typing presence store ─────────────────────────────────────────
+# {thread_key: {'username': str, 'expires': float}}
+# thread_key = "dm:{user_a}:{user_b}" (sorted alphabetically)
+import threading as _threading
+_TYPING_STORE: dict = {}
+_TYPING_LOCK  = _threading.Lock()
+_ONLINE_MINUTES  = 5   # active within N minutes = online
+_RECENT_MINUTES  = 30  # active within N minutes = recently active
+
+
+def _typing_key(u1: str, u2: str) -> str:
+    return 'dm:' + ':'.join(sorted([u1, u2]))
+
+
+def _set_typing(username: str, other: str) -> None:
+    key = _typing_key(username, other)
+    with _TYPING_LOCK:
+        _TYPING_STORE[key] = {'username': username, 'expires': time.time() + 6}
+
+
+def _is_typing(username: str, other: str) -> bool:
+    """Return True if `username` is currently typing to `other`."""
+    key = _typing_key(username, other)
+    with _TYPING_LOCK:
+        entry = _TYPING_STORE.get(key)
+        if not entry:
+            return False
+        if entry['username'] != username:
+            return False
+        if time.time() > entry['expires']:
+            del _TYPING_STORE[key]
+            return False
+        return True
+
+
+def _online_status(user_row) -> str:
+    """Return 'online', 'recent', or 'offline' based on last_seen.
+    Returns 'hidden' if user has disabled show_online."""
+    if user_row is None:
+        return 'offline'
+    show = user_row['show_online'] if 'show_online' in user_row.keys() else 1
+    if not show:
+        return 'hidden'
+    last = user_row['last_seen'] if 'last_seen' in user_row.keys() else None
+    if not last:
+        return 'offline'
+    try:
+        import datetime as _dt
+        delta = _dt.datetime.now() - _dt.datetime.fromisoformat(last)
+        mins = delta.total_seconds() / 60
+        if mins <= _ONLINE_MINUTES:
+            return 'online'
+        if mins <= _RECENT_MINUTES:
+            return 'recent'
+        return 'offline'
+    except Exception:
+        return 'offline'
+
+
+def _online_dot_html(status: str, label: str = '') -> str:
+    """Return a small colored presence dot with optional label."""
+    if status == 'hidden':
+        return ''
+    color = {'online': 'var(--green)', 'recent': 'var(--accent)', 'offline': 'var(--border)'}.get(status, 'var(--border)')
+    tip   = {'online': 'Online now', 'recent': 'Recently active', 'offline': 'Offline'}.get(status, '')
+    dot   = (f'<span title="{tip}" style="display:inline-block;width:8px;height:8px;'
+             f'border-radius:50%;background:{color};margin-right:4px;vertical-align:middle"></span>')
+    if label:
+        return dot + f'<span style="font-size:0.8rem;color:var(--muted)">{label}</span>'
+    return dot
+
+
 class ManageHandler(BaseHTTPRequestHandler):
     """Handles all /manage/* routes."""
-
     def _is_https(self) -> bool:
         return isinstance(self.connection, ssl.SSLSocket)
 
@@ -3956,6 +4132,16 @@ class ManageHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self._refresh_csrf_cookie()  # ensure wkcsrf is always current
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, data: dict, code: int = 200):
+        import json as _json
+        body = _json.dumps(data).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
         self.end_headers()
         self.wfile.write(body)
 
@@ -3985,6 +4171,9 @@ class ManageHandler(BaseHTTPRequestHandler):
             if user is not None:
                 log.debug('SESSION valid token=%s... user=%s', token[:8], user['username'])
                 self._valid_token = token  # remember for wkcsrf refresh
+                # Update last_seen for online presence — lightweight, fire-and-forget
+                if REGISTRATION_DB:
+                    REGISTRATION_DB.update_last_seen(user['id'])
                 return user
         if candidates:
             log.debug('SESSION all %d candidates invalid', len(candidates))
@@ -4095,8 +4284,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_search()
         elif path == '/manage/notifications':
             self._get_notifications()
+        elif path == '/manage/notifications/preview':
+            self._get_notifications_preview()
+        elif path == '/manage/poll':
+            self._get_global_poll()
         elif path == '/manage/messages':
             self._get_messages()
+        elif path == '/manage/messages/poll':
+            self._get_dm_poll()
         elif path.startswith('/manage/messages/'):
             self._get_message_thread(path[len('/manage/messages/'):])
         elif path == '/manage/bounty':
@@ -4135,7 +4330,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         # the CSRF token derived from whichever session token the browser used.
         # Browsers can hold multiple wksession cookies (stale + current); we try
         # all candidates so the valid one matches regardless of order.
-        _no_csrf = ('/manage/login', '/manage/signup', '/manage')
+        _no_csrf = ('/manage/login', '/manage/signup', '/manage', '/manage/messages/typing')
         if path not in _no_csrf:
             raw_cookie = self.headers.get('Cookie', '')
             session_candidates = [p.strip()[10:] for p in raw_cookie.split(';')
@@ -4202,12 +4397,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_notification_read(nid)
         elif path == '/manage/notifications/read-all':
             self._post_notification_read_all()
+        elif path == '/manage/messages/typing':
+            self._post_dm_typing()
         elif path == '/manage/messages/send':
             self._post_dm_send()
         elif path == '/manage/messages/reply':
             self._post_dm_reply()
         elif path == '/manage/messages/delete':
             self._post_dm_delete()
+        elif path == '/manage/messages/delete-conversation':
+            self._post_dm_delete_conversation()
         elif path == '/manage/messages/mark-read':
             self._post_dm_mark_read()
         elif path == '/manage/messages/block':
@@ -5401,6 +5600,128 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     # ── DM Handlers ─────────────────────────────────────────
 
+    def _get_notifications_preview(self):
+        """Return top-5 unread notifications as JSON for live dropdown refresh."""
+        user = self._get_session_user()
+        if not user:
+            return self._send_json({'error': 'auth'}, 401)
+        items = REGISTRATION_DB.get_unread_notifications(user['id'], 5) if REGISTRATION_DB else []
+        out = []
+        for n in items:
+            is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
+            if is_bounty:
+                bid   = str(n['info_hash']).split(':',1)[1]
+                ntype = n['type']
+                icons = {
+                    'bounty_claimed':         ('🎯', 'claimed your bounty'),
+                    'bounty_rejected':        ('✗',  'rejected your claim on'),
+                    'bounty_fulfilled':       ('✅', 'fulfilled bounty'),
+                    'bounty_contribution':    ('➕', 'added points to your bounty'),
+                    'bounty_expired':         ('⏰', 'bounty expired:'),
+                    'bounty_uploader_payout': ('💰', 'fulfilled a bounty using your upload:'),
+                }
+                icon, label = icons.get(ntype, ('🔔', 'bounty update on'))
+                url = f'/manage/bounty/{bid}'
+            else:
+                icon  = '💬' if n['type'] == 'reply' else '@'
+                label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
+                url   = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
+            out.append({
+                'id':       n['id'],
+                'icon':     icon,
+                'label':    label,
+                'from':     n['from_username'],
+                'torrent':  (n['torrent_name'] or '')[:40],
+                'ts':       (n['created_at'] or '')[:16].replace('T', ' '),
+                'url':      url,
+            })
+        return self._send_json({'items': out})
+
+    def _get_global_poll(self):
+        """Lightweight background poll for nav badge counts. Called every 30s by all pages."""
+        user = self._get_session_user()
+        if not user:
+            return self._send_json({'error': 'auth'}, 401)
+        notifs = REGISTRATION_DB.get_unread_count(user['id']) if REGISTRATION_DB else 0
+        msgs   = REGISTRATION_DB.get_unread_dm_count(user['username']) if REGISTRATION_DB else 0
+        return self._send_json({'notifs': notifs, 'msgs': msgs})
+
+    def _get_dm_poll(self):
+        """Lightweight JSON poll: returns new messages and presence info for a thread."""
+        user = self._get_session_user()
+        if not user:
+            return self._send_json({'error': 'auth'}, 401)
+        if _user_role(user) == 'basic':
+            return self._send_json({'error': 'forbidden'}, 403)
+        qs         = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        since_id   = int(qs.get('since_id', ['0'])[0])
+        other_user = qs.get('other', [''])[0]
+        uname      = user['username']
+
+        # Fetch only new messages in this conversation since since_id
+        conv_id   = int(qs.get('conv_id', ['0'])[0])
+        new_msgs  = []
+        if conv_id and REGISTRATION_DB:
+            rows = REGISTRATION_DB._conn().execute(
+                '''SELECT id, sender, recipient, subject, body, sent_at, is_broadcast
+                   FROM direct_messages
+                   WHERE id > ? AND conversation_id=?
+                   AND (
+                       (sender=? AND del_by_sender=0)
+                       OR (recipient=? AND del_by_recip=0)
+                   )
+                   ORDER BY id ASC''',
+                (since_id, conv_id, uname, uname)
+            ).fetchall()
+            for m in rows:
+                new_msgs.append({
+                    'id':           m['id'],
+                    'sender':       m['sender'],
+                    'recipient':    m['recipient'],
+                    'subject':      m['subject'] or '',
+                    'body':         m['body'],
+                    'sent_at':      (m['sent_at'] or '')[:16].replace('T', ' '),
+                    'is_broadcast': m['is_broadcast'],
+                    'is_mine':      m['sender'] == uname,
+                })
+            # Mark newly arrived incoming messages as read
+            if new_msgs:
+                REGISTRATION_DB._conn().execute(
+                    '''UPDATE direct_messages SET read_at=?
+                       WHERE conversation_id=? AND recipient=? AND read_at IS NULL''',
+                    (datetime.datetime.now().isoformat(timespec='seconds'), conv_id, uname)
+                )
+                REGISTRATION_DB._conn().commit()
+
+        # Presence
+        other_online  = False
+        other_status  = 'offline'
+        other_typing  = False
+        if other_user and REGISTRATION_DB:
+            ou = REGISTRATION_DB.get_user(other_user)
+            other_status = _online_status(ou)
+            # Respect show_online — only reveal to others if they allow it
+            other_online = (other_status == 'online')
+            other_typing = _is_typing(other_user, uname)
+
+        return self._send_json({
+            'messages':     new_msgs,
+            'other_typing': other_typing,
+            'other_online': other_online,
+            'other_status': other_status,
+        })
+
+    def _post_dm_typing(self):
+        """Receive typing heartbeat — store in memory, no DB write."""
+        user = self._get_session_user()
+        if not user:
+            return self._send_json({'ok': False}, 401)
+        fields = urllib.parse.parse_qs(self._read_body().decode('utf-8', errors='replace'))
+        other  = fields.get('other', [''])[0].strip()
+        if other:
+            _set_typing(user['username'], other)
+        return self._send_json({'ok': True})
+
     def _get_messages(self):
         user = self._get_session_user()
         if not user: return self._redirect('/manage')
@@ -5420,11 +5741,12 @@ class ManageHandler(BaseHTTPRequestHandler):
                                               tab=tab, msg=msg, msg_type=msg_type,
                                               compose_to=compose_to))
 
-    def _get_message_thread(self, msg_id_str: str):
+    def _get_message_thread(self, conv_id_str: str):
         user = self._get_session_user()
         if not user: return self._redirect('/manage')
         role = _user_role(user)
         if role == 'basic': return self._redirect('/manage/dashboard')
+        msg_id_str = conv_id_str  # keep variable name for rest of handler
         if not msg_id_str.isdigit():
             return self._redirect('/manage/messages')
         msg_id = int(msg_id_str)
@@ -5434,9 +5756,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         uname = user['username']
         if not any(m['sender'] == uname or m['recipient'] == uname for m in thread):
             return self._redirect('/manage/messages')
-        for m in thread:
-            if m['recipient'] == uname and not m['read_at']:
-                REGISTRATION_DB.mark_dm_read(m['id'], uname)
+        # Mark entire conversation read in one shot
+        REGISTRATION_DB.mark_dm_read(msg_id, uname)
         qs       = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
         msg_type = qs.get('msg_type', ['info'])[0]
@@ -5566,8 +5887,12 @@ class ManageHandler(BaseHTTPRequestHandler):
                     return self._redirect(f'/manage/messages/{reply_to}?msg=Insufficient+points&msg_type=error')
 
         subject = ('Re: ' + orig['subject']) if not orig['subject'].startswith('Re: ') else orig['subject']
-        msg_id = REGISTRATION_DB.send_dm(uname, recipient, subject, text, reply_to_id=int(reply_to))
-        self._redirect(f'/manage/messages/{msg_id}?msg=Reply+sent&msg_type=success')
+        # Inherit conversation_id from parent so reply stays in same thread
+        conv_id = orig['conversation_id'] if 'conversation_id' in orig.keys() and orig['conversation_id'] else orig['id']
+        REGISTRATION_DB.send_dm(uname, recipient, subject, text,
+                                reply_to_id=int(reply_to), conversation_id=conv_id)
+        # Redirect to the conversation root so URL stays stable
+        self._redirect(f'/manage/messages/{conv_id}?msg=Reply+sent&msg_type=success')
 
     def _post_dm_delete(self):
         user = self._get_session_user()
@@ -5583,6 +5908,29 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.delete_dm_sender(int(msg_id), uname)
         elif msg['recipient'] == uname:
             REGISTRATION_DB.delete_dm_recip(int(msg_id), uname)
+
+    def _post_dm_delete_conversation(self):
+        user = self._get_session_user()
+        if not user: return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        conv_id = fields.get('conversation_id', '').strip()
+        if not conv_id.isdigit():
+            return self._redirect('/manage/messages')
+        uname = user['username']
+        # Verify user is a participant before deleting
+        c = REGISTRATION_DB._conn()
+        is_participant = c.execute(
+            '''SELECT 1 FROM direct_messages
+               WHERE conversation_id=? AND (sender=? OR recipient=?) LIMIT 1''',
+            (int(conv_id), uname, uname)
+        ).fetchone()
+        if not is_participant:
+            return self._redirect('/manage/messages')
+        REGISTRATION_DB.delete_dm_conversation(int(conv_id), uname)
+        REGISTRATION_DB._log(uname, 'dm_delete_conversation', uname,
+                             f'conversation_id={conv_id}')
+        self._redirect('/manage/messages?msg=Conversation+deleted&msg_type=success')
         self._redirect('/manage/messages?msg=Message+deleted&msg_type=success')
 
     def _post_dm_mark_read(self):
@@ -5628,10 +5976,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not user: return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
-        allow = fields.get('allow_dms', '0') == '1'
+        allow       = fields.get('allow_dms',   '0') == '1'
+        show_online = fields.get('show_online', '0') == '1'
         REGISTRATION_DB.dm_toggle_setting(user['id'], allow)
-        msg = 'DMs+enabled' if allow else 'DMs+disabled'
-        self._redirect(f'/manage/profile?msg={msg}&msg_type=success')
+        REGISTRATION_DB._conn().execute(
+            'UPDATE users SET show_online=? WHERE id=?', (1 if show_online else 0, user['id']))
+        REGISTRATION_DB._conn().commit()
+        self._redirect('/manage/profile?msg=Privacy+settings+saved&msg_type=success')
 
     def _post_profile_generate_invite(self):
         user = self._get_session_user()
@@ -5805,7 +6156,6 @@ def start_manage6_server(host6: str, port: int, ssl_ctx=None, label='MANAGE'):
 
 class StatsWebHandler(ManageHandler):
     """Serves the stats page at / and /manage/* when registration is enabled."""
-
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         if path.startswith('/manage'):
@@ -6105,6 +6455,15 @@ _MANAGE_CSS = '''
                                   background:var(--accent); color:#000; border-radius:10px;
                                   padding:1px 6px; font-weight:700; }
   .notif-bell-inactive { opacity:0.35; }
+  @keyframes notif-glow {
+    0%   { filter: drop-shadow(0 0 0px transparent); }
+    20%  { filter: drop-shadow(0 0 6px var(--accent)); }
+    40%  { filter: drop-shadow(0 0 1px transparent); }
+    60%  { filter: drop-shadow(0 0 6px var(--accent)); }
+    80%  { filter: drop-shadow(0 0 1px transparent); }
+    100% { filter: drop-shadow(0 0 0px transparent); }
+  }
+  .notif-glow { animation: notif-glow 1.4s ease-in-out; }
   .notif-dropdown { position:absolute; right:0; top:calc(100% + 8px); width:340px;
                     background:var(--card); border:1px solid var(--border); border-radius:12px;
                     box-shadow:0 8px 32px rgba(0,0,0,0.4); z-index:1000; display:none;
@@ -6135,8 +6494,17 @@ _MANAGE_CSS = '''
                      justify-content:space-between; align-items:flex-start; gap:16px; }
   .notif-page-item.unread { border-left:3px solid var(--accent); }
   .notif-page-meta { font-family:var(--mono); font-size:0.68rem; color:var(--muted); margin-top:4px; }
+  /* ── Themed scrollbars ── */
+  #dm-bubbles { scrollbar-width:thin; scrollbar-color:var(--accent) var(--card2); }
+  #dm-bubbles::-webkit-scrollbar { width:5px; }
+  #dm-bubbles::-webkit-scrollbar-track { background:var(--card2); border-radius:3px; }
+  #dm-bubbles::-webkit-scrollbar-thumb { background:var(--accent); border-radius:3px; }
+  #dm-bubbles::-webkit-scrollbar-thumb:hover { background:var(--text); }
+  .notif-dropdown { scrollbar-width:thin; scrollbar-color:var(--accent) var(--card2); }
+  .notif-dropdown::-webkit-scrollbar { width:4px; }
+  .notif-dropdown::-webkit-scrollbar-track { background:transparent; }
+  .notif-dropdown::-webkit-scrollbar-thumb { background:var(--accent); border-radius:2px; }
 '''
-
 _MANAGE_HEAD = '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6353,7 +6721,38 @@ function copyInvite(btn, path) {
 function toggleNotifDropdown(e) {
   e.stopPropagation();
   var d = document.getElementById('notif-dropdown');
-  if (d) d.classList.toggle('open');
+  if (!d) return;
+  var opening = !d.classList.contains('open');
+  d.classList.toggle('open');
+  if (!opening) return;
+  // Fetch fresh notifications every time the dropdown opens
+  var body = d.querySelector('.notif-dropdown-body');
+  if (body) body.innerHTML = '<div class="notif-empty" style="padding:16px;text-align:center;color:var(--muted);font-size:0.82rem">Loading…</div>';
+  fetch('/manage/notifications/preview', {credentials:'same-origin'})
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(data){
+      if (!body) return;
+      if (!data || !data.items || !data.items.length) {
+        body.innerHTML = '<div class="notif-empty">No unread notifications</div>';
+        return;
+      }
+      var html = '';
+      data.items.forEach(function(n){
+        var tname = n.torrent.length >= 40 ? n.torrent + '...' : n.torrent;
+        html += '<button class="notif-item" onclick="readNotif(' + n.id + ',&#39;' + n.url + '&#39;)">'
+              + '<div class="notif-item-type">' + n.icon + ' <strong>' + _esc(n.from) + '</strong> ' + _esc(n.label) + '</div>'
+              + '<div class="notif-item-text"><em>' + _esc(tname) + '</em></div>'
+              + '<div class="notif-item-ts">' + _esc(n.ts) + '</div>'
+              + '</button>';
+      });
+      body.innerHTML = html;
+    })
+    .catch(function(){
+      if (body) body.innerHTML = '<div class="notif-empty">Could not load notifications</div>';
+    });
+}
+function _esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 document.addEventListener('click', function() {
   var d = document.getElementById('notif-dropdown');
@@ -6414,6 +6813,94 @@ function copyMagnet(btn, url) {
     prompt('Copy this magnet link:', url);
   });
 }
+// ── Global background poll: updates nav bell + mail badges every 30s ─────────
+(function(){
+  var _prevNotifs = -1;
+  var _prevMsgs   = -1;
+
+  function _glowEl(el) {
+    if (!el) return;
+    el.classList.remove('notif-glow');
+    // Force reflow so re-adding the class restarts the animation
+    void el.offsetWidth;
+    el.classList.add('notif-glow');
+    el.addEventListener('animationend', function(){ el.classList.remove('notif-glow'); }, {once:true});
+  }
+
+  function _updateBell(count) {
+    var btn = document.getElementById('nav-bell');
+    if (!btn) return;
+    var badge = btn.querySelector('.notif-count');
+    if (count > 0) {
+      btn.classList.remove('notif-bell-inactive');
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'notif-count';
+        btn.appendChild(badge);
+      }
+      badge.textContent = count;
+    } else {
+      btn.classList.add('notif-bell-inactive');
+      if (badge) badge.remove();
+    }
+  }
+
+  function _updateMail(count) {
+    var btn = document.getElementById('nav-mail');
+    if (!btn) return;
+    var badge = btn.querySelector('.notif-count');
+    if (count > 0) {
+      btn.classList.remove('notif-bell-inactive');
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'notif-count';
+        btn.appendChild(badge);
+      }
+      badge.textContent = count;
+    } else {
+      btn.classList.add('notif-bell-inactive');
+      if (badge) badge.remove();
+    }
+  }
+
+  function doPoll() {
+    if (document.visibilityState !== 'visible') return;
+    fetch('/manage/poll', {credentials: 'same-origin'})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d) return;
+        // Glow if count increased since last check
+        if (_prevNotifs >= 0 && d.notifs > _prevNotifs)
+          _glowEl(document.getElementById('nav-bell'));
+        if (_prevMsgs >= 0 && d.msgs > _prevMsgs)
+          _glowEl(document.getElementById('nav-mail'));
+        _updateBell(d.notifs);
+        _updateMail(d.msgs);
+        _prevNotifs = d.notifs;
+        _prevMsgs   = d.msgs;
+      })
+      .catch(function(){});
+  }
+
+  // Seed initial values from what the server rendered so first poll doesn't false-glow
+  document.addEventListener('DOMContentLoaded', function(){
+    var bell = document.getElementById('nav-bell');
+    var mail = document.getElementById('nav-mail');
+    if (bell) {
+      var bc = bell.querySelector('.notif-count');
+      _prevNotifs = bc ? parseInt(bc.textContent, 10) : 0;
+    }
+    if (mail) {
+      var mc = mail.querySelector('.notif-count');
+      _prevMsgs = mc ? parseInt(mc.textContent, 10) : 0;
+    }
+  });
+
+  setInterval(doPoll, 30000);
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState === 'visible') doPoll();
+  });
+})();
 </script>
 </main>
 </body></html>'''
@@ -6478,20 +6965,20 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             dropdown_items = '<div class="notif-empty">No unread notifications</div>'
         bell_html = (
             f'<div class="notif-wrap">'
-            f'<button class="{bell_cls}" onclick="toggleNotifDropdown(event)" aria-label="Notifications">'
+            f'<button id="nav-bell" class="{bell_cls}" onclick="toggleNotifDropdown(event)" aria-label="Notifications">'
             f'🔔{badge_html}</button>'
             f'<div class="notif-dropdown" id="notif-dropdown">'
             f'<div class="notif-dropdown-header">'
             f'<span class="notif-dropdown-title">Notifications</span>'
             f'</div>'
-            f'{dropdown_items}'
+            f'<div class="notif-dropdown-body">{dropdown_items}</div>'
             f'<div class="notif-footer"><a href="/manage/notifications">View all notifications</a></div>'
             f'</div></div>'
         )
         unread_dm = REGISTRATION_DB.get_unread_dm_count(user['username']) if REGISTRATION_DB else 0
         dm_badge  = f'<span class="notif-count">{unread_dm}</span>' if unread_dm else ''
         dm_cls    = 'notif-bell-btn' if unread_dm else 'notif-bell-btn notif-bell-inactive'
-        mail_html = (f'<a href="/manage/messages" class="{dm_cls}" '
+        mail_html = (f'<a id="nav-mail" href="/manage/messages" class="{dm_cls}" '
                      f'style="text-decoration:none" aria-label="Messages">'
                      f'📬{dm_badge}</a>') if role != 'basic' else ''
         nav = (f'<a href="/manage/profile" class="nav-user" style="text-decoration:none">'
@@ -7827,26 +8314,43 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
                     f'{_h(msg)}</div>')
 
     def _row(m, mode='inbox'):
-        is_unread = (not m['read_at']) and mode == 'inbox'
-        other = m['sender'] if mode == 'inbox' else m['recipient']
-        subj  = _h(((m['subject'] if 'subject' in m.keys() else '') or '')[:60] or '(no subject)')
-        ts    = _h(((m['sent_at'] if 'sent_at' in m.keys() else '') or '')[:16].replace('T', ' '))
-        bold  = 'font-weight:700;' if is_unread else ''
-        badge = ('<span style="background:var(--accent);color:#000;font-size:0.65rem;'
-                 'padding:1px 5px;border-radius:3px;margin-left:6px">NEW</span>') if is_unread else ''
-        bcast = ('<span style="background:var(--blue);color:#fff;font-size:0.65rem;'
-                 'padding:1px 5px;border-radius:3px;margin-left:4px">BROADCAST</span>') if (m['is_broadcast'] if 'is_broadcast' in m.keys() else 0) else ''
-        return (f'<tr style="cursor:pointer" onclick="location.href=\'/manage/messages/{m["id"]}\'">'
-                f'<td style="{bold}padding:8px 10px">{_h(other)}{bcast}</td>'
-                f'<td style="{bold}padding:8px 10px">{subj}{badge}</td>'
-                f'<td style="padding:8px 10px;color:var(--muted);white-space:nowrap">{ts}</td>'
+        unread_count = m['unread_count'] if 'unread_count' in m.keys() else 0
+        msg_count    = m['msg_count']    if 'msg_count'    in m.keys() else 1
+        is_unread    = unread_count > 0 and mode == 'inbox'
+        last_ts      = (m['last_activity'] if 'last_activity' in m.keys() else None) or (m['sent_at'] if 'sent_at' in m.keys() else '') or ''
+        other   = m['sender'] if mode == 'inbox' else m['recipient']
+        subj    = _h(((m['subject'] if 'subject' in m.keys() else '') or '')[:60] or '(no subject)')
+        ts      = _h(last_ts[:16].replace('T', ' '))
+        bold    = 'font-weight:700;' if is_unread else ''
+        conv_id = m['conversation_id'] if 'conversation_id' in m.keys() and m['conversation_id'] else m['id']
+        badge   = (f'<span style="background:var(--accent);color:#000;font-size:0.65rem;'
+                   f'padding:1px 5px;border-radius:3px;margin-left:6px">{unread_count} NEW</span>') if is_unread else ''
+        count_badge = (f'<span style="color:var(--muted);font-size:0.75rem;margin-left:6px">[{msg_count}]</span>') if msg_count > 1 else ''
+        bcast   = ('<span style="background:var(--blue);color:#fff;font-size:0.65rem;'
+                   'padding:1px 5px;border-radius:3px;margin-left:4px">BROADCAST</span>') if (m['is_broadcast'] if 'is_broadcast' in m.keys() else 0) else ''
+        trash = (
+            f'<form method="POST" action="/manage/messages/delete-conversation"'
+            f' style="display:inline"'
+            f' data-confirm="Delete this conversation? This cannot be undone.">'
+            f'<input type="hidden" name="conversation_id" value="{conv_id}">'
+            f'<button type="submit" class="btn btn-sm"'
+            f' style="background:transparent;border:none;color:var(--muted);padding:4px 6px;'
+            f'cursor:pointer;font-size:1rem;line-height:1" title="Delete conversation"'
+            f' onmouseover="this.style.color=\'var(--danger)\'" onmouseout="this.style.color=\'var(--muted)\'">'
+            f'&#x1F5D1;</button></form>'
+        )
+        return (f'<tr>'
+                f'<td style="{bold}padding:8px 10px;cursor:pointer" onclick="location.href=\'/manage/messages/{conv_id}\'">{_h(other)}{bcast}</td>'
+                f'<td style="{bold}padding:8px 10px;cursor:pointer" onclick="location.href=\'/manage/messages/{conv_id}\'">{subj}{count_badge}{badge}</td>'
+                f'<td style="padding:8px 10px;color:var(--muted);white-space:nowrap;cursor:pointer" onclick="location.href=\'/manage/messages/{conv_id}\'">{ts}</td>'
+                f'<td style="padding:4px 6px;text-align:right;white-space:nowrap">{trash}</td>'
                 f'</tr>')
 
     inbox_rows = (''.join(_row(m, 'inbox') for m in inbox)
-                  or '<tr><td colspan="3" style="padding:20px;text-align:center;'
+                  or '<tr><td colspan="4" style="padding:20px;text-align:center;'
                      'color:var(--muted)">No messages</td></tr>')
     sent_rows  = (''.join(_row(m, 'sent') for m in sent)
-                  or '<tr><td colspan="3" style="padding:20px;text-align:center;'
+                  or '<tr><td colspan="4" style="padding:20px;text-align:center;'
                      'color:var(--muted)">No sent messages</td></tr>')
 
     def _msg_table(rows, header1):
@@ -7858,6 +8362,7 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
                 f'font-size:0.8rem">Subject</th>'
                 f'<th style="text-align:left;padding:8px 10px;color:var(--muted);'
                 f'font-size:0.8rem">Date</th>'
+                f'<th style="padding:8px 10px"></th>'
                 f'</tr></thead><tbody>{rows}</tbody></table>')
 
     inbox_html = _msg_table(inbox_rows, 'From')
@@ -8036,6 +8541,10 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
         f'</form></div>')
 
     block_html = ''
+    # ── Compute presence now so profile_link dot renders correctly on first load ──
+    other_user_row  = REGISTRATION_DB.get_user(other_party) if (other_party and REGISTRATION_DB) else None
+    presence_status = _online_status(other_user_row)
+    presence_dot    = _online_dot_html(presence_status)
     if other_party:
         other_user = REGISTRATION_DB.get_user(other_party) if REGISTRATION_DB else None
         other_role = _user_role(other_user) if other_user else 'basic'
@@ -8062,15 +8571,165 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
     profile_link = ''
     if other_party:
         opu = _h(other_party)
+        dot_html = (f'<span id="dm-presence-dot" title="{{}}" '
+                    f'style="display:inline-block;width:8px;height:8px;border-radius:50%;'
+                    f'background:{{}};vertical-align:middle;margin-right:4px"></span>')
+        # Set initial color based on current presence
+        init_color = {'online':'var(--green)','recent':'var(--accent)','offline':'var(--border)','hidden':''}.get(presence_status, 'var(--border)')
+        init_tip   = {'online':'Online now','recent':'Recently active','offline':'Offline','hidden':''}.get(presence_status, '')
+        init_dot   = (f'<span id="dm-presence-dot" title="{init_tip}" '
+                      f'style="display:{"none" if presence_status == "hidden" else "inline-block"};'
+                      f'width:8px;height:8px;border-radius:50%;background:{init_color};'
+                      f'vertical-align:middle;margin-right:4px"></span>') if presence_status != 'hidden' else ''
         profile_link = (f' &nbsp;&#183;&nbsp; '
                         f'<a href="/manage/user/{opu}" class="btn btn-sm" '
-                        f'style="text-decoration:none">👤 {opu}\'s Profile</a>')
+                        f'style="text-decoration:none">{init_dot}👤 {opu}\'s Profile</a>')
 
     msg_html = ''
     if msg:
         clr = 'var(--green)' if msg_type == 'success' else 'var(--red)'
         msg_html = (f'<div style="background:{clr}22;border:1px solid {clr};color:{clr};'
                     f'padding:10px 14px;border-radius:6px;margin:12px 0">{_h(msg)}</div>')
+
+    # ── Build JS for live polling ─────────────────────────────────
+    last_id    = thread[-1]['id'] if thread else 0
+    conv_id_js = thread[0]['conversation_id'] if thread and thread[0]['conversation_id'] else (thread[0]['id'] if thread else 0)
+    opu_js     = _h(other_party) if other_party else ''
+    uname_js   = _h(uname)
+    poll_js = f'''<script>
+(function(){{
+  var sinceId = {last_id};
+  var convId  = {conv_id_js};
+  var otherUser = '{opu_js}';
+  var myUser = '{uname_js}';
+  var pollTimer = null;
+  var typingTimer = null;
+  var isTyping = false;
+
+  function _esc(s){{
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }}
+
+  function appendBubble(m){{
+    var wrap = document.getElementById('dm-bubbles');
+    if (!wrap) return;
+    var align  = m.is_mine ? 'flex-end' : 'flex-start';
+    var bg     = m.is_mine ? 'var(--accent)22' : 'var(--card2)';
+    var border = m.is_mine ? 'var(--accent)' : 'var(--border)';
+    var subj   = m.subject ? '<div style="font-size:0.82rem;color:var(--muted);margin-bottom:4px">'+_esc(m.subject)+'</div>' : '';
+    var bcast  = m.is_broadcast ? ' <span style="background:var(--blue);color:#fff;font-size:0.65rem;padding:1px 5px;border-radius:3px">BROADCAST</span>' : '';
+    var html   = '<div style="display:flex;justify-content:'+align+';margin-bottom:12px">'
+               + '<div style="max-width:75%;background:'+bg+';border:1px solid '+border+';border-radius:10px;padding:10px 14px">'
+               + '<div style="font-size:0.75rem;color:var(--muted);margin-bottom:4px">'
+               + '<strong>'+_esc(m.sender)+'</strong> &#x2192; <strong>'+_esc(m.recipient)+'</strong>'+bcast+' &middot; '+_esc(m.sent_at)
+               + '</div>'
+               + subj
+               + '<div style="white-space:pre-wrap;word-break:break-word">'+_esc(m.body)+'</div>'
+               + '</div></div>';
+    wrap.insertAdjacentHTML('beforeend', html);
+    wrap.scrollTop = wrap.scrollHeight;
+  }}
+
+  function updatePresence(status){{
+    var dot = document.getElementById('dm-presence-dot');
+    if (!dot) return;
+    var colors = {{online:'var(--green)', recent:'var(--accent)', offline:'var(--border)'}};
+    var tips   = {{online:'Online now', recent:'Recently active', offline:'Offline'}};
+    if (status === 'hidden'){{ dot.style.display='none'; return; }}
+    dot.style.background = colors[status] || 'var(--border)';
+    dot.title = tips[status] || '';
+    dot.style.display = 'inline-block';
+  }}
+
+  function updateTyping(isTyping){{
+    var el = document.getElementById('dm-typing');
+    if (!el) return;
+    el.style.display = isTyping ? 'block' : 'none';
+  }}
+
+  function doPoll(){{
+    if (document.visibilityState !== 'visible') return;
+    fetch('/manage/messages/poll?since_id=' + sinceId + '&conv_id=' + convId + '&other=' + encodeURIComponent(otherUser))
+      .then(function(r){{ return r.json(); }})
+      .then(function(d){{
+        if (d.messages && d.messages.length){{
+          d.messages.forEach(function(m){{ appendBubble(m); }});
+          sinceId = d.messages[d.messages.length-1].id;
+          // update reply_to hidden input
+          var ri = document.querySelector('input[name="reply_to_id"]');
+          if (ri) ri.value = sinceId;
+        }}
+        updatePresence(d.other_status || 'offline');
+        updateTyping(d.other_typing || false);
+      }})
+      .catch(function(){{}});
+  }}
+
+  function sendTyping(){{
+    var fd = new FormData();
+    fd.append('other', otherUser);
+    fetch('/manage/messages/typing', {{method:'POST', body: new URLSearchParams({{other: otherUser}})}});
+    isTyping = false;
+  }}
+
+  function onKeyDown(){{
+    if (!isTyping){{
+      isTyping = true;
+      sendTyping();
+    }}
+    clearTimeout(typingTimer);
+    typingTimer = setTimeout(function(){{ isTyping=false; }}, 4000);
+  }}
+
+  // Start polling
+  pollTimer = setInterval(doPoll, 4000);
+
+  // Pause/resume on visibility
+  document.addEventListener('visibilitychange', function(){{
+    if (document.visibilityState === 'visible'){{
+      doPoll(); // immediate catch-up
+    }}
+  }});
+
+  // Wire up typing listener when DOM ready
+  document.addEventListener('DOMContentLoaded', function(){{
+    var ta = document.querySelector('textarea[name="body"]');
+    if (ta) {{
+      ta.addEventListener('keydown', onKeyDown);
+      ta.addEventListener('keydown', function(e) {{
+        // Enter sends, Shift+Enter inserts newline
+        if (e.key === 'Enter' && !e.shiftKey) {{
+          e.preventDefault();
+          var form = ta.closest('form');
+          if (form && ta.value.trim()) {{
+            // requestSubmit fires the submit event (triggering CSRF injection)
+            // form.submit() bypasses it — don't use that
+            if (form.requestSubmit) {{
+              form.requestSubmit();
+            }} else {{
+              // Fallback: inject CSRF manually then submit
+              var m = document.cookie.match(/wkcsrf=([^;]+)/);
+              if (m) {{
+                var csrf = form.querySelector('input[name="_csrf"]');
+                if (!csrf) {{
+                  csrf = document.createElement('input');
+                  csrf.type = 'hidden'; csrf.name = '_csrf';
+                  form.appendChild(csrf);
+                }}
+                csrf.value = m[1];
+              }}
+              form.submit();
+            }}
+          }}
+        }}
+      }});
+    }}
+    // Scroll bubbles to bottom on load
+    var wrap = document.getElementById('dm-bubbles');
+    if (wrap) wrap.scrollTop = wrap.scrollHeight;
+  }});
+}})();
+</script>'''
 
     body = (
         f'<div class="page-title">📬 Conversation</div>'
@@ -8079,8 +8738,11 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
         f'{profile_link}'
         f'{block_html}</div>'
         f'{msg_html}'
-        f'<div style="margin-top:16px">{bubbles}</div>'
-        f'{reply_html}')
+        f'<div id="dm-bubbles" style="margin-top:16px;max-height:60vh;overflow-y:auto;scroll-behavior:smooth;padding-right:10px">{bubbles}</div>'
+        f'<div id="dm-typing" style="display:none;color:var(--muted);font-size:0.82rem;'
+        f'font-style:italic;padding:4px 0 8px 4px">{_h(other_party) if other_party else ""} is typing...</div>'
+        f'{reply_html}'
+        f'{poll_js}')
     return _manage_page('📬 Conversation', body, user=viewer)
 
 
@@ -8377,7 +9039,10 @@ def _render_public_profile(viewer, target_user, torrents: list,
   </div>
 
   <div class="card" style="max-width:400px">
-    <div class="card-title">Account</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <div class="card-title" style="margin:0">Account</div>
+      {_online_dot_html(_online_status(target_user), 'Online now' if _online_status(target_user)=='online' else 'Recently active' if _online_status(target_user)=='recent' else '')}
+    </div>
     <table style="min-width:unset">
       {_pub_row('Member Since', joined)}
       {_pub_row('Points', f'<span style="color:{pts_color};font-weight:bold">{pts_val}</span>'
@@ -8625,13 +9290,17 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '</div>'
             '</div>'
             '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
-            '<div style="font-size:0.85rem;color:var(--muted);margin-bottom:8px">Messaging</div>'
-            '<form method="POST" action="/manage/messages/toggle-dms" style="display:flex;align-items:center;gap:10px">'
+            '<div style="font-size:0.85rem;color:var(--muted);margin-bottom:8px">Messaging &amp; Privacy</div>'
+            '<form method="POST" action="/manage/messages/toggle-dms" style="display:flex;flex-direction:column;gap:10px">'
             '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
             '<input type="checkbox" name="allow_dms" value="1" '
             + ('checked' if ('allow_dms' in viewer.keys() and viewer['allow_dms']) else '')
             + '> Allow others to send me DMs</label>'
-            '<button type="submit" class="btn btn-sm">Save</button>'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            '<input type="checkbox" name="show_online" value="1" '
+            + ('checked' if ('show_online' not in viewer.keys() or viewer['show_online']) else '')
+            + '> Show my online status to others</label>'
+            '<div><button type="submit" class="btn btn-sm">Save</button></div>'
             '</form>'
             '</div>'
             '</div></div>'
@@ -9354,7 +10023,6 @@ def _bounty_status_badge(status: str) -> str:
 
 def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
     """Render the five-category leaderboard page."""
-
     def _lb_table(rows, cols):
         """cols: list of (header, key, formatter_fn) — _rank and _user are special keys"""
         if not rows:
