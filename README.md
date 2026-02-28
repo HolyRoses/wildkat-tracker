@@ -29,7 +29,7 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Upload safety limits** — request-size, file-count, and per-file caps with partial-success batch handling
 - **Profile and privacy controls** — DM opt-in, online status visibility, bounty alerts, torrent activity linking, optional Gravatar
 - **Followers system** — follow/unfollow members, follower activity notifications, and Most Followed leaderboard category
-- **Torrent peer snapshots** — manual Seeds/Peers refresh from torrent detail pages via configurable external query command with cooldown protection
+- **Torrent peer snapshots** — manual Seeds/Peers refresh from torrent detail pages (3-hour cooldown) plus optional auto-queued refresh after upload with configurable cap
 - **Direct messages** — threaded inbox/sent/compose/blocked flow with optional point cost and daily limits
 - **Comments and notifications** — threaded comments, @mentions, bell dropdown, and full notifications page
 - **Points economy** — earning, spending, transfers, streaks, and ledger-backed accounting

@@ -157,6 +157,7 @@ If peer-query settings are enabled by Super, the torrent Actions card includes *
 - During cooldown, the button remains visible but disabled and shows remaining time.
 - On success, Seeders/Peers/Downloads, Last Peer Update, and Peer Source are updated.
 - On failure or no-data responses, existing stored counts are not overwritten.
+- Optional tracker setting can auto-queue peer refreshes after successful uploads (background, non-blocking).
 
 If there are confidently linked active members in the swarm, a full-width **Members Currently Sharing This Torrent** card appears with member links and last activity times. If no linked members are active, the card is not shown.
 
@@ -496,7 +497,7 @@ Create a new account by specifying username, password, and role (Basic, Standard
 
 Manage the tracker URLs embedded in generated magnet links. Each tracker can be individually enabled or disabled.
 
-The Trackers tab also includes a **Torrent Seeds/Peers Query** card used by manual torrent-page peer refresh.
+The Trackers tab also includes a **Torrent Seeds/Peers Query** card used by manual torrent-page peer refresh and optional upload-triggered background refresh.
 
 It contains:
 
@@ -506,6 +507,8 @@ It contains:
 - **Tracker Query Arguments** — default pattern: `-o json -s -r -H {hash} -t {tracker}`
 - **Retry Attempts** — default `3`
 - **Retry Wait (sec)** — default `2`
+- **Auto-run peer updates on successful uploads** — optional toggle
+- **Auto update cap per upload** — max queued torrents per upload batch (default `5`)
 
 Validation rules:
 
@@ -513,6 +516,7 @@ Validation rules:
 - Arguments must include both placeholders: `{hash}` and `{tracker}`.
 - Arguments must request JSON output.
 - Saving fails if the configured tool path does not exist.
+- Auto-run upload refresh uses a background queue so upload responses return immediately.
 
 ### Settings Tab
 
