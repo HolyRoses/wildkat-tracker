@@ -28,6 +28,7 @@ It focuses on UI operations and behavior. Server deployment and OS-level setup a
 19. [Invite Codes](#19-invite-codes)
 20. [Database Backup and Restore](#20-database-backup-and-restore)
 21. [Passwords](#21-passwords)
+22. [Top-ups and Payments](#22-top-ups-and-payments)
 
 ---
 
@@ -52,7 +53,7 @@ Role promotions flow upward — Basic → Standard → Admin. The superuser acco
 
 ### Logging In
 
-Visit `https://your-tracker-domain/manage`. Enter your username and password and click **Login**. Sessions last 48 hours. If you close the browser the session cookie remains until it expires.
+Visit `https://tracker.example.net/manage`. Enter your username and password and click **Login**. Sessions last 48 hours. If you close the browser the session cookie remains until it expires.
 
 Sessions are HTTPS-only — the cookie cannot be sent over plain HTTP.
 
@@ -371,6 +372,7 @@ Streaks reset if you miss a day. The current streak is shown on your profile and
 | Contributing to a bounty | Variable — you choose how much to add |
 | Sending a direct message | Configurable per-recipient cost (default 5 pts). Exempt for Admin/Super |
 | Sending points to another user | Amount + transfer fee % |
+| Purchasing points (Top-ups) | USD payment amount selected in Top-ups |
 
 ### Point Transfers
 
@@ -454,7 +456,7 @@ Top 3 in each category receive 🥇🥈🥉 medals. All usernames link to public
 
 Accessible to Admin and Super only via the **⚙ Admin Panel** link (visible on the dashboard for admins).
 
-The Admin Panel has ten tabs:
+The Admin Panel has eleven tabs:
 
 ### Torrents Tab
 
@@ -483,6 +485,10 @@ See [Section 20](#20-database-backup-and-restore). Visible to Super only.
 ### Economy Tab
 
 See [Section 18](#18-economy-settings-admin). Visible to Super only.
+
+### Top-ups Tab
+
+See [Section 22](#22-top-ups-and-payments). Visible to Super only.
 
 ### Invites Tab
 
@@ -762,3 +768,56 @@ There is no self-service password reset — contact an admin or superuser. If th
 ### Password Security
 
 Passwords are hashed using PBKDF2-HMAC-SHA256 with 260,000 iterations and a unique random salt per account. Plain-text passwords are never stored or logged.
+
+---
+
+## 22. Top-ups and Payments
+
+Top-ups let eligible users purchase points using enabled payment providers.
+
+### User Flow
+
+Users open `/manage/topups` to:
+
+- Select a fixed USD amount
+- Select a provider (if more than one is enabled)
+- Create an order and continue to provider checkout
+- Return to Wildkat and view updated order status
+
+Order history is shown on the Top-ups page and includes provider, amount, quoted points, status, and timestamps.
+
+### Provider Behavior
+
+- If only one payment provider is enabled, the UI shows that provider as a fixed label.
+- If multiple providers are enabled, a selector is shown.
+- Capture/confirmation can complete via provider return flow or provider webhook flow.
+- Duplicate events are safely ignored; each order can only be credited once.
+
+### Status Lifecycle
+
+| Status | Meaning |
+|--------|---------|
+| created | Order record created |
+| pending | Awaiting provider completion or callback |
+| confirmed | Provider confirmation received |
+| credited | Points posted to balance |
+| refunded | Payment reversed; points deducted |
+| exception | Needs admin review |
+
+### Super/Admin Controls
+
+In **Admin Panel → Top-ups** (Super only), operators configure:
+
+- Global top-up enable/disable
+- Rollout mode (`admin_only` or `all_users`)
+- Coinbase and PayPal enable/disable
+- Sandbox/live credentials for both providers
+- Webhook secrets/IDs and PayPal webhook enforcement mode
+- Pricing model: base rate, fixed amounts, and multiplier bands
+- Timeout and pending-SLA behavior
+
+### Reconciliation and Safety
+
+- Stale orders are reconciled automatically into exception state when they exceed SLA without completion.
+- Refund/reversal webhooks reverse previously credited points.
+- Top-up actions are recorded in event logs and top-up order history for auditability.
