@@ -57,6 +57,7 @@ import subprocess
 import sys
 import threading
 import time
+import queue
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -495,6 +496,7 @@ REGISTRATION_DB    = None   # RegistrationDB instance, set in main()
 OPEN_TRACKER       = False  # mirrors settings[open_tracker]; updated without restart
 SUPER_USER         = ''
 _MANAGE_HTTPS_PORT = 0      # set in main() so /manage routes know the HTTPS port
+PEER_UPDATE_QUEUE  = None   # background queue for async peer snapshot refresh
 
 # ─────────────────────────────────────────────────────────────
 # Bencode decoder  (for .torrent parsing)
@@ -1393,6 +1395,8 @@ class RegistrationDB:
             'peer_query_args':              '-o json -s -r -H {hash} -t {tracker}',
             'peer_query_retries':           '3',
             'peer_query_retry_wait_sec':    '2',
+            'peer_query_auto_on_upload':    '0',
+            'peer_query_auto_upload_cap':   '5',
         }
         for k, v in defaults.items():
             c.execute('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)', (k, v))
@@ -1642,6 +1646,11 @@ class RegistrationDB:
             wait_sec = max(0, min(30, int(settings.get('peer_query_retry_wait_sec', '2') or '2')))
         except Exception:
             wait_sec = 2
+        auto_on_upload = settings.get('peer_query_auto_on_upload', '0') == '1'
+        try:
+            auto_upload_cap = max(1, min(50, int(settings.get('peer_query_auto_upload_cap', '5') or '5')))
+        except Exception:
+            auto_upload_cap = 5
         enabled = settings.get('peer_query_enabled', '0') == '1'
         # Only considered active if fully configured.
         active = bool(
@@ -1656,23 +1665,33 @@ class RegistrationDB:
             'args': args,
             'retries': retries,
             'retry_wait_sec': wait_sec,
+            'auto_on_upload': auto_on_upload,
+            'auto_upload_cap': auto_upload_cap,
             'min_interval_sec': PEER_SCRAPE_MIN_INTERVAL_SECONDS,
         }
 
     def update_torrent_peer_snapshot(self, ih: str, seeds: int, peers: int,
                                      downloaded: int | None, tracker: str, actor: str):
         ih_upper = ih.upper()
-        c = self._conn()
-        c.execute(
-            '''UPDATE torrents
-               SET peer_seeders=?, peer_leechers=?, peer_downloaded=?,
-                   peer_last_updated=?, peer_last_tracker=?
-               WHERE info_hash=?''',
-            (int(seeds), int(peers),
-             (None if downloaded is None else int(downloaded)),
-             self._ts(), tracker[:255], ih_upper)
-        )
-        c.commit()
+        for attempt in range(8):
+            try:
+                c = self._conn()
+                c.execute(
+                    '''UPDATE torrents
+                       SET peer_seeders=?, peer_leechers=?, peer_downloaded=?,
+                           peer_last_updated=?, peer_last_tracker=?
+                       WHERE info_hash=?''',
+                    (int(seeds), int(peers),
+                     (None if downloaded is None else int(downloaded)),
+                     self._ts(), tracker[:255], ih_upper)
+                )
+                c.commit()
+                break
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                raise
         self._log(actor, 'update_peer_stats', ih_upper,
                   f'seeds={int(seeds)} peers={int(peers)}')
 
@@ -3102,7 +3121,7 @@ class RegistrationDB:
     def register_torrent(self, ih: str, name: str, total_size: int,
                          user_id: int, username: str, meta: dict | None = None) -> bool:
         meta = meta or {}
-        for attempt in range(5):
+        for attempt in range(10):
             try:
                 self._conn().execute(
                     'INSERT INTO torrents '
@@ -3121,8 +3140,8 @@ class RegistrationDB:
             except sqlite3.IntegrityError:
                 return False
             except sqlite3.OperationalError as e:
-                if 'locked' in str(e) and attempt < 4:
-                    time.sleep(0.2 * (attempt + 1))
+                if 'locked' in str(e).lower() and attempt < 9:
+                    time.sleep(0.25 * (attempt + 1))
                     continue
                 raise
 
@@ -6010,6 +6029,59 @@ def _run_peer_query(info_hash: str) -> tuple[bool, dict]:
             time.sleep(wait_sec)
     return False, {'error': last_error}
 
+
+def _enqueue_peer_update(info_hash: str, actor: str = 'system', source: str = 'upload') -> bool:
+    """Queue a peer snapshot refresh job for background processing."""
+    global PEER_UPDATE_QUEUE
+    if PEER_UPDATE_QUEUE is None:
+        return False
+    try:
+        PEER_UPDATE_QUEUE.put_nowait((info_hash.upper(), actor, source))
+        return True
+    except Exception:
+        return False
+
+
+def _peer_update_worker():
+    """Background worker that resolves queued peer snapshot jobs."""
+    global PEER_UPDATE_QUEUE
+    while True:
+        job = PEER_UPDATE_QUEUE.get()
+        try:
+            if not job:
+                continue
+            ih, actor, source = job
+            ok, details = _run_peer_query(ih)
+            if not ok:
+                log.debug('PEER queue update failed ih=%s source=%s err=%s',
+                          ih, source, details.get('error', 'unknown'))
+                continue
+            REGISTRATION_DB.update_torrent_peer_snapshot(
+                ih,
+                details['seeds'],
+                details['peers'],
+                details.get('downloaded'),
+                details.get('tracker', ''),
+                actor
+            )
+            log.debug('PEER queue update success ih=%s source=%s seeds=%s peers=%s',
+                      ih, source, details.get('seeds', 0), details.get('peers', 0))
+        except Exception:
+            log.exception('PEER queue worker unexpected error')
+        finally:
+            PEER_UPDATE_QUEUE.task_done()
+
+
+def _start_peer_update_worker():
+    """Initialize queue + one daemon worker for async peer updates."""
+    global PEER_UPDATE_QUEUE
+    if PEER_UPDATE_QUEUE is not None:
+        return
+    PEER_UPDATE_QUEUE = queue.Queue()
+    t = threading.Thread(target=_peer_update_worker, daemon=True, name='peer-update-worker')
+    t.start()
+    log.info('Peer update background worker started')
+
 def _render_profile_sharing_card(target_user) -> str:
     """Full-width profile card listing torrents currently shared by this member."""
     if not target_user:
@@ -6262,6 +6334,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_leaderboard()
         elif path == '/manage/topups':
             self._get_topups()
+        elif path == '/manage/upload':
+            self._redirect('/manage/dashboard')
         elif path == '/manage/topups/paypal/return':
             self._get_topups_paypal_return()
         elif path == '/manage/topups/paypal/cancel':
@@ -6641,6 +6715,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         skipped_too_large = 0
         skipped_invalid   = 0
         skipped_over_max_files = 0
+        skipped_db_locked = 0
         for idx, (fname, file_data) in enumerate(file_list):
             if idx >= max_files:
                 skipped_over_max_files += 1
@@ -6653,7 +6728,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             except Exception:
                 skipped_invalid += 1
                 continue
-            ok = REGISTRATION_DB.register_torrent(ih, name, total_size, user['id'], user['username'], meta=meta)
+            try:
+                ok = REGISTRATION_DB.register_torrent(ih, name, total_size, user['id'], user['username'], meta=meta)
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower():
+                    skipped_db_locked += 1
+                    log.warning('UPLOAD register skipped due DB lock ih=%s user=%s', ih, user['username'])
+                    continue
+                raise
             if ok:
                 log.info('REGISTRATION torrent registered  ih=%s  name=%s  by=%s', ih, name, user['username'])
                 REGISTRATION_DB.award_upload_points(user['id'], name, ih)
@@ -6662,6 +6744,17 @@ class ManageHandler(BaseHTTPRequestHandler):
                 added_with_hash.append((ih, name))
             else:
                 skipped_duplicate += 1
+        auto_peer_queued = 0
+        auto_peer_not_queued = 0
+        peer_cfg = REGISTRATION_DB.get_peer_query_config()
+        if added_with_hash and peer_cfg.get('active') and peer_cfg.get('auto_on_upload'):
+            cap = max(1, int(peer_cfg.get('auto_upload_cap', 5)))
+            for ih, tname in added_with_hash[:cap]:
+                if _enqueue_peer_update(ih, user['username'], 'upload'):
+                    auto_peer_queued += 1
+                else:
+                    auto_peer_not_queued += 1
+                    log.debug('UPLOAD auto peer queue failed ih=%s', ih)
         follower_notifs = 0
         for ih, tname in added_with_hash:
             follower_notifs += REGISTRATION_DB.notify_followers_torrent_upload(
@@ -6678,6 +6771,15 @@ class ManageHandler(BaseHTTPRequestHandler):
             parts.append(f'{skipped_invalid} invalid torrent files skipped')
         if skipped_over_max_files:
             parts.append(f'{skipped_over_max_files} skipped (max files per upload is {max_files})')
+        if skipped_db_locked:
+            parts.append(f'{skipped_db_locked} skipped (temporary database lock)')
+        if auto_peer_queued:
+            parts.append(f'{auto_peer_queued} peer snapshots queued')
+        over_cap = max(0, len(added_with_hash) - max(1, int(peer_cfg.get('auto_upload_cap', 5)))) if (added_with_hash and peer_cfg.get('active') and peer_cfg.get('auto_on_upload')) else 0
+        if over_cap:
+            parts.append(f'{over_cap} peer snapshots deferred (cap)')
+        if auto_peer_not_queued:
+            parts.append(f'{auto_peer_not_queued} peer snapshots queue failed')
         # Include a short preview of registered torrent names when practical.
         if added:
             preview = ', '.join(added[:8])
@@ -6963,6 +7065,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         referer = self.headers.get('Referer', '')
         back = urllib.parse.urlparse(referer).path or '/manage/dashboard'
         if back.startswith('/manage/torrent'): back = '/manage/dashboard'
+        if back == '/manage/upload': back = '/manage/dashboard'
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
@@ -7649,6 +7752,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             tracker = fields.get('peer_query_tracker', '').strip()
             tool = fields.get('peer_query_tool', '').strip()
             args = fields.get('peer_query_args', '').strip()
+            auto_on_upload = '1' if fields.get('peer_query_auto_on_upload') == '1' else '0'
             try:
                 retries = str(max(1, min(10, int(fields.get('peer_query_retries', '3')))))
             except Exception:
@@ -7657,6 +7761,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                 retry_wait = str(max(0, min(30, int(fields.get('peer_query_retry_wait_sec', '2')))))
             except Exception:
                 retry_wait = '2'
+            try:
+                auto_cap = str(max(1, min(50, int(fields.get('peer_query_auto_upload_cap', '5')))))
+            except Exception:
+                auto_cap = '5'
             if tool and not os.path.exists(tool):
                 q = urllib.parse.quote_plus(f'Peer query tool not found: {tool}')
                 return self._redirect(f'/manage/admin?tab=trackers&msg={q}&msg_type=error')
@@ -7673,6 +7781,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.set_setting('peer_query_args', args, user['username'])
             REGISTRATION_DB.set_setting('peer_query_retries', retries, user['username'])
             REGISTRATION_DB.set_setting('peer_query_retry_wait_sec', retry_wait, user['username'])
+            REGISTRATION_DB.set_setting('peer_query_auto_on_upload', auto_on_upload, user['username'])
+            REGISTRATION_DB.set_setting('peer_query_auto_upload_cap', auto_cap, user['username'])
             return self._redirect('/manage/admin?tab=trackers&msg=Peer+query+settings+saved&msg_type=success')
         elif form_id == 'auto_promote':
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
@@ -11337,6 +11447,8 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _peer_args = _h(settings.get('peer_query_args', '-o json -s -r -H {hash} -t {tracker}'))
     _peer_retries = _h(settings.get('peer_query_retries', '3'))
     _peer_wait = _h(settings.get('peer_query_retry_wait_sec', '2'))
+    _peer_auto_upload = settings.get('peer_query_auto_on_upload', '0') == '1'
+    _peer_auto_cap = _h(settings.get('peer_query_auto_upload_cap', '5'))
     _peer_disabled_attr = '' if is_super else 'disabled'
     _peer_save_cta = ('<button type="submit" class="btn btn-primary">Save Peer Query Settings</button>'
                       if is_super else
@@ -11381,7 +11493,15 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             <label>Retry Wait (sec)</label>
             <input type="number" name="peer_query_retry_wait_sec" value="{_peer_wait}" min="0" max="30" {_peer_disabled_attr}>
           </div>
+          <div class="form-group" style="min-width:180px">
+            <label>Auto update cap per upload</label>
+            <input type="number" name="peer_query_auto_upload_cap" value="{_peer_auto_cap}" min="1" max="50" {_peer_disabled_attr}>
+          </div>
         </div>
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+          <input type="checkbox" name="peer_query_auto_on_upload" value="1" {'checked' if _peer_auto_upload else ''} {_peer_disabled_attr}>
+          Auto-run peer updates on successful uploads (up to cap)
+        </label>
         <div style="font-size:0.8rem;color:var(--muted);margin:6px 0 14px 0">
           Saving fails if the tool path does not exist. Enabling requires all fields plus both placeholders: {{hash}}, {{tracker}}.
         </div>
@@ -13861,6 +13981,7 @@ def main():
         SUPER_USER        = args.super_user
         REGISTRATION_DB   = RegistrationDB(args.db)
         _init_csrf_secret(REGISTRATION_DB)
+        _start_peer_update_worker()
         OPEN_TRACKER = REGISTRATION_DB.get_setting('open_tracker') == '1'
         REWARD_ENABLED = REGISTRATION_DB.get_setting('reward_enabled') == '1'
         try:
