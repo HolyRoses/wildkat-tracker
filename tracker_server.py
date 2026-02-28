@@ -48,10 +48,12 @@ import logging
 import os
 import re
 import random
+import shlex
 import socket
 import ssl
 import string
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -103,6 +105,7 @@ DEFAULT_HTTPS_PORT  = None   # disabled unless cert+key supplied
 DEFAULT_UDP_PORT    = 6969
 DEFAULT_INTERVAL    = 1800   # seconds
 DEFAULT_MIN_INTERVAL = 60
+PEER_SCRAPE_MIN_INTERVAL_SECONDS = 3 * 60 * 60
 PEER_TTL            = 3600   # seconds before a peer is purged
 MAX_PEERS_PER_REPLY  = 200
 MAX_SCRAPE_HASHES    = 5      # max info_hashes per scrape request
@@ -990,6 +993,16 @@ class RegistrationDB:
             c.execute('ALTER TABLE torrents ADD COLUMN is_multifile INTEGER NOT NULL DEFAULT 0')
         if 'files_json' not in cols:
             c.execute("ALTER TABLE torrents ADD COLUMN files_json TEXT NOT NULL DEFAULT '[]'")
+        if 'peer_seeders' not in cols:
+            c.execute('ALTER TABLE torrents ADD COLUMN peer_seeders INTEGER')
+        if 'peer_leechers' not in cols:
+            c.execute('ALTER TABLE torrents ADD COLUMN peer_leechers INTEGER')
+        if 'peer_downloaded' not in cols:
+            c.execute('ALTER TABLE torrents ADD COLUMN peer_downloaded INTEGER')
+        if 'peer_last_updated' not in cols:
+            c.execute('ALTER TABLE torrents ADD COLUMN peer_last_updated TEXT')
+        if 'peer_last_tracker' not in cols:
+            c.execute('ALTER TABLE torrents ADD COLUMN peer_last_tracker TEXT')
         ucols = [r[1] for r in c.execute('PRAGMA table_info(users)').fetchall()]
         if 'login_count' not in ucols:
             c.execute('ALTER TABLE users ADD COLUMN login_count INTEGER NOT NULL DEFAULT 0')
@@ -1373,6 +1386,13 @@ class RegistrationDB:
             'topup_base_rate_pts_per_usd':  '200',
             'topup_fixed_amounts_json':     '[5,10,25,50,100]',
             'topup_multiplier_bands_json':  '[{"min_usd":5,"multiplier_bp":10000},{"min_usd":10,"multiplier_bp":12500},{"min_usd":25,"multiplier_bp":14000},{"min_usd":50,"multiplier_bp":15500},{"min_usd":100,"multiplier_bp":17500}]',
+            # ── Torrent peer scrape (manual refresh) ─────────
+            'peer_query_enabled':           '0',
+            'peer_query_tracker':           'http://tracker.opentrackr.org:1337/announce',
+            'peer_query_tool':              '/opt/tracker/tracker_query.py',
+            'peer_query_args':              '-o json -s -r -H {hash} -t {tracker}',
+            'peer_query_retries':           '3',
+            'peer_query_retry_wait_sec':    '2',
         }
         for k, v in defaults.items():
             c.execute('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)', (k, v))
@@ -1608,6 +1628,53 @@ class RegistrationDB:
     def get_all_settings(self) -> dict:
         rows = self._conn().execute('SELECT key,value FROM settings').fetchall()
         return {r[0]: r[1] for r in rows}
+
+    def get_peer_query_config(self) -> dict:
+        settings = self.get_all_settings()
+        tracker = (settings.get('peer_query_tracker', '') or '').strip()
+        tool = (settings.get('peer_query_tool', '') or '').strip()
+        args = (settings.get('peer_query_args', '') or '').strip()
+        try:
+            retries = max(1, min(10, int(settings.get('peer_query_retries', '3') or '3')))
+        except Exception:
+            retries = 3
+        try:
+            wait_sec = max(0, min(30, int(settings.get('peer_query_retry_wait_sec', '2') or '2')))
+        except Exception:
+            wait_sec = 2
+        enabled = settings.get('peer_query_enabled', '0') == '1'
+        # Only considered active if fully configured.
+        active = bool(
+            enabled and tracker and tool and args
+            and ('{hash}' in args) and ('{tracker}' in args)
+        )
+        return {
+            'enabled': enabled,
+            'active': active,
+            'tracker': tracker,
+            'tool': tool,
+            'args': args,
+            'retries': retries,
+            'retry_wait_sec': wait_sec,
+            'min_interval_sec': PEER_SCRAPE_MIN_INTERVAL_SECONDS,
+        }
+
+    def update_torrent_peer_snapshot(self, ih: str, seeds: int, peers: int,
+                                     downloaded: int | None, tracker: str, actor: str):
+        ih_upper = ih.upper()
+        c = self._conn()
+        c.execute(
+            '''UPDATE torrents
+               SET peer_seeders=?, peer_leechers=?, peer_downloaded=?,
+                   peer_last_updated=?, peer_last_tracker=?
+               WHERE info_hash=?''',
+            (int(seeds), int(peers),
+             (None if downloaded is None else int(downloaded)),
+             self._ts(), tracker[:255], ih_upper)
+        )
+        c.commit()
+        self._log(actor, 'update_peer_stats', ih_upper,
+                  f'seeds={int(seeds)} peers={int(peers)}')
 
     # ── Top-up system ────────────────────────────────────────
 
@@ -5825,6 +5892,124 @@ def _linked_active_torrents_for_username(username: str) -> list[dict]:
         })
     return sorted(out, key=lambda x: x['last_seen'], reverse=True)
 
+
+def _parse_iso_ts(ts: str) -> datetime.datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def _peer_refresh_remaining_seconds(torrent_row) -> int:
+    """Cooldown based on last successful peer snapshot update."""
+    if not torrent_row:
+        return 0
+    last = torrent_row['peer_last_updated'] if 'peer_last_updated' in torrent_row.keys() else None
+    dt = _parse_iso_ts(last or '')
+    if not dt:
+        return 0
+    elapsed = (datetime.datetime.now() - dt).total_seconds()
+    return max(0, int(PEER_SCRAPE_MIN_INTERVAL_SECONDS - elapsed))
+
+
+def _extract_peer_counts_from_query_json(payload: dict, info_hash: str) -> tuple[bool, dict]:
+    """
+    Return (ok, data).
+    On success data: {'seeds': int, 'peers': int, 'downloaded': int|None}.
+    """
+    if not isinstance(payload, dict):
+        return False, {'error': 'Query output was not a JSON object.'}
+    torrents = payload.get('torrents')
+    if not isinstance(torrents, list) or not torrents:
+        return False, {'error': 'No torrent data returned from query output.'}
+    ih_lower = info_hash.lower()
+    match = None
+    for row in torrents:
+        if not isinstance(row, dict):
+            continue
+        row_ih = str(row.get('info_hash', '')).strip().lower()
+        if row_ih == ih_lower:
+            match = row
+            break
+    if match is None:
+        return False, {'error': 'Query output did not include this torrent hash.'}
+    try:
+        seeds = int(match.get('complete', 0))
+        peers = int(match.get('incomplete', 0))
+    except Exception:
+        return False, {'error': 'Query output had invalid complete/incomplete values.'}
+    try:
+        downloaded = int(match['downloaded']) if ('downloaded' in match and match.get('downloaded') is not None) else None
+    except Exception:
+        downloaded = None
+    return True, {'seeds': max(0, seeds), 'peers': max(0, peers), 'downloaded': downloaded}
+
+
+def _run_peer_query(info_hash: str) -> tuple[bool, dict]:
+    """
+    Run external tracker query command for one hash.
+    Returns (ok, details). Never mutates DB.
+    """
+    if not REGISTRATION_DB:
+        return False, {'error': 'Database unavailable.'}
+    cfg = REGISTRATION_DB.get_peer_query_config()
+    if not cfg.get('active'):
+        return False, {'error': 'Peer query is not enabled/configured.'}
+    tracker = cfg['tracker'].strip()
+    tool = cfg['tool'].strip()
+    args_template = cfg['args'].strip()
+    if not (tracker and tool and args_template):
+        return False, {'error': 'Peer query settings are incomplete.'}
+    if not os.path.exists(tool):
+        return False, {'error': f'Query tool not found: {tool}'}
+    try:
+        arg_tokens = shlex.split(args_template)
+    except Exception as e:
+        return False, {'error': f'Invalid query arguments: {e}'}
+    attempts = max(1, int(cfg.get('retries', 3)))
+    wait_sec = max(0, int(cfg.get('retry_wait_sec', 2)))
+    last_error = 'Query failed.'
+    for attempt in range(1, attempts + 1):
+        cmd = [tool] + [tok.replace('{hash}', info_hash.upper()).replace('{tracker}', tracker) for tok in arg_tokens]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            last_error = f'Query execution failed: {e}'
+            if attempt < attempts and wait_sec > 0:
+                time.sleep(wait_sec)
+            continue
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or '').strip()
+            last_error = 'Query command returned non-zero exit status.'
+            if detail:
+                last_error += f' {detail[:180]}'
+            if attempt < attempts and wait_sec > 0:
+                time.sleep(wait_sec)
+            continue
+        raw = (proc.stdout or '').strip()
+        if not raw:
+            last_error = 'Query command returned empty output.'
+            if attempt < attempts and wait_sec > 0:
+                time.sleep(wait_sec)
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception as e:
+            last_error = f'Query output was not valid JSON: {e}'
+            if attempt < attempts and wait_sec > 0:
+                time.sleep(wait_sec)
+            continue
+        ok_counts, data = _extract_peer_counts_from_query_json(payload, info_hash)
+        if ok_counts:
+            data['tracker'] = tracker
+            return True, data
+        last_error = data.get('error', 'No data in query output.')
+        if attempt < attempts and wait_sec > 0:
+            time.sleep(wait_sec)
+    return False, {'error': last_error}
+
 def _render_profile_sharing_card(target_user) -> str:
     """Full-width profile card listing torrents currently shared by this member."""
     if not target_user:
@@ -6177,6 +6362,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_toggle_comments_lock(True)
         elif path == '/manage/torrent/unlock':
             self._post_toggle_comments_lock(False)
+        elif path == '/manage/torrent/update-peers':
+            self._post_torrent_update_peers()
         elif path == '/manage/password':
             self._post_change_password()
         elif path == '/manage/admin/add-user':
@@ -6730,6 +6917,43 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not t: return self._redirect('/manage/dashboard')
         REGISTRATION_DB.set_comments_locked(ih, lock, user['username'])
         self._redirect(f'/manage/torrent/{ih.lower()}')
+
+    def _post_torrent_update_peers(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        if not ih:
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not t:
+            return self._redirect('/manage/dashboard')
+        cfg = REGISTRATION_DB.get_peer_query_config()
+        if not cfg.get('active'):
+            q = urllib.parse.quote('Peer query is disabled or not fully configured.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        rem = _peer_refresh_remaining_seconds(t)
+        if rem > 0:
+            h = rem // 3600
+            m = (rem % 3600) // 60
+            q = urllib.parse.quote(f'Peer stats can be refreshed again in {h}h {m}m.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        ok, details = _run_peer_query(ih)
+        if not ok:
+            q = urllib.parse.quote('Peer stats update failed: ' + details.get('error', 'unknown error'))
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        REGISTRATION_DB.update_torrent_peer_snapshot(
+            ih,
+            details['seeds'],
+            details['peers'],
+            details.get('downloaded'),
+            details.get('tracker', cfg.get('tracker', '')),
+            user['username']
+        )
+        q = urllib.parse.quote(f'Peer stats updated: seeds={details["seeds"]}, peers={details["peers"]}.')
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
 
     def _get_torrent_detail(self, ih: str):
         user = self._get_session_user()
@@ -7420,6 +7644,36 @@ class ManageHandler(BaseHTTPRequestHandler):
                 except Exception:
                     v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
+        elif form_id == 'peer_query_settings':
+            enabled = '1' if fields.get('peer_query_enabled') == '1' else '0'
+            tracker = fields.get('peer_query_tracker', '').strip()
+            tool = fields.get('peer_query_tool', '').strip()
+            args = fields.get('peer_query_args', '').strip()
+            try:
+                retries = str(max(1, min(10, int(fields.get('peer_query_retries', '3')))))
+            except Exception:
+                retries = '3'
+            try:
+                retry_wait = str(max(0, min(30, int(fields.get('peer_query_retry_wait_sec', '2')))))
+            except Exception:
+                retry_wait = '2'
+            if tool and not os.path.exists(tool):
+                q = urllib.parse.quote_plus(f'Peer query tool not found: {tool}')
+                return self._redirect(f'/manage/admin?tab=trackers&msg={q}&msg_type=error')
+            if enabled == '1':
+                if not (tracker and tool and args):
+                    return self._redirect('/manage/admin?tab=trackers&msg=Fill+all+peer+query+fields+before+enabling.&msg_type=error')
+                if ('{hash}' not in args) or ('{tracker}' not in args):
+                    return self._redirect('/manage/admin?tab=trackers&msg=Query+arguments+must+contain+%7Bhash%7D+and+%7Btracker%7D.&msg_type=error')
+                if 'json' not in args.lower():
+                    return self._redirect('/manage/admin?tab=trackers&msg=Query+arguments+must+request+JSON+output.&msg_type=error')
+            REGISTRATION_DB.set_setting('peer_query_enabled', enabled, user['username'])
+            REGISTRATION_DB.set_setting('peer_query_tracker', tracker, user['username'])
+            REGISTRATION_DB.set_setting('peer_query_tool', tool, user['username'])
+            REGISTRATION_DB.set_setting('peer_query_args', args, user['username'])
+            REGISTRATION_DB.set_setting('peer_query_retries', retries, user['username'])
+            REGISTRATION_DB.set_setting('peer_query_retry_wait_sec', retry_wait, user['username'])
+            return self._redirect('/manage/admin?tab=trackers&msg=Peer+query+settings+saved&msg_type=success')
         elif form_id == 'auto_promote':
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('auto_promote_enabled', val, user['username'])
@@ -11077,6 +11331,64 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     else:
         _autotab_js = ''
 
+    _peer_enabled = settings.get('peer_query_enabled', '0') == '1'
+    _peer_tracker = _h(settings.get('peer_query_tracker', 'http://tracker.opentrackr.org:1337/announce'))
+    _peer_tool = _h(settings.get('peer_query_tool', '/opt/tracker/tracker_query.py'))
+    _peer_args = _h(settings.get('peer_query_args', '-o json -s -r -H {hash} -t {tracker}'))
+    _peer_retries = _h(settings.get('peer_query_retries', '3'))
+    _peer_wait = _h(settings.get('peer_query_retry_wait_sec', '2'))
+    _peer_disabled_attr = '' if is_super else 'disabled'
+    _peer_save_cta = ('<button type="submit" class="btn btn-primary">Save Peer Query Settings</button>'
+                      if is_super else
+                      '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')
+    peer_query_card = f'''
+    <div class="card">
+      <div class="card-title">Torrent Seeds/Peers Query</div>
+      <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+        Configure a command that returns JSON peer stats for a torrent hash. Updates are manual per torrent and
+        allowed once every 3 hours.
+      </p>
+      <form method="POST" action="/manage/admin/save-settings">
+        <input type="hidden" name="form_id" value="peer_query_settings">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+          <input type="checkbox" name="peer_query_enabled" value="1" {'checked' if _peer_enabled else ''} {_peer_disabled_attr}>
+          Enable seeds/peers query updates
+        </label>
+        <div class="form-group">
+          <label>Scrape Input (announce URL)</label>
+          <input type="text" name="peer_query_tracker" value="{_peer_tracker}"
+                 placeholder="http://tracker.opentrackr.org:1337/announce" {_peer_disabled_attr}>
+        </div>
+        <div class="form-group">
+          <label>Tracker Query Tool Path</label>
+          <input type="text" name="peer_query_tool" value="{_peer_tool}"
+                 placeholder="/opt/tracker/tracker_query.py" {_peer_disabled_attr}>
+        </div>
+        <div class="form-group">
+          <label>Tracker Query Arguments</label>
+          <input type="text" name="peer_query_args" value="{_peer_args}"
+                 placeholder="-o json -s -r -H {{hash}} -t {{tracker}}" {_peer_disabled_attr}>
+          <div style="color:var(--muted);font-size:0.8rem;margin-top:6px">
+            Example: -o json -s -r -H {{hash}} -t {{tracker}}
+          </div>
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <div class="form-group" style="min-width:160px">
+            <label>Retry Attempts</label>
+            <input type="number" name="peer_query_retries" value="{_peer_retries}" min="1" max="10" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:160px">
+            <label>Retry Wait (sec)</label>
+            <input type="number" name="peer_query_retry_wait_sec" value="{_peer_wait}" min="0" max="30" {_peer_disabled_attr}>
+          </div>
+        </div>
+        <div style="font-size:0.8rem;color:var(--muted);margin:6px 0 14px 0">
+          Saving fails if the tool path does not exist. Enabling requires all fields plus both placeholders: {{hash}}, {{tracker}}.
+        </div>
+        {_peer_save_cta}
+      </form>
+    </div>'''
+
     body = f'''
   <div class="page-title">Admin Panel</div>
   <div class="page-sub">Manage torrents and users &nbsp;·&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none;font-size:0.85rem">&#10094; Dashboard</a></div>
@@ -11177,6 +11489,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <button type="submit" class="btn btn-primary" style="margin-bottom:1px">Add</button>
       </form>
     </div>
+    {peer_query_card}
   </div>
 
   {'<div class="panel" id="panel-settings">' + settings_html + '</div>' if is_super else ''}
@@ -12124,6 +12437,31 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     priv = 'Yes' if (t['is_private'] if 'is_private' in t.keys() else 0) else 'No'
     mf   = 'Multi-file' if (t['is_multifile'] if 'is_multifile' in t.keys() else 0) else 'Single-file'
     swarm_members = _linked_swarm_members(ih)
+    peer_seeders = t['peer_seeders'] if ('peer_seeders' in t.keys() and t['peer_seeders'] is not None) else None
+    peer_leechers = t['peer_leechers'] if ('peer_leechers' in t.keys() and t['peer_leechers'] is not None) else None
+    peer_downloaded = t['peer_downloaded'] if ('peer_downloaded' in t.keys() and t['peer_downloaded'] is not None) else None
+    peer_last_updated = t['peer_last_updated'] if ('peer_last_updated' in t.keys()) else ''
+    peer_last_tracker = t['peer_last_tracker'] if ('peer_last_tracker' in t.keys() and t['peer_last_tracker']) else ''
+    peer_cfg = REGISTRATION_DB.get_peer_query_config() if REGISTRATION_DB else {'active': False}
+    peer_update_btn = ''
+    if peer_cfg.get('active'):
+        rem = _peer_refresh_remaining_seconds(t)
+        if rem > 0:
+            h = rem // 3600
+            m = (rem % 3600) // 60
+            peer_update_btn = (
+                f'<button type="button" class="btn btn-green" disabled '
+                f'style="opacity:0.95;cursor:not-allowed" '
+                f'title="Available in {h}h {m}m">'
+                f'Refresh Seeds/Peers ({h}h {m}m)</button>'
+            )
+        else:
+            peer_update_btn = (
+                f'<form method="POST" action="/manage/torrent/update-peers" style="display:inline">'
+                f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<button type="submit" class="btn btn-green">Refresh Seeds/Peers</button>'
+                f'</form>'
+            )
 
     # Delete button
     del_btn = ''
@@ -12225,12 +12563,23 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             <td><a href="/manage/user/{t["uploaded_by_username"]}" class="user-link">{t["uploaded_by_username"]}</a></td></tr>
         <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">REGISTERED AT</td>
             <td class="hash">{t["registered_at"][:16].replace("T", " ")}</td></tr>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">SEEDERS</td>
+            <td>{'--' if peer_seeders is None else int(peer_seeders)}</td></tr>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">PEERS</td>
+            <td>{'--' if peer_leechers is None else int(peer_leechers)}</td></tr>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">DOWNLOADS</td>
+            <td>{'--' if peer_downloaded is None else int(peer_downloaded)}</td></tr>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">LAST PEER UPDATE</td>
+            <td class="hash">{(peer_last_updated or '--')[:16].replace("T", " ")}</td></tr>
+        <tr><td style="color:var(--muted);font-size:0.78rem;letter-spacing:0.08em;white-space:nowrap">PEER SOURCE</td>
+            <td class="hash" style="word-break:break-all">{_h(peer_last_tracker) if peer_last_tracker else '--'}</td></tr>
       </table>
     </div>
     <div class="card">
       <div class="card-title">Actions</div>
       <div style="display:flex;flex-direction:column;gap:12px;align-items:flex-start">
         <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet Link</button>
+        {peer_update_btn}
         {del_btn}
         {lock_btn}
         {del_comments_btn}

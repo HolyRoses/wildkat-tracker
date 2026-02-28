@@ -140,10 +140,23 @@ The detail page shows:
 - **Private** — whether the torrent's private flag was set
 - **Registered By** — the user who uploaded it (clickable link to their profile)
 - **Registered At** — date and time of registration
+- **Seeders / Peers / Downloads** — latest stored peer snapshot values
+- **Last Peer Update** — time of the last successful peer snapshot refresh
+- **Peer Source** — announce URL used for the last successful snapshot
 
 Below the info card is the **file list** — every file in the torrent with its exact size.
 
 The **Copy Magnet Link** button builds a magnet URI from the info hash, torrent name, total size, and the active tracker URLs configured in the Admin Panel.
+
+### Refresh Seeds/Peers
+
+If peer-query settings are enabled by Super, the torrent Actions card includes **Refresh Seeds/Peers**.
+
+- The refresh is manual and per-torrent.
+- Cooldown: one successful refresh every 3 hours for the same torrent.
+- During cooldown, the button remains visible but disabled and shows remaining time.
+- On success, Seeders/Peers/Downloads, Last Peer Update, and Peer Source are updated.
+- On failure or no-data responses, existing stored counts are not overwritten.
 
 If there are confidently linked active members in the swarm, a full-width **Members Currently Sharing This Torrent** card appears with member links and last activity times. If no linked members are active, the card is not shown.
 
@@ -482,6 +495,24 @@ Create a new account by specifying username, password, and role (Basic, Standard
 ### Trackers Tab
 
 Manage the tracker URLs embedded in generated magnet links. Each tracker can be individually enabled or disabled.
+
+The Trackers tab also includes a **Torrent Seeds/Peers Query** card used by manual torrent-page peer refresh.
+
+It contains:
+
+- **Enable seeds/peers query updates**
+- **Scrape Input (announce URL)** — example: `http://tracker.opentrackr.org:1337/announce`
+- **Tracker Query Tool Path** — default example: `/opt/tracker/tracker_query.py`
+- **Tracker Query Arguments** — default pattern: `-o json -s -r -H {hash} -t {tracker}`
+- **Retry Attempts** — default `3`
+- **Retry Wait (sec)** — default `2`
+
+Validation rules:
+
+- Enabling fails unless all query fields are filled.
+- Arguments must include both placeholders: `{hash}` and `{tracker}`.
+- Arguments must request JSON output.
+- Saving fails if the configured tool path does not exist.
 
 ### Settings Tab
 
