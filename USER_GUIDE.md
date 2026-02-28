@@ -29,6 +29,7 @@ It focuses on UI operations and behavior. Server deployment and OS-level setup a
 20. [Database Backup and Restore](#20-database-backup-and-restore)
 21. [Passwords](#21-passwords)
 22. [Top-ups and Payments](#22-top-ups-and-payments)
+23. [Followers System](#23-followers-system)
 
 ---
 
@@ -194,6 +195,9 @@ In addition to comment notifications, the bell delivers bounty-related events:
 | ➕ | Someone added points to your bounty |
 | ⏰ | Your bounty expired without being fulfilled |
 | 💰 | Someone fulfilled a bounty using your upload |
+| 👥 | Someone started following you |
+| 📦 | Someone you follow uploaded a torrent |
+| ✅ | Someone you follow fulfilled a bounty |
 
 ---
 
@@ -206,6 +210,7 @@ Your profile shows:
 - Your role badge and status badges (locked, disabled) if applicable
 - **Account Details** — join date, created-by (shows "Invited by username" if you joined via invite), login count, last login, last password change, failed attempts, current **Points** balance (color-coded red if negative), and current **Login Streak** if you are on a streak
 - **Actions card** — Change Password button
+- **Followers link** — quick entry to followers/following page
 - IP Allowlist — if your account has IP-locking enabled
 - **Invite Codes** — your pending and consumed invite codes, and the Purchase Invite Link button if you have enough points
 - All your registered torrents with pagination
@@ -250,6 +255,7 @@ A public profile shows:
 - **Points** balance (color-coded)
 - **Login Streak** (if active)
 - Total torrent count
+- Followers and following counts
 - Their full paginated torrent list
 
 Status behaviour:
@@ -270,6 +276,8 @@ Basic users are redirected to their dashboard if they attempt to view a profile.
 If you are an Admin or Super, a small **⚙ Admin View** link appears on the public profile page that takes you directly to the full administrative view of that user.
 
 A **📬 Send DM** button appears in the profile sub-header for eligible Standard+ viewers when DMs are enabled site-wide and the profile owner has not disabled DMs. Clicking it opens the compose form pre-addressed to that user.
+
+A **Follow** button appears on profile pages for other users. Follow and unfollow actions are instant.
 
 ---
 
@@ -447,6 +455,7 @@ Navigate to **🏆 Leaderboard** in the nav bar (Standard+ only). The leaderboar
 | 🎯 Bounty Hunters | Most bounties successfully fulfilled |
 | 🔥 Login Streaks | Longest current consecutive daily login streak |
 | 💬 Most Chatty | Most comments posted across all torrents |
+| 👥 Most Followed | Most followers across Standard/Admin users |
 
 Top 3 in each category receive 🥇🥈🥉 medals. All usernames link to public profiles. Rankings update in real time.
 
@@ -821,3 +830,44 @@ In **Admin Panel → Top-ups** (Super only), operators configure:
 - Stale orders are reconciled automatically into exception state when they exceed SLA without completion.
 - Refund/reversal webhooks reverse previously credited points.
 - Top-up actions are recorded in event logs and top-up order history for auditability.
+
+---
+
+## 23. Followers System
+
+The followers system lets users subscribe to activity from other members.
+
+### Follow and Unfollow
+
+- On another user's profile, click **Follow** to start following.
+- If already following, the button shows **✅ Following** and changes to **❌ Unfollow** on hover.
+- Clicking unfollow removes the relationship immediately.
+- Self-follow is blocked.
+- Duplicate follow attempts are ignored safely.
+
+### Followers Page
+
+Open `/manage/following` (also linked from your profile/actions area).
+
+The page has two lists:
+
+- **Followers** — users following you
+- **Following** — users you follow
+
+Each row links to the user's profile and includes quick follow/unfollow actions.
+
+### Notifications from Follows
+
+You receive notifications when:
+
+- someone starts following you
+- someone you follow uploads a new torrent
+- someone you follow fulfills a bounty
+
+Notification clicks redirect directly to the related profile, torrent, or bounty page.
+
+### Role Behavior
+
+- Basic users cannot browse arbitrary public profiles.
+- Basic users can still use the followers page and follow-back actions when another member has followed them.
+- Standard/Admin/Super users can follow from profile pages directly.
