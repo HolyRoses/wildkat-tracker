@@ -31,9 +31,10 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Direct messages** — threaded inbox/sent/compose/blocked flow with optional point cost and daily limits
 - **Comments and notifications** — threaded comments, @mentions, bell dropdown, and full notifications page
 - **Points economy** — earning, spending, transfers, streaks, and ledger-backed accounting
+- **Points top-ups** — fixed-amount purchases with provider-based checkout and order tracking
 - **Bounty board** — posting, claiming, confirming, contributing, voting, and payout splitting
 - **Leaderboard** — ranked categories for points, uploads, streaks, and bounty activity
-- **Admin panel** — torrents, users, add user, trackers, settings, database, economy, invites, danger, events
+- **Admin panel** — torrents, users, add user, trackers, settings, database, economy, top-ups, invites, danger, events
 - **Operational controls** — IP allowlists, open-tracker switch, configurable `robots.txt`, database backup/restore
 
 For full operational detail, see [USER_GUIDE.md](USER_GUIDE.md). For deployment and hardening steps, see [INSTALL.md](INSTALL.md).
@@ -44,7 +45,7 @@ For full operational detail, see [USER_GUIDE.md](USER_GUIDE.md). For deployment 
 - Sensitive state changes use POST flows (including comment lock/unlock and profile messaging/privacy toggles)
 - All user content HTML-escaped before output — no XSS surface
 - PBKDF2-HMAC-SHA256 password hashing, 260,000 iterations, unique salt per account
-- Session cookies: `HttpOnly; SameSite=Strict; Secure`
+- Session cookies: `HttpOnly; SameSite=Lax; Secure` (CSRF cookie remains `SameSite=Strict`)
 - All database queries parameterized — no SQL injection surface
 - No shell execution (`os.system`, `subprocess`, `eval`) anywhere in the codebase
 

@@ -33,6 +33,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import hashlib
 import hmac
@@ -55,8 +56,12 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+
+_BENIGN_SOCKET_EXC = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -80,6 +85,13 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
                 raise
             conn.settimeout(None)  # clear — timeout was only needed for the handshake
         return conn, addr
+
+    def handle_error(self, request, client_address):
+        exc_type = sys.exc_info()[0]
+        if exc_type in _BENIGN_SOCKET_EXC:
+            log.debug('WEB connection reset from %s', client_address[0])
+            return
+        super().handle_error(request, client_address)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -735,6 +747,111 @@ def _validate_password(password: str, settings: dict) -> list[str]:
     return errors
 
 
+def _nested_get(obj, path: list[str], default=''):
+    cur = obj
+    for p in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(p)
+    return cur if cur is not None else default
+
+
+def _coinbase_extract_refs(payload: dict) -> dict:
+    """Extract likely Coinbase webhook references for order matching."""
+    refs = {
+        'event_id': str(payload.get('id') or payload.get('event_id') or ''),
+        'event_type': str(payload.get('type') or payload.get('event') or _nested_get(payload, ['event', 'type'], '')),
+        'order_uuid': '',
+        'order_id': '',
+        'checkout_id': '',
+        'charge_id': '',
+        'hosted_url': '',
+    }
+    metadata = {}
+    for path in (
+        ['metadata'],
+        ['data', 'metadata'],
+        ['event', 'metadata'],
+        ['event', 'data', 'metadata'],
+    ):
+        val = _nested_get(payload, path, {})
+        if isinstance(val, dict) and val:
+            metadata = val
+            break
+    refs['order_uuid'] = str(metadata.get('order_uuid') or metadata.get('topup_order_uuid') or '')
+    refs['order_id'] = str(metadata.get('order_id') or '')
+    refs['checkout_id'] = str(
+        _nested_get(payload, ['data', 'code'], '')
+        or _nested_get(payload, ['data', 'checkout_id'], '')
+        or _nested_get(payload, ['event', 'data', 'code'], '')
+        or _nested_get(payload, ['event', 'data', 'checkout_id'], '')
+        or _nested_get(payload, ['event', 'data', 'payment_link', 'id'], '')
+    )
+    refs['charge_id'] = str(
+        _nested_get(payload, ['data', 'id'], '')
+        or _nested_get(payload, ['event', 'data', 'id'], '')
+        or _nested_get(payload, ['data', 'charge_id'], '')
+        or _nested_get(payload, ['event', 'data', 'charge_id'], '')
+    )
+    refs['hosted_url'] = str(
+        _nested_get(payload, ['data', 'hosted_url'], '')
+        or _nested_get(payload, ['event', 'data', 'hosted_url'], '')
+        or _nested_get(payload, ['data', 'url'], '')
+        or _nested_get(payload, ['event', 'data', 'url'], '')
+    )
+    return refs
+
+
+def _verify_coinbase_signature(secret: str, raw_body: bytes, header_value: str) -> bool:
+    """Best-effort verifier supporting plain hex and key=value signature formats."""
+    if not secret:
+        return True
+    if not header_value:
+        return False
+    expected = hmac.new(secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest().lower()
+    hv = header_value.strip().lower()
+    if hmac.compare_digest(expected, hv):
+        return True
+    candidates = []
+    for part in hv.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '=' in part:
+            _, val = part.split('=', 1)
+            candidates.append(val.strip())
+        else:
+            candidates.append(part)
+    for cand in candidates:
+        if hmac.compare_digest(expected, cand):
+            return True
+    return False
+
+
+def _paypal_extract_refs(payload: dict) -> dict:
+    """Extract useful PayPal webhook references for order matching."""
+    refs = {
+        'event_id': str(payload.get('id') or ''),
+        'event_type': str(payload.get('event_type') or payload.get('type') or ''),
+        'order_uuid': '',
+        'order_id': '',
+        'checkout_id': '',
+        'capture_id': '',
+    }
+    resource = payload.get('resource') if isinstance(payload.get('resource'), dict) else {}
+    refs['checkout_id'] = str(resource.get('supplementary_data', {}).get('related_ids', {}).get('order_id', '')
+                              if isinstance(resource.get('supplementary_data'), dict) else '') or str(resource.get('id') or '')
+    refs['capture_id'] = str(resource.get('id') or '')
+    custom_id = str(resource.get('custom_id') or '')
+    if custom_id:
+        # custom_id uses order_uuid in current create flow
+        refs['order_uuid'] = custom_id
+    invoice_id = str(resource.get('invoice_id') or '')
+    if invoice_id.startswith('wk-topup-'):
+        refs['order_uuid'] = invoice_id[len('wk-topup-'):]
+    return refs
+
+
 # ─────────────────────────────────────────────────────────────
 # SQLite database
 # ─────────────────────────────────────────────────────────────
@@ -927,6 +1044,80 @@ class RegistrationDB:
                 created_at    TEXT    NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+        ''')
+        c.commit()
+        # ── Top-up system (migration-safe) ───────────────────
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS topup_orders (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_uuid              TEXT    NOT NULL UNIQUE,
+                user_id                 INTEGER NOT NULL,
+                provider                TEXT    NOT NULL DEFAULT 'coinbase',
+                provider_env            TEXT    NOT NULL DEFAULT 'sandbox',
+                provider_checkout_id    TEXT    NOT NULL DEFAULT '',
+                provider_charge_id      TEXT    NOT NULL DEFAULT '',
+                provider_reference      TEXT    NOT NULL DEFAULT '',
+                status                  TEXT    NOT NULL DEFAULT 'created',
+                status_reason           TEXT    NOT NULL DEFAULT '',
+                status_detail           TEXT    NOT NULL DEFAULT '',
+                amount_usd_cents        INTEGER NOT NULL,
+                currency                TEXT    NOT NULL DEFAULT 'USD',
+                base_rate_pts_per_usd   INTEGER NOT NULL,
+                multiplier_bp           INTEGER NOT NULL,
+                quoted_points           INTEGER NOT NULL,
+                credited_points         INTEGER NOT NULL DEFAULT 0,
+                credits_ledger_id       INTEGER,
+                created_at              TEXT    NOT NULL,
+                updated_at              TEXT    NOT NULL,
+                expires_at              TEXT,
+                confirmed_at            TEXT,
+                credited_at             TEXT,
+                last_webhook_at         TEXT,
+                created_by_admin_id     INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS topup_webhook_events (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider          TEXT    NOT NULL DEFAULT 'coinbase',
+                event_id          TEXT    NOT NULL DEFAULT '',
+                event_type        TEXT    NOT NULL DEFAULT '',
+                signature_valid   INTEGER NOT NULL DEFAULT 0,
+                payload_json      TEXT    NOT NULL DEFAULT '',
+                headers_json      TEXT    NOT NULL DEFAULT '',
+                received_at       TEXT    NOT NULL,
+                processed_at      TEXT,
+                process_status    TEXT    NOT NULL DEFAULT 'received',
+                process_error     TEXT    NOT NULL DEFAULT '',
+                linked_order_id   INTEGER,
+                idempotency_key   TEXT    NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS topup_reconciliation_actions (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id      INTEGER NOT NULL,
+                actor_user_id INTEGER NOT NULL,
+                action        TEXT    NOT NULL,
+                note          TEXT    NOT NULL DEFAULT '',
+                old_status    TEXT    NOT NULL,
+                new_status    TEXT    NOT NULL,
+                created_at    TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_topup_orders_user_created
+              ON topup_orders(user_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_topup_orders_status_created
+              ON topup_orders(status, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_topup_orders_provider_ref
+              ON topup_orders(provider, provider_reference);
+            CREATE INDEX IF NOT EXISTS idx_topup_orders_checkout
+              ON topup_orders(provider_checkout_id);
+            CREATE INDEX IF NOT EXISTS idx_topup_webhook_event_id
+              ON topup_webhook_events(provider, event_id);
+            CREATE INDEX IF NOT EXISTS idx_topup_webhook_order
+              ON topup_webhook_events(linked_order_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_topup_webhook_status
+              ON topup_webhook_events(process_status, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_topup_recon_order_created
+              ON topup_reconciliation_actions(order_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_topup_recon_actor_created
+              ON topup_reconciliation_actions(actor_user_id, id DESC);
         ''')
         c.commit()
         # ── Comments & notifications (migration-safe) ────────
@@ -1134,6 +1325,38 @@ class RegistrationDB:
             'dm_cost':              '5',
             'dm_daily_limit':       '10',
             'gravatar_enabled':     '0',
+            # ── Top-ups (Coinbase-only v1) ───────────────────
+            'topup_enabled':                '0',
+            'topup_rollout_mode':           'admin_only',
+            'topup_provider':               'coinbase',
+            'topup_coinbase_enabled':       '1',
+            'topup_coinbase_env':           'sandbox',
+            'topup_coinbase_api_key':       '',
+            'topup_coinbase_webhook_secret':'',
+            'topup_coinbase_api_key_sandbox': '',
+            'topup_coinbase_api_key_live':    '',
+            'topup_coinbase_webhook_secret_sandbox': '',
+            'topup_coinbase_webhook_secret_live':    '',
+            'topup_coinbase_create_url':    'https://api.commerce.coinbase.com/charges',
+            'topup_provider_request_timeout_sec': '15',
+            'topup_coinbase_request_timeout_sec': '15',
+            'topup_auto_redirect_checkout': '1',
+            'topup_pending_sla_minutes':    '180',
+            'topup_paypal_enabled':         '0',
+            'topup_paypal_webhook_enforce': '1',
+            'topup_paypal_env':             'sandbox',
+            'topup_paypal_client_id':       '',
+            'topup_paypal_client_secret':   '',
+            'topup_paypal_webhook_id':      '',
+            'topup_paypal_client_id_sandbox':     '',
+            'topup_paypal_client_id_live':        '',
+            'topup_paypal_client_secret_sandbox': '',
+            'topup_paypal_client_secret_live':    '',
+            'topup_paypal_webhook_id_sandbox':    '',
+            'topup_paypal_webhook_id_live':       '',
+            'topup_base_rate_pts_per_usd':  '200',
+            'topup_fixed_amounts_json':     '[5,10,25,50,100]',
+            'topup_multiplier_bands_json':  '[{"min_usd":5,"multiplier_bp":10000},{"min_usd":10,"multiplier_bp":12500},{"min_usd":25,"multiplier_bp":14000},{"min_usd":50,"multiplier_bp":15500},{"min_usd":100,"multiplier_bp":17500}]',
         }
         for k, v in defaults.items():
             c.execute('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)', (k, v))
@@ -1369,6 +1592,947 @@ class RegistrationDB:
     def get_all_settings(self) -> dict:
         rows = self._conn().execute('SELECT key,value FROM settings').fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ── Top-up system ────────────────────────────────────────
+
+    def topup_enabled_for_user(self, user) -> bool:
+        if not user:
+            return False
+        if self.get_setting('topup_enabled', '0') != '1':
+            return False
+        rollout = self.get_setting('topup_rollout_mode', 'admin_only')
+        if rollout == 'all_users':
+            return True
+        return bool(user['is_admin'] or user['username'] == SUPER_USER)
+
+    def get_topup_config(self) -> dict:
+        settings = self.get_all_settings()
+        base_rate = int(settings.get('topup_base_rate_pts_per_usd', '200') or '200')
+        base_rate = max(1, min(100000, base_rate))
+        try:
+            fixed_raw = json.loads(settings.get('topup_fixed_amounts_json', '[5,10,25,50,100]'))
+            fixed_amounts = sorted({max(1, min(100000, int(v))) for v in fixed_raw})
+        except Exception:
+            fixed_amounts = [5, 10, 25, 50, 100]
+        try:
+            bands_raw = json.loads(settings.get('topup_multiplier_bands_json', '[]'))
+            bands = []
+            for row in bands_raw:
+                min_usd = max(1, min(100000, int(row.get('min_usd', 1))))
+                bp = max(1000, min(100000, int(row.get('multiplier_bp', 10000))))
+                bands.append({'min_usd': min_usd, 'multiplier_bp': bp})
+            bands.sort(key=lambda x: x['min_usd'])
+        except Exception:
+            bands = []
+        if not bands:
+            bands = [
+                {'min_usd': 5, 'multiplier_bp': 10000},
+                {'min_usd': 10, 'multiplier_bp': 12500},
+                {'min_usd': 25, 'multiplier_bp': 14000},
+                {'min_usd': 50, 'multiplier_bp': 15500},
+                {'min_usd': 100, 'multiplier_bp': 17500},
+            ]
+        env = settings.get('topup_coinbase_env', 'sandbox')
+        if env not in ('sandbox', 'live'):
+            env = 'sandbox'
+        coinbase_enabled = settings.get('topup_coinbase_enabled', '1') == '1'
+        provider = settings.get('topup_provider', 'coinbase') or 'coinbase'
+        try:
+            timeout_raw = (settings.get('topup_provider_request_timeout_sec', '')
+                           or settings.get('topup_coinbase_request_timeout_sec', '15')
+                           or '15')
+            timeout_sec = max(3, min(120, int(timeout_raw)))
+        except Exception:
+            timeout_sec = 15
+        try:
+            pending_sla = max(5, min(10080, int(settings.get('topup_pending_sla_minutes', '180') or '180')))
+        except Exception:
+            pending_sla = 180
+        paypal_env = settings.get('topup_paypal_env', 'sandbox')
+        if paypal_env not in ('sandbox', 'live'):
+            paypal_env = 'sandbox'
+        paypal_enabled = settings.get('topup_paypal_enabled', '0') == '1'
+        paypal_webhook_enforce = settings.get('topup_paypal_webhook_enforce', '1') == '1'
+        coinbase_api_key_sandbox = settings.get('topup_coinbase_api_key_sandbox', '')
+        coinbase_api_key_live = settings.get('topup_coinbase_api_key_live', '')
+        coinbase_webhook_secret_sandbox = settings.get('topup_coinbase_webhook_secret_sandbox', '')
+        coinbase_webhook_secret_live = settings.get('topup_coinbase_webhook_secret_live', '')
+        paypal_client_id_sandbox = settings.get('topup_paypal_client_id_sandbox', '')
+        paypal_client_id_live = settings.get('topup_paypal_client_id_live', '')
+        paypal_client_secret_sandbox = settings.get('topup_paypal_client_secret_sandbox', '')
+        paypal_client_secret_live = settings.get('topup_paypal_client_secret_live', '')
+        paypal_webhook_id_sandbox = settings.get('topup_paypal_webhook_id_sandbox', '')
+        paypal_webhook_id_live = settings.get('topup_paypal_webhook_id_live', '')
+        legacy_coinbase_key = settings.get('topup_coinbase_api_key', '')
+        legacy_coinbase_secret = settings.get('topup_coinbase_webhook_secret', '')
+        legacy_paypal_client_id = settings.get('topup_paypal_client_id', '')
+        legacy_paypal_client_secret = settings.get('topup_paypal_client_secret', '')
+        legacy_paypal_webhook_id = settings.get('topup_paypal_webhook_id', '')
+
+        # Backfill env-specific values from legacy single fields for existing installs.
+        if legacy_coinbase_key and not (coinbase_api_key_sandbox or coinbase_api_key_live):
+            if env == 'live':
+                coinbase_api_key_live = legacy_coinbase_key
+            else:
+                coinbase_api_key_sandbox = legacy_coinbase_key
+        if legacy_coinbase_secret and not (coinbase_webhook_secret_sandbox or coinbase_webhook_secret_live):
+            if env == 'live':
+                coinbase_webhook_secret_live = legacy_coinbase_secret
+            else:
+                coinbase_webhook_secret_sandbox = legacy_coinbase_secret
+        if legacy_paypal_client_id and not (paypal_client_id_sandbox or paypal_client_id_live):
+            if paypal_env == 'live':
+                paypal_client_id_live = legacy_paypal_client_id
+            else:
+                paypal_client_id_sandbox = legacy_paypal_client_id
+        if legacy_paypal_client_secret and not (paypal_client_secret_sandbox or paypal_client_secret_live):
+            if paypal_env == 'live':
+                paypal_client_secret_live = legacy_paypal_client_secret
+            else:
+                paypal_client_secret_sandbox = legacy_paypal_client_secret
+        if legacy_paypal_webhook_id and not (paypal_webhook_id_sandbox or paypal_webhook_id_live):
+            if paypal_env == 'live':
+                paypal_webhook_id_live = legacy_paypal_webhook_id
+            else:
+                paypal_webhook_id_sandbox = legacy_paypal_webhook_id
+
+        # Active credentials are resolved from the selected environment; legacy
+        # single-value keys remain as fallback for existing deployments.
+        coinbase_api_key_active = (
+            coinbase_api_key_sandbox if env == 'sandbox' else coinbase_api_key_live
+        ) or legacy_coinbase_key
+        coinbase_webhook_secret_active = (
+            coinbase_webhook_secret_sandbox if env == 'sandbox' else coinbase_webhook_secret_live
+        ) or legacy_coinbase_secret
+        paypal_client_id_active = (
+            paypal_client_id_sandbox if paypal_env == 'sandbox' else paypal_client_id_live
+        ) or legacy_paypal_client_id
+        paypal_client_secret_active = (
+            paypal_client_secret_sandbox if paypal_env == 'sandbox' else paypal_client_secret_live
+        ) or legacy_paypal_client_secret
+        paypal_webhook_id_active = (
+            paypal_webhook_id_sandbox if paypal_env == 'sandbox' else paypal_webhook_id_live
+        ) or legacy_paypal_webhook_id
+        providers = []
+        if coinbase_enabled:
+            providers.append('coinbase')
+        if paypal_enabled:
+            providers.append('paypal')
+        if not providers:
+            # keep stable behavior when all processors disabled
+            providers = ['coinbase']
+        if provider not in providers:
+            provider = providers[0]
+        return {
+            'enabled': settings.get('topup_enabled', '0') == '1',
+            'rollout_mode': settings.get('topup_rollout_mode', 'admin_only'),
+            'provider': provider,
+            'providers': providers,
+            'coinbase_enabled': coinbase_enabled,
+            'coinbase_env': env,
+            'coinbase_api_key': coinbase_api_key_active,
+            'coinbase_webhook_secret': coinbase_webhook_secret_active,
+            'coinbase_api_key_sandbox': coinbase_api_key_sandbox,
+            'coinbase_api_key_live': coinbase_api_key_live,
+            'coinbase_webhook_secret_sandbox': coinbase_webhook_secret_sandbox,
+            'coinbase_webhook_secret_live': coinbase_webhook_secret_live,
+            'coinbase_create_url': settings.get('topup_coinbase_create_url', 'https://api.commerce.coinbase.com/charges'),
+            'provider_request_timeout_sec': timeout_sec,
+            'coinbase_request_timeout_sec': timeout_sec,
+            'auto_redirect_checkout': settings.get('topup_auto_redirect_checkout', '1') == '1',
+            'pending_sla_minutes': pending_sla,
+            'paypal_enabled': paypal_enabled,
+            'paypal_webhook_enforce': paypal_webhook_enforce,
+            'paypal_env': paypal_env,
+            'paypal_client_id': paypal_client_id_active,
+            'paypal_client_secret': paypal_client_secret_active,
+            'paypal_webhook_id': paypal_webhook_id_active,
+            'paypal_client_id_sandbox': paypal_client_id_sandbox,
+            'paypal_client_id_live': paypal_client_id_live,
+            'paypal_client_secret_sandbox': paypal_client_secret_sandbox,
+            'paypal_client_secret_live': paypal_client_secret_live,
+            'paypal_webhook_id_sandbox': paypal_webhook_id_sandbox,
+            'paypal_webhook_id_live': paypal_webhook_id_live,
+            'base_rate_pts_per_usd': base_rate,
+            'fixed_amounts_usd': fixed_amounts,
+            'multiplier_bands': bands,
+        }
+
+    def quote_topup_points(self, amount_usd: int) -> dict:
+        cfg = self.get_topup_config()
+        amount_usd = max(1, int(amount_usd))
+        amount_cents = amount_usd * 100
+        multiplier_bp = 10000
+        for band in cfg['multiplier_bands']:
+            if amount_usd >= band['min_usd']:
+                multiplier_bp = band['multiplier_bp']
+            else:
+                break
+        # integer math: floor(usd * rate * multiplier)
+        points = (amount_cents * cfg['base_rate_pts_per_usd'] * multiplier_bp) // 1000000
+        return {
+            'amount_usd': amount_usd,
+            'amount_usd_cents': amount_cents,
+            'base_rate_pts_per_usd': cfg['base_rate_pts_per_usd'],
+            'multiplier_bp': multiplier_bp,
+            'quoted_points': int(points),
+            'provider': cfg['provider'],
+            'provider_env': cfg['coinbase_env'],
+        }
+
+    def create_topup_order(self, user_id: int, amount_usd: int, actor: str = '',
+                           provider: str = 'coinbase'):
+        q = self.quote_topup_points(amount_usd)
+        provider = (provider or 'coinbase').strip().lower()
+        if provider not in ('coinbase', 'paypal'):
+            provider = 'coinbase'
+        order_uuid = secrets.token_urlsafe(18)
+        c = self._conn()
+        c.execute(
+            '''INSERT INTO topup_orders (
+                   order_uuid,user_id,provider,provider_env,status,
+                   amount_usd_cents,currency,base_rate_pts_per_usd,multiplier_bp,quoted_points,
+                   created_at,updated_at,created_by_admin_id
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (order_uuid, user_id, provider, q['provider_env'], 'created',
+             q['amount_usd_cents'], 'USD', q['base_rate_pts_per_usd'], q['multiplier_bp'], q['quoted_points'],
+             self._ts(), self._ts(), None)
+        )
+        order_id = c.execute('SELECT last_insert_rowid()').fetchone()[0]
+        c.commit()
+        if actor:
+            self._log(actor, 'topup_order_create', str(order_id),
+                      f'user_id={user_id} amount_usd={amount_usd} quote={q["quoted_points"]}')
+        return self.get_topup_order(order_id)
+
+    def get_topup_order(self, order_id: int):
+        return self._conn().execute(
+            'SELECT * FROM topup_orders WHERE id=?', (order_id,)
+        ).fetchone()
+
+    def get_topup_order_by_uuid(self, order_uuid: str):
+        return self._conn().execute(
+            'SELECT * FROM topup_orders WHERE order_uuid=?', (order_uuid,)
+        ).fetchone()
+
+    def get_topup_order_by_provider_checkout_id(self, checkout_id: str):
+        return self._conn().execute(
+            'SELECT * FROM topup_orders WHERE provider_checkout_id=?',
+            (checkout_id,)
+        ).fetchone()
+
+    def get_topup_order_by_provider_charge_id(self, charge_id: str):
+        return self._conn().execute(
+            'SELECT * FROM topup_orders WHERE provider_charge_id=?',
+            (charge_id,)
+        ).fetchone()
+
+    def get_topup_order_by_provider_reference(self, provider_reference: str):
+        return self._conn().execute(
+            'SELECT * FROM topup_orders WHERE provider_reference=?',
+            (provider_reference,)
+        ).fetchone()
+
+    def set_topup_provider_refs(self, order_id: int, provider_checkout_id: str = '',
+                                provider_charge_id: str = '', provider_reference: str = '',
+                                actor: str = '') -> None:
+        self._conn().execute(
+            '''UPDATE topup_orders
+               SET provider_checkout_id=?,
+                   provider_charge_id=?,
+                   provider_reference=?,
+                   updated_at=?
+               WHERE id=?''',
+            (provider_checkout_id[:255], provider_charge_id[:255], provider_reference[:1000], self._ts(), order_id)
+        )
+        self._conn().commit()
+        if actor:
+            self._log(actor, 'topup_provider_ref_set', str(order_id),
+                      f'checkout_id={provider_checkout_id[:32]} charge_id={provider_charge_id[:32]}')
+
+    def create_coinbase_checkout_for_order(self, order_id: int, user, actor: str = '') -> tuple[bool, dict]:
+        order = self.get_topup_order(order_id)
+        if not order:
+            return False, {'error': 'order_not_found', 'message': 'Order not found.'}
+        cfg = self.get_topup_config()
+        api_key = cfg.get('coinbase_api_key', '')
+        create_url = (cfg.get('coinbase_create_url', '') or '').strip()
+        if not api_key:
+            return False, {'error': 'missing_api_key', 'message': 'Coinbase API key is not configured.'}
+        if not create_url:
+            return False, {'error': 'missing_create_url', 'message': 'Coinbase create URL is not configured.'}
+        amount_usd = f'{order["amount_usd_cents"] / 100:.2f}'
+        payload = {
+            'name': f'Wildkat Points Top-up #{order["id"]}',
+            'description': f'{order["quoted_points"]} points for user @{user["username"]}',
+            'pricing_type': 'fixed_price',
+            'local_price': {'amount': amount_usd, 'currency': 'USD'},
+            'metadata': {
+                'order_uuid': order['order_uuid'],
+                'topup_order_uuid': order['order_uuid'],
+                'order_id': str(order['id']),
+                'user_id': str(order['user_id']),
+                'username': user['username'],
+            },
+        }
+        req_data = json.dumps(payload).encode('utf-8')
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            # Commerce API commonly uses X-CC-Api-Key; keep Authorization too for compatibility.
+            'X-CC-Api-Key': api_key,
+            'Authorization': f'Bearer {api_key}',
+        }
+        req = urllib.request.Request(create_url, data=req_data, headers=headers, method='POST')
+        timeout = cfg.get('provider_request_timeout_sec', cfg.get('coinbase_request_timeout_sec', 15))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode('utf-8', errors='replace')
+                status_code = getattr(resp, 'status', 200)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode('utf-8', errors='replace')
+            return False, {'error': 'provider_http_error', 'status': e.code, 'message': err_body[:500]}
+        except Exception as e:
+            return False, {'error': 'provider_request_error', 'message': str(e)[:500]}
+        try:
+            data = json.loads(body or '{}')
+        except Exception:
+            data = {}
+        root = data.get('data') if isinstance(data.get('data'), dict) else data
+        hosted_url = ''
+        for key in ('hosted_url', 'url', 'checkout_url', 'redirect_url'):
+            val = root.get(key) if isinstance(root, dict) else None
+            if isinstance(val, str) and val.startswith('http'):
+                hosted_url = val
+                break
+        charge_id = ''
+        checkout_id = ''
+        if isinstance(root, dict):
+            charge_id = str(root.get('id') or root.get('charge_id') or '')
+            checkout_id = str(root.get('code') or root.get('checkout_id') or root.get('payment_link_id') or '')
+        if not hosted_url:
+            return False, {'error': 'missing_checkout_url', 'status': status_code, 'message': body[:500]}
+        self.set_topup_provider_refs(order_id, provider_checkout_id=checkout_id,
+                                     provider_charge_id=charge_id,
+                                     provider_reference=hosted_url, actor=actor)
+        self.update_topup_status(order_id, 'pending', actor=actor or 'system',
+                                 reason='awaiting_payment',
+                                 detail='Checkout generated; awaiting Coinbase confirmation')
+        return True, {
+            'checkout_url': hosted_url,
+            'checkout_id': checkout_id,
+            'charge_id': charge_id,
+            'status': status_code,
+        }
+
+    def _paypal_api_base(self, cfg: dict) -> str:
+        return 'https://api-m.paypal.com' if cfg.get('paypal_env') == 'live' else 'https://api-m.sandbox.paypal.com'
+
+    def _paypal_access_token(self, cfg: dict) -> tuple[bool, dict]:
+        client_id = cfg.get('paypal_client_id', '')
+        client_secret = cfg.get('paypal_client_secret', '')
+        if not client_id or not client_secret:
+            return False, {'error': 'missing_paypal_credentials', 'message': 'PayPal client id/secret not configured.'}
+        token_url = self._paypal_api_base(cfg) + '/v1/oauth2/token'
+        creds = f'{client_id}:{client_secret}'.encode('utf-8')
+        auth = base64.b64encode(creds).decode('ascii')
+        data = b'grant_type=client_credentials'
+        headers = {
+            'Accept': 'application/json',
+            'Accept-Language': 'en_US',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Authorization': f'Basic {auth}',
+        }
+        req = urllib.request.Request(token_url, data=data, headers=headers, method='POST')
+        timeout = cfg.get('provider_request_timeout_sec', cfg.get('coinbase_request_timeout_sec', 15))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode('utf-8', errors='replace')
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode('utf-8', errors='replace')
+            return False, {'error': 'paypal_oauth_http_error', 'status': e.code, 'message': err_body[:500]}
+        except Exception as e:
+            return False, {'error': 'paypal_oauth_request_error', 'message': str(e)[:500]}
+        try:
+            payload = json.loads(body or '{}')
+        except Exception:
+            payload = {}
+        token = payload.get('access_token', '')
+        if not token:
+            return False, {'error': 'paypal_oauth_no_token', 'message': body[:500]}
+        return True, {'access_token': token}
+
+    def create_paypal_checkout_for_order(self, order_id: int, user, return_url: str,
+                                         cancel_url: str, actor: str = '') -> tuple[bool, dict]:
+        order = self.get_topup_order(order_id)
+        if not order:
+            return False, {'error': 'order_not_found', 'message': 'Order not found.'}
+        cfg = self.get_topup_config()
+        log.debug('PAYPAL create start order_id=%s order_uuid=%s user_id=%s env=%s actor=%s amount_usd=%.2f',
+                  order['id'], str(order['order_uuid'])[:12], order['user_id'], cfg.get('paypal_env', 'sandbox'),
+                  actor or 'system', order['amount_usd_cents'] / 100.0)
+        ok_tok, tok = self._paypal_access_token(cfg)
+        if not ok_tok:
+            log.warning('PAYPAL create oauth_failed order_id=%s err=%s',
+                        order['id'], tok.get('error') or tok.get('message') or 'unknown')
+            return False, tok
+        api_base = self._paypal_api_base(cfg)
+        create_url = api_base + '/v2/checkout/orders'
+        amount_usd = f'{order["amount_usd_cents"] / 100:.2f}'
+        payload = {
+            'intent': 'CAPTURE',
+            'purchase_units': [{
+                'reference_id': str(order['id']),
+                'custom_id': order['order_uuid'],
+                'invoice_id': f'wk-topup-{order["order_uuid"]}',
+                'description': f'Wildkat Points Top-up ({order["quoted_points"]} pts)',
+                'amount': {'currency_code': 'USD', 'value': amount_usd},
+            }],
+            'application_context': {
+                'brand_name': 'Wildkat Tracker',
+                'user_action': 'PAY_NOW',
+                'return_url': return_url,
+                'cancel_url': cancel_url,
+            },
+        }
+        req_data = json.dumps(payload).encode('utf-8')
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {tok["access_token"]}',
+            'PayPal-Request-Id': f'wk-topup-{order["order_uuid"]}',
+        }
+        req = urllib.request.Request(create_url, data=req_data, headers=headers, method='POST')
+        timeout = cfg.get('provider_request_timeout_sec', cfg.get('coinbase_request_timeout_sec', 15))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode('utf-8', errors='replace')
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode('utf-8', errors='replace')
+            log.warning('PAYPAL create http_error order_id=%s status=%s body=%r',
+                        order['id'], e.code, err_body[:220])
+            return False, {'error': 'paypal_create_http_error', 'status': e.code, 'message': err_body[:500]}
+        except Exception as e:
+            log.warning('PAYPAL create request_error order_id=%s err=%s', order['id'], e)
+            return False, {'error': 'paypal_create_request_error', 'message': str(e)[:500]}
+        try:
+            data = json.loads(body or '{}')
+        except Exception:
+            data = {}
+        paypal_order_id = str(data.get('id') or '')
+        approve_url = ''
+        links = data.get('links') if isinstance(data.get('links'), list) else []
+        for link in links:
+            if isinstance(link, dict) and link.get('rel') == 'approve' and isinstance(link.get('href'), str):
+                approve_url = link['href']
+                break
+        if not paypal_order_id or not approve_url:
+            log.warning('PAYPAL create missing_fields order_id=%s paypal_order_id=%r approve_present=%s body=%r',
+                        order['id'], paypal_order_id[:24], bool(approve_url), body[:220])
+            return False, {'error': 'paypal_create_missing_fields', 'message': body[:500]}
+        log.debug('PAYPAL create ok order_id=%s paypal_order_id=%s approve_url=%s',
+                  order['id'], paypal_order_id[:24], approve_url[:180])
+        self.set_topup_provider_refs(order_id,
+                                     provider_checkout_id=paypal_order_id,
+                                     provider_charge_id='',
+                                     provider_reference=approve_url,
+                                     actor=actor)
+        self.update_topup_status(order_id, 'pending', actor=actor or 'system',
+                                 reason='awaiting_payment',
+                                 detail='PayPal order created; awaiting payer approval/capture')
+        return True, {'checkout_id': paypal_order_id, 'checkout_url': approve_url}
+
+    def capture_paypal_order(self, order_id: int, actor: str = 'system') -> tuple[bool, dict]:
+        order = self.get_topup_order(order_id)
+        if not order:
+            return False, {'error': 'order_not_found', 'message': 'Order not found.'}
+        if order['status'] == 'credited':
+            log.debug('PAYPAL capture skipped order_id=%s reason=already_credited actor=%s',
+                      order_id, actor)
+            return True, {'already_credited': True, 'status': 'CREDITED'}
+        if order['status'] == 'refunded':
+            log.debug('PAYPAL capture skipped order_id=%s reason=already_refunded actor=%s',
+                      order_id, actor)
+            return False, {'error': 'order_refunded', 'message': 'Order already refunded.'}
+        paypal_order_id = order['provider_checkout_id'] or ''
+        if not paypal_order_id:
+            return False, {'error': 'missing_paypal_order_id', 'message': 'No PayPal order ID on top-up order.'}
+        cfg = self.get_topup_config()
+        log.debug('PAYPAL capture start order_id=%s paypal_order_id=%s actor=%s env=%s status=%s',
+                  order['id'], paypal_order_id[:24], actor, cfg.get('paypal_env', 'sandbox'),
+                  order['status'])
+        ok_tok, tok = self._paypal_access_token(cfg)
+        if not ok_tok:
+            log.warning('PAYPAL capture oauth_failed order_id=%s err=%s',
+                        order['id'], tok.get('error') or tok.get('message') or 'unknown')
+            return False, tok
+        capture_url = self._paypal_api_base(cfg) + f'/v2/checkout/orders/{urllib.parse.quote(paypal_order_id)}/capture'
+        req = urllib.request.Request(
+            capture_url,
+            data=b'{}',
+            headers={
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': f'Bearer {tok["access_token"]}',
+                'PayPal-Request-Id': f'wk-topup-capture-{order["order_uuid"]}',
+            },
+            method='POST'
+        )
+        timeout = cfg.get('provider_request_timeout_sec', cfg.get('coinbase_request_timeout_sec', 15))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode('utf-8', errors='replace')
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode('utf-8', errors='replace')
+            log.warning('PAYPAL capture http_error order_id=%s status=%s body=%r',
+                        order['id'], e.code, err_body[:220])
+            return False, {'error': 'paypal_capture_http_error', 'status': e.code, 'message': err_body[:500]}
+        except Exception as e:
+            log.warning('PAYPAL capture request_error order_id=%s err=%s', order['id'], e)
+            return False, {'error': 'paypal_capture_request_error', 'message': str(e)[:500]}
+        try:
+            data = json.loads(body or '{}')
+        except Exception:
+            data = {}
+        status = str(data.get('status') or '')
+        text_blob = json.dumps(data).lower()
+        capture_id = ''
+        pu = data.get('purchase_units') if isinstance(data.get('purchase_units'), list) else []
+        for unit in pu:
+            payments = unit.get('payments') if isinstance(unit, dict) else {}
+            captures = payments.get('captures') if isinstance(payments, dict) else []
+            if captures and isinstance(captures[0], dict):
+                capture_id = str(captures[0].get('id') or '')
+                break
+        if status in ('COMPLETED', 'APPROVED') or '"status":"completed"' in text_blob:
+            log.debug('PAYPAL capture provider_ok order_id=%s paypal_order_id=%s status=%s capture_id=%s',
+                      order['id'], paypal_order_id[:24], status, capture_id[:24])
+            self.set_topup_provider_refs(order_id,
+                                         provider_checkout_id=paypal_order_id,
+                                         provider_charge_id=capture_id or order['provider_charge_id'],
+                                         provider_reference=order['provider_reference'],
+                                         actor=actor)
+            self.update_topup_status(order_id, 'confirmed', actor=actor,
+                                     reason='provider_confirmed', detail='PayPal order captured')
+            ok_credit, msg_credit = self.credit_topup_order(order_id, actor=actor)
+            if not ok_credit:
+                # Webhook may have credited moments before return capture.
+                # Treat that as idempotent success to avoid false user-facing errors.
+                if 'already credited' in (msg_credit or '').lower():
+                    log.debug('PAYPAL capture already_credited order_id=%s status=%s capture_id=%s',
+                              order['id'], status, capture_id[:24])
+                    return True, {'status': status, 'capture_id': capture_id, 'already_credited': True}
+                log.warning('PAYPAL capture credit_failed order_id=%s msg=%s', order['id'], msg_credit)
+                return False, {'error': 'credit_failed', 'message': msg_credit}
+            log.debug('PAYPAL capture credited order_id=%s status=%s capture_id=%s',
+                      order['id'], status, capture_id[:24])
+            return True, {'status': status, 'capture_id': capture_id}
+        log.warning('PAYPAL capture not_completed order_id=%s provider_status=%s body=%r',
+                    order['id'], status, body[:220])
+        return False, {'error': 'paypal_capture_not_completed', 'message': body[:500]}
+
+    def verify_paypal_webhook_signature(self, payload: dict, headers) -> tuple[bool, str]:
+        """Verify PayPal webhook signature using PayPal verify endpoint.
+        Returns (is_valid, detail). Enforce mode controls fail-closed behavior."""
+        cfg = self.get_topup_config()
+        webhook_id = cfg.get('paypal_webhook_id', '')
+        enforce = bool(cfg.get('paypal_webhook_enforce', True))
+        if not webhook_id:
+            if enforce:
+                log.warning('PAYPAL webhook verify failed: webhook_id_not_configured (env=%s enforce=1)',
+                            cfg.get('paypal_env', 'sandbox'))
+                return False, 'webhook_id_not_configured'
+            log.warning('PAYPAL webhook verify bypassed: webhook_id_not_configured (env=%s enforce=0, INSECURE)',
+                        cfg.get('paypal_env', 'sandbox'))
+            return True, 'skipped_no_webhook_id_enforce_off'
+        required = {
+            'transmission_id': headers.get('paypal-transmission-id', ''),
+            'transmission_time': headers.get('paypal-transmission-time', ''),
+            'cert_url': headers.get('paypal-cert-url', ''),
+            'auth_algo': headers.get('paypal-auth-algo', ''),
+            'transmission_sig': headers.get('paypal-transmission-sig', ''),
+        }
+        if not all(required.values()):
+            log.warning('PAYPAL webhook verify missing headers id=%s time=%s algo=%s cert=%s sig=%s',
+                        bool(required['transmission_id']), bool(required['transmission_time']),
+                        bool(required['auth_algo']), bool(required['cert_url']),
+                        bool(required['transmission_sig']))
+            return False, 'missing_signature_headers'
+        ok_tok, tok = self._paypal_access_token(cfg)
+        if not ok_tok:
+            log.warning('PAYPAL webhook verify oauth_failed err=%s', tok.get('error') or tok.get('message') or 'unknown')
+            return False, tok.get('error') or 'oauth_failed'
+        verify_url = self._paypal_api_base(cfg) + '/v1/notifications/verify-webhook-signature'
+        body = {
+            'transmission_id': required['transmission_id'],
+            'transmission_time': required['transmission_time'],
+            'cert_url': required['cert_url'],
+            'auth_algo': required['auth_algo'],
+            'transmission_sig': required['transmission_sig'],
+            'webhook_id': webhook_id,
+            'webhook_event': payload,
+        }
+        req = urllib.request.Request(
+            verify_url,
+            data=json.dumps(body).encode('utf-8'),
+            headers={
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': f'Bearer {tok["access_token"]}',
+            },
+            method='POST'
+        )
+        timeout = cfg.get('provider_request_timeout_sec', cfg.get('coinbase_request_timeout_sec', 15))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode('utf-8', errors='replace')
+        except Exception as e:
+            log.warning('PAYPAL webhook verify request_error err=%s', e)
+            return False, f'verify_request_failed:{str(e)[:120]}'
+        try:
+            data = json.loads(raw or '{}')
+        except Exception:
+            data = {}
+        status = str(data.get('verification_status') or '').upper()
+        log.debug('PAYPAL webhook verify result status=%s webhook_id=%s transmission_id=%s',
+                  status, webhook_id[:20], required['transmission_id'][:20])
+        return (status == 'SUCCESS'), (status or 'unknown')
+
+    def list_topup_orders(self, user_id: int | None = None, status: str = '',
+                          limit: int = 200) -> list:
+        limit = max(1, min(500, int(limit)))
+        if user_id is None:
+            if status:
+                return self._conn().execute(
+                    'SELECT * FROM topup_orders WHERE status=? ORDER BY id DESC LIMIT ?',
+                    (status, limit)
+                ).fetchall()
+            return self._conn().execute(
+                'SELECT * FROM topup_orders ORDER BY id DESC LIMIT ?',
+                (limit,)
+            ).fetchall()
+        if status:
+            return self._conn().execute(
+                'SELECT * FROM topup_orders WHERE user_id=? AND status=? ORDER BY id DESC LIMIT ?',
+                (user_id, status, limit)
+            ).fetchall()
+        return self._conn().execute(
+            'SELECT * FROM topup_orders WHERE user_id=? ORDER BY id DESC LIMIT ?',
+            (user_id, limit)
+        ).fetchall()
+
+    def get_topup_user_sequence(self, user_id: int, order_id: int) -> int:
+        """1-based sequence number of this order within a user's own top-up history."""
+        row = self._conn().execute(
+            'SELECT COUNT(*) FROM topup_orders WHERE user_id=? AND id<=?',
+            (user_id, order_id)
+        ).fetchone()
+        return int(row[0] if row and row[0] is not None else 0)
+
+    def update_topup_status(self, order_id: int, new_status: str, actor: str = '',
+                            reason: str = '', detail: str = '') -> bool:
+        allowed = {'created', 'pending', 'confirmed', 'credited', 'expired', 'failed', 'exception', 'refunded'}
+        if new_status not in allowed:
+            return False
+        old = self.get_topup_order(order_id)
+        if not old:
+            return False
+        old_status = old['status']
+        if old_status == new_status:
+            return False
+        transitions = {
+            'created':   {'pending', 'confirmed', 'failed', 'expired', 'exception'},
+            'pending':   {'confirmed', 'failed', 'expired', 'exception'},
+            'confirmed': {'credited', 'failed', 'expired', 'exception'},
+            'failed':    set(),
+            'expired':   set(),
+            'exception': set(),
+            'credited':  {'refunded'},
+            'refunded':  set(),
+        }
+        if new_status not in transitions.get(old_status, set()):
+            return False
+        c = self._conn()
+        c.execute(
+            'UPDATE topup_orders SET status=?,status_reason=?,status_detail=?,updated_at=? WHERE id=?',
+            (new_status, reason, detail[:400], self._ts(), order_id)
+        )
+        if new_status == 'confirmed':
+            c.execute('UPDATE topup_orders SET confirmed_at=COALESCE(confirmed_at,?) WHERE id=?',
+                      (self._ts(), order_id))
+        c.commit()
+        if actor:
+            self._log(actor, 'topup_status_change', str(order_id),
+                      f'{old["status"]}->{new_status} reason={reason}')
+        return True
+
+    def record_topup_webhook_event(self, provider: str, event_type: str,
+                                   payload_json: str, headers_json: str = '',
+                                   signature_valid: bool = False, event_id: str = '',
+                                   linked_order_id: int | None = None,
+                                   idempotency_key: str = '') -> int:
+        c = self._conn()
+        c.execute(
+            '''INSERT INTO topup_webhook_events (
+                   provider,event_id,event_type,signature_valid,payload_json,headers_json,
+                   received_at,linked_order_id,idempotency_key
+               ) VALUES (?,?,?,?,?,?,?,?,?)''',
+            (provider, event_id[:120], event_type[:120], 1 if signature_valid else 0,
+             payload_json[:50000], headers_json[:50000], self._ts(), linked_order_id, idempotency_key[:200])
+        )
+        event_id_db = c.execute('SELECT last_insert_rowid()').fetchone()[0]
+        c.commit()
+        return event_id_db
+
+    def get_topup_webhook_event(self, provider: str, event_id: str):
+        if not event_id:
+            return None
+        return self._conn().execute(
+            'SELECT * FROM topup_webhook_events WHERE provider=? AND event_id=? ORDER BY id DESC LIMIT 1',
+            (provider, event_id[:120])
+        ).fetchone()
+
+    def mark_topup_webhook_processed(self, webhook_event_id: int, status: str = 'processed',
+                                     error_msg: str = '') -> None:
+        self._conn().execute(
+            'UPDATE topup_webhook_events SET process_status=?,process_error=?,processed_at=? WHERE id=?',
+            (status, error_msg[:400], self._ts(), webhook_event_id)
+        )
+        self._conn().commit()
+
+    def list_topup_webhook_events(self, limit: int = 200) -> list:
+        limit = max(1, min(500, int(limit)))
+        return self._conn().execute(
+            'SELECT * FROM topup_webhook_events ORDER BY id DESC LIMIT ?',
+            (limit,)
+        ).fetchall()
+
+    def add_topup_reconciliation_action(self, order_id: int, actor_user_id: int, action: str,
+                                        old_status: str, new_status: str, note: str = '') -> None:
+        self._conn().execute(
+            '''INSERT INTO topup_reconciliation_actions
+               (order_id,actor_user_id,action,note,old_status,new_status,created_at)
+               VALUES (?,?,?,?,?,?,?)''',
+            (order_id, actor_user_id, action, note[:800], old_status, new_status, self._ts())
+        )
+        self._conn().commit()
+
+    def list_topup_reconciliation_actions(self, order_id: int) -> list:
+        return self._conn().execute(
+            'SELECT * FROM topup_reconciliation_actions WHERE order_id=? ORDER BY id DESC',
+            (order_id,)
+        ).fetchall()
+
+    def credit_topup_order(self, order_id: int, actor: str = 'system') -> tuple[bool, str]:
+        c = self._conn()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            order = c.execute('SELECT * FROM topup_orders WHERE id=?', (order_id,)).fetchone()
+            if not order:
+                c.execute('ROLLBACK')
+                return False, 'Order not found.'
+            if order['status'] == 'credited':
+                c.execute('ROLLBACK')
+                return False, 'Order already credited.'
+            if order['status'] != 'confirmed':
+                c.execute('ROLLBACK')
+                return False, f'Order status {order["status"]} cannot be credited.'
+            user = c.execute('SELECT id,username FROM users WHERE id=?', (order['user_id'],)).fetchone()
+            if not user:
+                c.execute('ROLLBACK')
+                return False, 'User not found.'
+
+            points = int(order['quoted_points'])
+            c.execute('UPDATE users SET points = points + ? WHERE id = ?', (points, order['user_id']))
+            bal_row = c.execute('SELECT points FROM users WHERE id=?', (order['user_id'],)).fetchone()
+            balance = bal_row[0] if bal_row else 0
+            c.execute(
+                'INSERT INTO points_ledger (user_id,delta,balance_after,reason,ref_type,ref_id,created_at)'
+                ' VALUES (?,?,?,?,?,?,?)',
+                (order['user_id'], points, balance,
+                 f'top-up credited (${order["amount_usd_cents"]/100:.2f})',
+                 'topup', str(order_id), self._ts())
+            )
+            ledger_id = c.execute('SELECT last_insert_rowid()').fetchone()[0]
+            now = self._ts()
+            upd = c.execute(
+                '''UPDATE topup_orders
+                   SET status='credited',
+                       status_reason='credited',
+                       status_detail='Credited after confirmed payment',
+                       credited_points=?,
+                       credits_ledger_id=?,
+                       confirmed_at=COALESCE(confirmed_at,?),
+                       credited_at=?,
+                       updated_at=?
+                   WHERE id=? AND status='confirmed' ''',
+                (points, ledger_id, now, now, now, order_id)
+            )
+            if upd.rowcount != 1:
+                c.execute('ROLLBACK')
+                latest = c.execute('SELECT status FROM topup_orders WHERE id=?', (order_id,)).fetchone()
+                if latest and latest['status'] == 'credited':
+                    return False, 'Order already credited.'
+                return False, 'Order state changed during credit.'
+            c.execute('COMMIT')
+        except Exception:
+            try:
+                c.execute('ROLLBACK')
+            except Exception:
+                pass
+            raise
+        self.add_notification(
+            order['user_id'],
+            'topup_credited',
+            'system',
+            f'TOPUP:{order_id}',
+            f'{points} pts awarded for ${order["amount_usd_cents"]/100:.2f}',
+            0
+        )
+        self._log(actor, 'topup_credit', str(order_id),
+                  f'user={user["username"]} points={points}')
+        self.check_auto_promote(order['user_id'])
+        return True, f'Credited {points} points.'
+
+    def refund_topup_order(self, order_id: int, actor: str = 'system',
+                           reason: str = 'provider_refund',
+                           detail: str = '') -> tuple[bool, str]:
+        """Reverse previously credited points for a refunded/reversed payment."""
+        c = self._conn()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            order = c.execute('SELECT * FROM topup_orders WHERE id=?', (order_id,)).fetchone()
+            if not order:
+                c.execute('ROLLBACK')
+                return False, 'Order not found.'
+            if order['status'] == 'refunded':
+                c.execute('ROLLBACK')
+                return False, 'Order already refunded.'
+            if order['status'] != 'credited':
+                c.execute('ROLLBACK')
+                return False, f'Order status {order["status"]} cannot be refunded.'
+            user = c.execute('SELECT id,username FROM users WHERE id=?', (order['user_id'],)).fetchone()
+            if not user:
+                c.execute('ROLLBACK')
+                return False, 'User not found.'
+            points = int(order['credited_points'] or 0 or order['quoted_points'])
+            if points <= 0:
+                c.execute('ROLLBACK')
+                return False, 'No credited points to reverse.'
+
+            c.execute('UPDATE users SET points = points - ? WHERE id = ?', (points, order['user_id']))
+            bal_row = c.execute('SELECT points FROM users WHERE id=?', (order['user_id'],)).fetchone()
+            balance = bal_row[0] if bal_row else 0
+            c.execute(
+                'INSERT INTO points_ledger (user_id,delta,balance_after,reason,ref_type,ref_id,created_at)'
+                ' VALUES (?,?,?,?,?,?,?)',
+                (order['user_id'], -points, balance,
+                 f'top-up refunded (${order["amount_usd_cents"]/100:.2f})',
+                 'topup_refund', str(order_id), self._ts())
+            )
+            now = self._ts()
+            upd = c.execute(
+                '''UPDATE topup_orders
+                   SET status='refunded',
+                       status_reason=?,
+                       status_detail=?,
+                       updated_at=?
+                   WHERE id=? AND status='credited' ''',
+                (reason[:120], (detail or 'Payment refunded by provider')[:400], now, order_id)
+            )
+            if upd.rowcount != 1:
+                c.execute('ROLLBACK')
+                latest = c.execute('SELECT status FROM topup_orders WHERE id=?', (order_id,)).fetchone()
+                if latest and latest['status'] == 'refunded':
+                    return False, 'Order already refunded.'
+                return False, 'Order state changed during refund.'
+            c.execute('COMMIT')
+        except Exception:
+            try:
+                c.execute('ROLLBACK')
+            except Exception:
+                pass
+            raise
+        self.add_notification(
+            order['user_id'],
+            'topup_refunded',
+            'system',
+            f'TOPUP:{order_id}',
+            f'{points} pts reversed due to payment refund (${order["amount_usd_cents"]/100:.2f})',
+            0
+        )
+        if SUPER_USER:
+            super_u = self.get_user(SUPER_USER)
+            if super_u and int(super_u['id']) != int(order['user_id']):
+                self.add_notification(
+                    super_u['id'],
+                    'topup_refunded',
+                    'system',
+                    f'TOPUP:{order_id}',
+                    f'@{user["username"]} refunded (${order["amount_usd_cents"]/100:.2f}); reversed {points} pts',
+                    0
+                )
+        self._log(actor, 'topup_refund', str(order_id),
+                  f'user={user["username"]} points=-{points} reason={reason}')
+        return True, f'Reversed {points} points due to refund.'
+
+    def get_topup_stats(self) -> dict:
+        c = self._conn()
+        def _q(sql, *args):
+            row = c.execute(sql, args).fetchone()
+            return row[0] if row and row[0] is not None else 0
+        credited_orders = _q("SELECT COUNT(*) FROM topup_orders WHERE status='credited'")
+        pending_orders = _q("SELECT COUNT(*) FROM topup_orders WHERE status IN ('created','pending','confirmed')")
+        exception_orders = _q("SELECT COUNT(*) FROM topup_orders WHERE status IN ('failed','expired','exception','refunded')")
+        usd_credited_cents = _q("SELECT SUM(amount_usd_cents) FROM topup_orders WHERE status='credited'")
+        points_credited = _q("SELECT SUM(credited_points) FROM topup_orders WHERE status='credited'")
+        return {
+            'credited_orders': credited_orders,
+            'pending_orders': pending_orders,
+            'exception_orders': exception_orders,
+            'usd_credited_cents': usd_credited_cents,
+            'points_credited': points_credited,
+        }
+
+    def reconcile_stale_topup_orders(self) -> int:
+        """Reconcile stale orders:
+        - created/pending -> exception
+        - confirmed -> retry credit, else exception
+        """
+        cfg = self.get_topup_config()
+        cutoff = (datetime.datetime.now() -
+                  datetime.timedelta(minutes=cfg.get('pending_sla_minutes', 180))).isoformat()
+        rows = self._conn().execute(
+            "SELECT id,status FROM topup_orders WHERE status IN ('created','pending','confirmed') AND created_at < ?",
+            (cutoff,)
+        ).fetchall()
+        count = 0
+        for r in rows:
+            if r['status'] == 'confirmed':
+                try:
+                    ok, msg = self.credit_topup_order(r['id'], actor='system')
+                except Exception as e:
+                    ok, msg = False, f'credit_exception:{e}'
+                if ok:
+                    count += 1
+                    continue
+                if 'already credited' in (msg or '').lower():
+                    continue
+                if self.update_topup_status(
+                    r['id'], 'exception', actor='system',
+                    reason='confirmed_uncredited_timeout',
+                    detail=('Order exceeded pending SLA in confirmed state and auto-credit failed: '
+                            + (msg or 'unknown'))
+                ):
+                    count += 1
+                continue
+            if self.update_topup_status(
+                r['id'], 'exception', actor='system',
+                reason='pending_timeout',
+                detail='Order exceeded pending SLA window; review in admin reconciliation queue'
+            ):
+                count += 1
+        return count
 
     def list_magnet_trackers(self) -> list:
         return self._conn().execute(
@@ -2647,6 +3811,9 @@ class RegistrationDB:
         c.execute('DELETE FROM dm_blocklist')
         c.execute('DELETE FROM ip_allowlist')
         c.execute('DELETE FROM login_history')
+        c.execute('DELETE FROM topup_reconciliation_actions')
+        c.execute('DELETE FROM topup_webhook_events')
+        c.execute('DELETE FROM topup_orders')
         c.execute('DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users)')
         # Reset mutable account state for remaining account(s).
         c.execute(
@@ -4524,6 +5691,14 @@ class ManageHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', '0')
         self.end_headers()
 
+    def _redirect_with_session(self, location: str, session_token: str, code: int = 303):
+        """Redirect while refreshing auth cookies for a newly created session."""
+        self.send_response(code)
+        self._set_session_cookie(session_token)
+        self.send_header('Location', location)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     def _send_html(self, html: str, code: int = 200):
         body = html.encode('utf-8')
         self.send_response(code)
@@ -4607,7 +5782,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         expires = (datetime.datetime.now() + datetime.timedelta(hours=48)).strftime(
             '%a, %d %b %Y %H:%M:%S GMT')
         self.send_header('Set-Cookie',
-            f'wksession={token}; Path=/; HttpOnly; SameSite=Strict; '
+            # Lax allows top-level return navigations from payment providers.
+            f'wksession={token}; Path=/; HttpOnly; SameSite=Lax; '
             f'Expires={expires}; Secure')
         csrf = _csrf_token(token)
         self.send_header('Set-Cookie',
@@ -4719,6 +5895,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_bounty_board()
         elif path == '/manage/leaderboard':
             self._get_leaderboard()
+        elif path == '/manage/topups':
+            self._get_topups()
+        elif path == '/manage/topups/paypal/return':
+            self._get_topups_paypal_return()
+        elif path == '/manage/topups/paypal/cancel':
+            self._get_topups_paypal_cancel()
         elif path.startswith('/manage/bounty/'):
             bid_str = path[len('/manage/bounty/'):]
             if bid_str.isdigit():
@@ -4745,6 +5927,12 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not self._require_https():
             return
         path = urllib.parse.urlparse(self.path).path.rstrip('/')
+        if path == '/coinbase/webhook':
+            self._post_coinbase_webhook()
+            return
+        if path == '/paypal/webhook':
+            self._post_paypal_webhook()
+            return
 
         # Upload body-size guard before CSRF parsing to avoid loading huge bodies into RAM.
         if path == '/manage/upload':
@@ -4779,7 +5967,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         # the CSRF token derived from whichever session token the browser used.
         # Browsers can hold multiple wksession cookies (stale + current); we try
         # all candidates so the valid one matches regardless of order.
-        _no_csrf = ('/manage/login', '/manage/signup', '/manage', '/manage/messages/typing')
+        _no_csrf = ('/manage/login', '/manage/signup', '/manage', '/manage/messages/typing', '/coinbase/webhook', '/paypal/webhook')
         if path not in _no_csrf:
             raw_cookie = self.headers.get('Cookie', '')
             session_candidates = [p.strip()[10:] for p in raw_cookie.split(';')
@@ -4909,6 +6097,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_bounty_comment()
         elif path == '/manage/points/transfer':
             self._post_points_transfer()
+        elif path == '/manage/topup/create':
+            self._post_topup_create()
+        elif path == '/manage/admin/topup/reconcile':
+            self._post_topup_reconcile()
         elif path == '/manage/profile/generate-invite':
             self._post_profile_generate_invite()
         elif path == '/manage/delete-all-torrents-user':
@@ -5267,8 +6459,17 @@ class ManageHandler(BaseHTTPRequestHandler):
             n = REGISTRATION_DB.get_notification(int(nid_str), user['id'])
             if n:
                 REGISTRATION_DB.mark_notification_read(int(nid_str), user['id'])
+                ih = str(n['info_hash'] or '')
+                ih_up = ih.upper()
+                if ih_up.startswith('TOPUP:'):
+                    return self._redirect('/manage/topups')
+                if ih_up.startswith('BOUNTY:'):
+                    bid = ih.split(':', 1)[1] if ':' in ih else ''
+                    if bid.isdigit():
+                        return self._redirect(f'/manage/bounty/{bid}')
+                    return self._redirect('/manage/bounty')
                 return self._redirect(
-                    f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}')
+                    f'/manage/torrent/{ih.lower()}#comment-{n["comment_id"]}')
         self._redirect('/manage/notifications')
 
     def _post_delete_all_comments_global(self):
@@ -5782,6 +6983,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         history   = REGISTRATION_DB.get_login_history(user['id'], 5)
         allowlist = REGISTRATION_DB.get_ip_allowlist(user['id'])
         ledger    = REGISTRATION_DB.get_points_ledger(user['id'], 50)
+        topup_orders = REGISTRATION_DB.list_topup_orders(user_id=user['id'], limit=100)
         bounty_data = REGISTRATION_DB.list_bounties_by_user(user['username'])
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
@@ -5790,8 +6992,95 @@ class ManageHandler(BaseHTTPRequestHandler):
                                             allowlist=allowlist, is_own_profile=True,
                                             page=page, total_pages=total_pages,
                                             total=total, base_url='/manage/profile',
-                                            ledger=ledger, bounty_data=bounty_data,
+                                            ledger=ledger, bounty_data=bounty_data, topup_orders=topup_orders,
                                             msg=msg, msg_type=msg_type))
+
+    def _get_topups(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if not REGISTRATION_DB.topup_enabled_for_user(user):
+            return self._redirect('/manage/profile?msg=Top-ups+are+not+enabled+for+your+account.&msg_type=error')
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        orders = REGISTRATION_DB.list_topup_orders(user_id=user['id'], limit=200)
+        cfg = REGISTRATION_DB.get_topup_config()
+        self._send_html(_render_topups_page(user, orders, cfg, msg=msg, msg_type=msg_type))
+
+    def _build_manage_base_url(self) -> str:
+        host = self.headers.get('Host', '').strip()
+        if not host:
+            host = 'localhost'
+            if _MANAGE_HTTPS_PORT and _MANAGE_HTTPS_PORT != 443:
+                host += f':{_MANAGE_HTTPS_PORT}'
+        return f'https://{host}'
+
+    def _get_topups_paypal_return(self):
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            token = (qs.get('token', [''])[0] or '').strip()
+            payer_id = (qs.get('PayerID', [''])[0] or '').strip()
+            log.debug('PAYPAL return start token=%s payer_id=%s remote_ip=%s',
+                      token[:24], payer_id[:24], self.client_address[0] if self.client_address else '?')
+            if not token:
+                return self._redirect('/manage/topups?msg=Missing+PayPal+token.&msg_type=error')
+            order = REGISTRATION_DB.get_topup_order_by_provider_checkout_id(token)
+            if not order:
+                log.warning('PAYPAL return unknown_token token=%s', token[:24])
+                return self._redirect('/manage/topups?msg=Top-up+order+not+found+for+PayPal+token.&msg_type=error')
+            user = self._get_session_user()
+            log.debug('PAYPAL return linked order_id=%s order_uuid=%s order_user_id=%s order_status=%s session_user=%s',
+                      order['id'], str(order['order_uuid'])[:12], order['user_id'], order['status'],
+                      user['username'] if user else '(none)')
+            if user and int(order['user_id']) != int(user['id']) and not (user['is_admin'] or user['username'] == SUPER_USER):
+                log.warning('PAYPAL return unauthorized order_id=%s session_user=%s', order['id'], user['username'])
+                return self._redirect('/manage/topups?msg=Unauthorized+PayPal+return+context.&msg_type=error')
+            # Build redirect path first; we may need to recreate the owner's session
+            # when browser policy or provider flow drops auth cookies on return.
+            def _return_to_topups(message: str, msg_type: str = 'success'):
+                location = '/manage/topups?msg=' + urllib.parse.quote(message) + f'&msg_type={msg_type}'
+                if user:
+                    return self._redirect(location)
+                owner = REGISTRATION_DB.get_user_by_id(order['user_id'])
+                if owner and not owner['disabled']:
+                    new_token = REGISTRATION_DB.create_session(owner['id'])
+                    return self._redirect_with_session(location, new_token)
+                return self._redirect('/manage')
+
+            if order['status'] == 'credited':
+                log.debug('PAYPAL return already_credited order_id=%s', order['id'])
+                return _return_to_topups('Order already credited.')
+            actor = user['username'] if user else 'paypal_return'
+            ok, info = REGISTRATION_DB.capture_paypal_order(order['id'], actor=actor)
+            if not ok:
+                detail = info.get('message') or info.get('error') or 'PayPal capture failed'
+                log.warning('PAYPAL return capture_failed order_id=%s token=%s detail=%r',
+                            order['id'], token[:24], detail[:180] if isinstance(detail, str) else detail)
+                q = urllib.parse.quote('PayPal return received but capture did not complete: ' + detail)
+                return self._redirect(f'/manage/topups?msg={q}&msg_type=error')
+            msg = 'PayPal payment has been confirmed.'
+            if payer_id:
+                msg += f' PayerID: {payer_id}'
+            log.debug('PAYPAL return success order_id=%s token=%s payer_id=%s', order['id'], token[:24], payer_id[:24])
+            return _return_to_topups(msg)
+        except Exception as e:
+            log.exception('PAYPAL return handler failed token=%r: %s', self.path, e)
+            return self._redirect('/manage/topups?msg=PayPal+return+processing+failed.+Please+check+Top-up+Orders.&msg_type=error')
+
+    def _get_topups_paypal_cancel(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        token = (qs.get('token', [''])[0] or '').strip()
+        if token:
+            order = REGISTRATION_DB.get_topup_order_by_provider_checkout_id(token)
+            if order and int(order['user_id']) == int(user['id']) and order['status'] in ('created', 'pending'):
+                REGISTRATION_DB.update_topup_status(order['id'], 'pending', actor=user['username'],
+                                                    reason='user_cancelled_checkout',
+                                                    detail='User cancelled PayPal checkout; can retry Pay Now link')
+        return self._redirect('/manage/topups?msg=PayPal+checkout+was+cancelled.&msg_type=error')
 
     def _post_tracker_add(self):
         user = self._get_session_user()
@@ -5955,7 +7244,155 @@ class ManageHandler(BaseHTTPRequestHandler):
         elif form_id == 'gravatar_settings':
             val = '1' if fields.get('gravatar_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('gravatar_enabled', val, user['username'])
-        self._redirect('/manage/admin?tab=economy' if form_id in ('points_earn','points_spend','bounty_settings','leaderboard_settings','admin_grant_settings','dm_settings') else '/manage/admin')
+        elif form_id == 'topup_settings':
+            # PayPal webhook verification policy:
+            # enforce=1 -> fail closed and require active env webhook ID when PayPal enabled
+            # enforce=0 -> allow open mode (insecure), still logs warnings on each webhook
+            _pp_enabled = fields.get('topup_paypal_enabled', '')
+            if _pp_enabled not in ('0', '1'):
+                _pp_enabled = '0'
+            _pp_enforce = fields.get('topup_paypal_webhook_enforce', '')
+            if _pp_enforce not in ('0', '1'):
+                _pp_enforce = '1'
+            _pp_env = fields.get('topup_paypal_env', 'sandbox')
+            if _pp_env not in ('sandbox', 'live'):
+                _pp_env = 'sandbox'
+            _pp_wh_sbx = fields.get('topup_paypal_webhook_id_sandbox', '')[:500]
+            _pp_wh_live = fields.get('topup_paypal_webhook_id_live', '')[:500]
+            if _pp_enabled == '1' and _pp_enforce == '1':
+                _active_wh = _pp_wh_sbx if _pp_env == 'sandbox' else _pp_wh_live
+                if not (_active_wh or '').strip():
+                    log.warning('TOPUP settings rejected: paypal enabled without webhook id env=%s actor=%s',
+                                _pp_env, user['username'])
+                    return self._redirect('/manage/admin?tab=topups&msg=PayPal+webhook+ID+is+required+for+the+active+environment+when+PayPal+is+enabled.&msg_type=error')
+
+            enabled = '1' if fields.get('topup_enabled') == '1' else '0'
+            REGISTRATION_DB.set_setting('topup_enabled', enabled, user['username'])
+            rollout = fields.get('topup_rollout_mode', 'admin_only')
+            if rollout not in ('admin_only', 'all_users'):
+                rollout = 'admin_only'
+            REGISTRATION_DB.set_setting('topup_rollout_mode', rollout, user['username'])
+            provider = fields.get('topup_provider', 'coinbase') or 'coinbase'
+            if provider not in ('coinbase', 'paypal'):
+                provider = 'coinbase'
+            coinbase_enabled = fields.get('topup_coinbase_enabled', '')
+            if coinbase_enabled not in ('0', '1'):
+                coinbase_enabled = '1'
+            REGISTRATION_DB.set_setting('topup_coinbase_enabled', coinbase_enabled, user['username'])
+            REGISTRATION_DB.set_setting('topup_provider', provider[:32], user['username'])
+            env = fields.get('topup_coinbase_env', 'sandbox')
+            if env not in ('sandbox', 'live'):
+                env = 'sandbox'
+            REGISTRATION_DB.set_setting('topup_coinbase_env', env, user['username'])
+            cb_key_sandbox = fields.get('topup_coinbase_api_key_sandbox', '')[:500]
+            cb_key_live = fields.get('topup_coinbase_api_key_live', '')[:500]
+            cb_secret_sandbox = fields.get('topup_coinbase_webhook_secret_sandbox', '')[:500]
+            cb_secret_live = fields.get('topup_coinbase_webhook_secret_live', '')[:500]
+            REGISTRATION_DB.set_setting('topup_coinbase_api_key_sandbox', cb_key_sandbox, user['username'])
+            REGISTRATION_DB.set_setting('topup_coinbase_api_key_live', cb_key_live, user['username'])
+            REGISTRATION_DB.set_setting('topup_coinbase_webhook_secret_sandbox', cb_secret_sandbox, user['username'])
+            REGISTRATION_DB.set_setting('topup_coinbase_webhook_secret_live', cb_secret_live, user['username'])
+            # Legacy single-value keys mirror active env value for backward compatibility.
+            REGISTRATION_DB.set_setting('topup_coinbase_api_key',
+                                        cb_key_sandbox if env == 'sandbox' else cb_key_live,
+                                        user['username'])
+            REGISTRATION_DB.set_setting('topup_coinbase_webhook_secret',
+                                        cb_secret_sandbox if env == 'sandbox' else cb_secret_live,
+                                        user['username'])
+            REGISTRATION_DB.set_setting('topup_coinbase_create_url',
+                                        fields.get('topup_coinbase_create_url',
+                                                   'https://api.commerce.coinbase.com/charges')[:500],
+                                        user['username'])
+            try:
+                req_timeout = str(max(3, min(120, int(
+                    fields.get('topup_provider_request_timeout_sec',
+                               fields.get('topup_coinbase_request_timeout_sec', '15'))
+                ))))
+            except Exception:
+                req_timeout = '15'
+            REGISTRATION_DB.set_setting('topup_provider_request_timeout_sec', req_timeout, user['username'])
+            REGISTRATION_DB.set_setting('topup_coinbase_request_timeout_sec', req_timeout, user['username'])
+            auto_redirect = '1' if fields.get('topup_auto_redirect_checkout') == '1' else '0'
+            REGISTRATION_DB.set_setting('topup_auto_redirect_checkout', auto_redirect, user['username'])
+            try:
+                pending_sla = str(max(5, min(10080, int(fields.get('topup_pending_sla_minutes', '180')))))
+            except Exception:
+                pending_sla = '180'
+            REGISTRATION_DB.set_setting('topup_pending_sla_minutes', pending_sla, user['username'])
+            paypal_enabled = fields.get('topup_paypal_enabled', '')
+            if paypal_enabled not in ('0', '1'):
+                paypal_enabled = '0'
+            REGISTRATION_DB.set_setting('topup_paypal_enabled', paypal_enabled, user['username'])
+            paypal_webhook_enforce = fields.get('topup_paypal_webhook_enforce', '')
+            if paypal_webhook_enforce not in ('0', '1'):
+                paypal_webhook_enforce = '1'
+            REGISTRATION_DB.set_setting('topup_paypal_webhook_enforce', paypal_webhook_enforce, user['username'])
+            paypal_env = fields.get('topup_paypal_env', 'sandbox')
+            if paypal_env not in ('sandbox', 'live'):
+                paypal_env = 'sandbox'
+            REGISTRATION_DB.set_setting('topup_paypal_env', paypal_env, user['username'])
+            pp_client_id_sandbox = fields.get('topup_paypal_client_id_sandbox', '')[:500]
+            pp_client_id_live = fields.get('topup_paypal_client_id_live', '')[:500]
+            pp_client_secret_sandbox = fields.get('topup_paypal_client_secret_sandbox', '')[:500]
+            pp_client_secret_live = fields.get('topup_paypal_client_secret_live', '')[:500]
+            pp_webhook_id_sandbox = fields.get('topup_paypal_webhook_id_sandbox', '')[:500]
+            pp_webhook_id_live = fields.get('topup_paypal_webhook_id_live', '')[:500]
+            REGISTRATION_DB.set_setting('topup_paypal_client_id_sandbox', pp_client_id_sandbox, user['username'])
+            REGISTRATION_DB.set_setting('topup_paypal_client_id_live', pp_client_id_live, user['username'])
+            REGISTRATION_DB.set_setting('topup_paypal_client_secret_sandbox', pp_client_secret_sandbox, user['username'])
+            REGISTRATION_DB.set_setting('topup_paypal_client_secret_live', pp_client_secret_live, user['username'])
+            REGISTRATION_DB.set_setting('topup_paypal_webhook_id_sandbox', pp_webhook_id_sandbox, user['username'])
+            REGISTRATION_DB.set_setting('topup_paypal_webhook_id_live', pp_webhook_id_live, user['username'])
+            # Legacy single-value keys mirror active env value for backward compatibility.
+            REGISTRATION_DB.set_setting('topup_paypal_client_id',
+                                        pp_client_id_sandbox if paypal_env == 'sandbox' else pp_client_id_live,
+                                        user['username'])
+            REGISTRATION_DB.set_setting('topup_paypal_client_secret',
+                                        pp_client_secret_sandbox if paypal_env == 'sandbox' else pp_client_secret_live,
+                                        user['username'])
+            REGISTRATION_DB.set_setting('topup_paypal_webhook_id',
+                                        pp_webhook_id_sandbox if paypal_env == 'sandbox' else pp_webhook_id_live,
+                                        user['username'])
+            try:
+                base_rate = str(max(1, min(100000, int(fields.get('topup_base_rate_pts_per_usd', '200')))))
+            except Exception:
+                base_rate = '200'
+            REGISTRATION_DB.set_setting('topup_base_rate_pts_per_usd', base_rate, user['username'])
+            raw_amounts = fields.get('topup_fixed_amounts', '5,10,25,50,100')
+            amounts = []
+            for part in raw_amounts.split(','):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    amounts.append(max(1, min(100000, int(part))))
+                except Exception:
+                    continue
+            if not amounts:
+                amounts = [5, 10, 25, 50, 100]
+            amounts = sorted(set(amounts))
+            REGISTRATION_DB.set_setting('topup_fixed_amounts_json', json.dumps(amounts), user['username'])
+            raw_bands = fields.get('topup_multiplier_bands', '5:1.00,10:1.25,25:1.40,50:1.55,100:1.75')
+            bands = []
+            for part in raw_bands.split(','):
+                part = part.strip()
+                if ':' not in part:
+                    continue
+                left, right = part.split(':', 1)
+                try:
+                    min_usd = max(1, min(100000, int(left.strip())))
+                    mult = float(right.strip())
+                    bp = int(mult * 10000)
+                    bp = max(1000, min(100000, bp))
+                except Exception:
+                    continue
+                bands.append({'min_usd': min_usd, 'multiplier_bp': bp})
+            if not bands:
+                bands = [{'min_usd': 5, 'multiplier_bp': 10000}]
+            bands.sort(key=lambda x: x['min_usd'])
+            REGISTRATION_DB.set_setting('topup_multiplier_bands_json', json.dumps(bands), user['username'])
+        self._redirect('/manage/admin?tab=economy' if form_id in ('points_earn','points_spend','bounty_settings','leaderboard_settings','admin_grant_settings','dm_settings')
+                       else ('/manage/admin?tab=topups' if form_id == 'topup_settings' else '/manage/admin'))
 
     # ── Invite & Credit handlers ─────────────────────────────
 
@@ -6119,6 +7556,361 @@ class ManageHandler(BaseHTTPRequestHandler):
         q = urllib.parse.quote(msg)
         self._redirect(f'/manage/profile?msg={q}&msg_type={"success" if ok else "error"}')
 
+    def _post_topup_create(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if not REGISTRATION_DB.topup_enabled_for_user(user):
+            return self._redirect('/manage/profile?msg=Top-ups+are+disabled.&msg_type=error')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            amount_usd = int(fields.get('amount_usd', '0'))
+        except Exception:
+            amount_usd = 0
+        selected_provider = (fields.get('provider', '') or '').strip().lower()
+        cfg = REGISTRATION_DB.get_topup_config()
+        if amount_usd not in cfg['fixed_amounts_usd']:
+            return self._redirect('/manage/topups?msg=Invalid+top-up+amount.&msg_type=error')
+        provider = selected_provider or cfg.get('provider', 'coinbase')
+        if provider not in cfg.get('providers', ['coinbase']):
+            return self._redirect('/manage/topups?msg=Selected+payment+processor+is+not+available.&msg_type=error')
+        order = REGISTRATION_DB.create_topup_order(
+            user['id'], amount_usd, actor=user['username'], provider=provider
+        )
+        if not order:
+            return self._redirect('/manage/topups?msg=Unable+to+create+order.&msg_type=error')
+        if provider == 'paypal':
+            base = self._build_manage_base_url()
+            return_url = f'{base}/manage/topups/paypal/return'
+            cancel_url = f'{base}/manage/topups/paypal/cancel'
+            ok, info = REGISTRATION_DB.create_paypal_checkout_for_order(
+                order['id'], user, return_url=return_url, cancel_url=cancel_url,
+                actor=user['username']
+            )
+            if not ok:
+                if info.get('error') == 'missing_paypal_credentials':
+                    REGISTRATION_DB.update_topup_status(
+                        order['id'], 'pending', actor=user['username'],
+                        reason='awaiting_manual_payment',
+                        detail='PayPal credentials are not configured; manual/admin flow required'
+                    )
+                    q = urllib.parse.quote('Order created in pending state. PayPal auto-checkout is not configured yet.')
+                    return self._redirect(f'/manage/topups?msg={q}&msg_type=success')
+                REGISTRATION_DB.update_topup_status(
+                    order['id'], 'exception', actor=user['username'],
+                    reason='checkout_create_failed',
+                    detail=(info.get('message') or info.get('error') or 'Unable to create PayPal checkout')
+                )
+                q = urllib.parse.quote('Order created but PayPal checkout failed: ' + (info.get('message') or info.get('error') or 'unknown'))
+                return self._redirect(f'/manage/topups?msg={q}&msg_type=error')
+            approve_url = info.get('checkout_url', '')
+            if approve_url:
+                self.send_response(303)
+                self.send_header('Location', approve_url)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            return self._redirect('/manage/topups?msg=PayPal+order+created.+Use+Pay+Now+to+continue.&msg_type=success')
+        ok, info = REGISTRATION_DB.create_coinbase_checkout_for_order(
+            order['id'], user, actor=user['username']
+        )
+        if not ok:
+            if info.get('error') in ('missing_api_key', 'missing_create_url'):
+                REGISTRATION_DB.update_topup_status(
+                    order['id'], 'pending', actor=user['username'],
+                    reason='awaiting_manual_payment',
+                    detail='Checkout not auto-created (provider credentials/URL not configured); admin/manual flow required'
+                )
+                q = urllib.parse.quote('Order created in pending state. Coinbase auto-checkout is not configured yet.')
+                return self._redirect(f'/manage/topups?msg={q}&msg_type=success')
+            # Keep order visible for reconciliation and troubleshooting.
+            REGISTRATION_DB.update_topup_status(
+                order['id'], 'exception', actor=user['username'],
+                reason='checkout_create_failed',
+                detail=(info.get('message') or info.get('error') or 'Unable to create Coinbase checkout')
+            )
+            q = urllib.parse.quote('Order created but checkout failed: ' + (info.get('message') or info.get('error') or 'unknown'))
+            return self._redirect(f'/manage/topups?msg={q}&msg_type=error')
+        checkout_url = info.get('checkout_url', '')
+        if cfg.get('auto_redirect_checkout') and checkout_url:
+            self.send_response(303)
+            self.send_header('Location', checkout_url)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        self._redirect('/manage/topups?msg=Top-up+order+created.+Proceed+to+Coinbase+checkout.&msg_type=success')
+
+    def _post_topup_reconcile(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        is_super = user['username'] == SUPER_USER
+        if not (user['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            order_id = int(fields.get('order_id', '0'))
+        except Exception:
+            order_id = 0
+        action = fields.get('action', '').strip()
+        note = fields.get('note', '').strip()
+        if order_id <= 0:
+            return self._redirect('/manage/admin?tab=topups&msg=Invalid+order+id.&msg_type=error')
+        order = REGISTRATION_DB.get_topup_order(order_id)
+        if not order:
+            return self._redirect('/manage/admin?tab=topups&msg=Order+not+found.&msg_type=error')
+        old_status = order['status']
+        if old_status == 'credited':
+            return self._redirect('/manage/admin?tab=topups&msg=Credited+orders+are+final+and+cannot+be+changed.&msg_type=error')
+        if action == 'mark_confirmed':
+            if old_status not in ('created', 'pending'):
+                return self._redirect('/manage/admin?tab=topups&msg=Confirm+is+only+allowed+from+created+or+pending.&msg_type=error')
+            ok = REGISTRATION_DB.update_topup_status(order_id, 'confirmed', actor=user['username'],
+                                                     reason='admin_confirmed', detail=note or 'Marked confirmed by admin')
+            new_status = 'confirmed'
+        elif action == 'mark_failed':
+            if old_status not in ('created', 'pending', 'confirmed'):
+                return self._redirect('/manage/admin?tab=topups&msg=Failed+is+only+allowed+from+created%2C+pending%2C+or+confirmed.&msg_type=error')
+            ok = REGISTRATION_DB.update_topup_status(order_id, 'failed', actor=user['username'],
+                                                     reason='admin_failed', detail=note or 'Marked failed by admin')
+            new_status = 'failed'
+        elif action == 'mark_expired':
+            if old_status not in ('created', 'pending', 'confirmed'):
+                return self._redirect('/manage/admin?tab=topups&msg=Expired+is+only+allowed+from+created%2C+pending%2C+or+confirmed.&msg_type=error')
+            ok = REGISTRATION_DB.update_topup_status(order_id, 'expired', actor=user['username'],
+                                                     reason='admin_expired', detail=note or 'Marked expired by admin')
+            new_status = 'expired'
+        elif action == 'mark_exception':
+            if old_status not in ('created', 'pending', 'confirmed'):
+                return self._redirect('/manage/admin?tab=topups&msg=Exception+is+only+allowed+from+created%2C+pending%2C+or+confirmed.&msg_type=error')
+            ok = REGISTRATION_DB.update_topup_status(order_id, 'exception', actor=user['username'],
+                                                     reason='admin_exception', detail=note or 'Marked exception by admin')
+            new_status = 'exception'
+        elif action == 'mark_credited':
+            if old_status != 'confirmed':
+                return self._redirect('/manage/admin?tab=topups&msg=Credit+is+only+allowed+from+confirmed.&msg_type=error')
+            ok, msg = REGISTRATION_DB.credit_topup_order(order_id, actor=user['username'])
+            if ok:
+                new_status = 'credited'
+            else:
+                return self._redirect('/manage/admin?tab=topups&msg=' + urllib.parse.quote(msg) + '&msg_type=error')
+        else:
+            return self._redirect('/manage/admin?tab=topups&msg=Unknown+action.&msg_type=error')
+        if not ok:
+            return self._redirect('/manage/admin?tab=topups&msg=Unable+to+update+order.&msg_type=error')
+        actor_id = user['id']
+        REGISTRATION_DB.add_topup_reconciliation_action(
+            order_id, actor_id, action, old_status, new_status, note
+        )
+        REGISTRATION_DB._log(user['username'], 'topup_reconcile', str(order_id), f'{action} old={old_status} new={new_status}')
+        self._redirect('/manage/admin?tab=topups&msg=Top-up+order+updated.&msg_type=success')
+
+    def _post_coinbase_webhook(self):
+        """Coinbase webhook ingestion endpoint."""
+        body = self._read_body()
+        cfg = REGISTRATION_DB.get_topup_config() if REGISTRATION_DB else {}
+        secret = cfg.get('coinbase_webhook_secret', '') if cfg else ''
+        sig = (self.headers.get('X-CC-Webhook-Signature')
+               or self.headers.get('X-Coinbase-Signature')
+               or self.headers.get('X-Hook0-Signature')
+               or self.headers.get('x-cc-webhook-signature')
+               or '')
+        signature_valid = _verify_coinbase_signature(secret, body, sig)
+        try:
+            payload = json.loads(body.decode('utf-8', errors='replace') or '{}')
+        except Exception:
+            payload = {}
+        refs = _coinbase_extract_refs(payload)
+        event_type = refs['event_type']
+        event_id = refs['event_id']
+        if event_id:
+            existing_event = REGISTRATION_DB.get_topup_webhook_event('coinbase', event_id)
+            if existing_event and existing_event['process_status'] in ('processed', 'ignored'):
+                return self._send_json({'ok': True, 'duplicate': True})
+        linked_order = None
+        if refs['order_uuid']:
+            linked_order = REGISTRATION_DB.get_topup_order_by_uuid(refs['order_uuid'])
+        if not linked_order and refs['order_id'].isdigit():
+            linked_order = REGISTRATION_DB.get_topup_order(int(refs['order_id']))
+        if not linked_order and refs['checkout_id']:
+            linked_order = REGISTRATION_DB.get_topup_order_by_provider_checkout_id(refs['checkout_id'])
+        if not linked_order and refs['charge_id']:
+            linked_order = REGISTRATION_DB.get_topup_order_by_provider_charge_id(refs['charge_id'])
+        if not linked_order and refs['hosted_url']:
+            linked_order = REGISTRATION_DB.get_topup_order_by_provider_reference(refs['hosted_url'])
+        linked_order_id = linked_order['id'] if linked_order else None
+        wh_id = REGISTRATION_DB.record_topup_webhook_event(
+            provider='coinbase',
+            event_type=event_type[:120],
+            payload_json=body.decode('utf-8', errors='replace'),
+            headers_json=json.dumps({
+                'x-cc-webhook-signature': self.headers.get('X-CC-Webhook-Signature', ''),
+                'x-coinbase-signature': self.headers.get('X-Coinbase-Signature', ''),
+                'x-hook0-signature': self.headers.get('X-Hook0-Signature', ''),
+            }),
+            signature_valid=signature_valid,
+            event_id=event_id[:120],
+            linked_order_id=linked_order_id,
+            idempotency_key=(event_id or refs['order_uuid'] or refs['checkout_id'] or secrets.token_hex(8))
+        )
+        if secret and not signature_valid:
+            REGISTRATION_DB.mark_topup_webhook_processed(wh_id, status='ignored', error_msg='invalid signature')
+            return self._send_json({'ok': False, 'error': 'invalid signature'}, 400)
+        if linked_order_id:
+            text_blob = json.dumps(payload).lower()
+            try:
+                if refs['checkout_id'] or refs['charge_id'] or refs['hosted_url']:
+                    REGISTRATION_DB.set_topup_provider_refs(
+                        linked_order_id,
+                        provider_checkout_id=refs['checkout_id'] or (linked_order['provider_checkout_id'] if linked_order else ''),
+                        provider_charge_id=refs['charge_id'] or (linked_order['provider_charge_id'] if linked_order else ''),
+                        provider_reference=refs['hosted_url'] or (linked_order['provider_reference'] if linked_order else ''),
+                        actor='coinbase_webhook',
+                    )
+                if ('confirmed' in event_type.lower() or 'completed' in event_type.lower()
+                        or '"status":"confirmed"' in text_blob
+                        or '"status":"completed"' in text_blob
+                        or '"status":"success"' in text_blob):
+                    REGISTRATION_DB.update_topup_status(
+                        linked_order_id, 'confirmed', actor='coinbase_webhook',
+                        reason='provider_confirmed', detail=f'Webhook {event_type}'
+                    )
+                    REGISTRATION_DB.credit_topup_order(linked_order_id, actor='coinbase_webhook')
+                elif ('failed' in event_type.lower() or 'expired' in event_type.lower()
+                      or '"status":"failed"' in text_blob or '"status":"expired"' in text_blob):
+                    target = 'failed' if 'failed' in event_type.lower() or '"status":"failed"' in text_blob else 'expired'
+                    REGISTRATION_DB.update_topup_status(
+                        linked_order_id, target, actor='coinbase_webhook',
+                        reason=f'provider_{target}', detail=f'Webhook {event_type}'
+                    )
+                else:
+                    REGISTRATION_DB.update_topup_status(
+                        linked_order_id, 'pending', actor='coinbase_webhook',
+                        reason='provider_pending', detail=f'Webhook {event_type}'
+                    )
+                REGISTRATION_DB._conn().execute(
+                    'UPDATE topup_orders SET last_webhook_at=?, updated_at=? WHERE id=?',
+                    (REGISTRATION_DB._ts(), REGISTRATION_DB._ts(), linked_order_id)
+                )
+                REGISTRATION_DB._conn().commit()
+            except Exception as exc:
+                REGISTRATION_DB.mark_topup_webhook_processed(wh_id, status='error', error_msg=str(exc))
+                return self._send_json({'ok': False}, 500)
+        REGISTRATION_DB.mark_topup_webhook_processed(wh_id, status='processed', error_msg='')
+        return self._send_json({'ok': True})
+
+    def _post_paypal_webhook(self):
+        """PayPal webhook ingestion endpoint."""
+        body = self._read_body()
+        try:
+            payload = json.loads(body.decode('utf-8', errors='replace') or '{}')
+        except Exception:
+            payload = {}
+        sig_ok, sig_detail = REGISTRATION_DB.verify_paypal_webhook_signature(payload, self.headers)
+        refs = _paypal_extract_refs(payload)
+        event_type = refs['event_type']
+        event_id = refs['event_id']
+        log.debug('PAYPAL webhook recv event_type=%s event_id=%s checkout_id=%s capture_id=%s order_uuid=%s sig_ok=%s sig_detail=%s',
+                  event_type[:80], event_id[:40], refs['checkout_id'][:24], refs['capture_id'][:24],
+                  refs['order_uuid'][:12], int(bool(sig_ok)), str(sig_detail)[:80])
+        if event_id:
+            existing_event = REGISTRATION_DB.get_topup_webhook_event('paypal', event_id)
+            if existing_event and existing_event['process_status'] in ('processed', 'ignored'):
+                log.debug('PAYPAL webhook duplicate event_id=%s status=%s', event_id[:40], existing_event['process_status'])
+                return self._send_json({'ok': True, 'duplicate': True})
+        linked_order = None
+        if refs['order_uuid']:
+            linked_order = REGISTRATION_DB.get_topup_order_by_uuid(refs['order_uuid'])
+        if not linked_order and refs['checkout_id']:
+            linked_order = REGISTRATION_DB.get_topup_order_by_provider_checkout_id(refs['checkout_id'])
+        if not linked_order and refs['capture_id']:
+            linked_order = REGISTRATION_DB.get_topup_order_by_provider_charge_id(refs['capture_id'])
+        linked_order_id = linked_order['id'] if linked_order else None
+        log.debug('PAYPAL webhook linked event_id=%s linked_order_id=%s', event_id[:40], linked_order_id or 0)
+        wh_id = REGISTRATION_DB.record_topup_webhook_event(
+            provider='paypal',
+            event_type=event_type[:120],
+            payload_json=body.decode('utf-8', errors='replace'),
+            headers_json=json.dumps({
+                'paypal-transmission-id': self.headers.get('paypal-transmission-id', ''),
+                'paypal-transmission-sig': self.headers.get('paypal-transmission-sig', ''),
+                'paypal-cert-url': self.headers.get('paypal-cert-url', ''),
+                'paypal-auth-algo': self.headers.get('paypal-auth-algo', ''),
+            }),
+            signature_valid=1 if sig_ok else 0,
+            event_id=event_id[:120],
+            linked_order_id=linked_order_id,
+            idempotency_key=(event_id or refs['order_uuid'] or refs['checkout_id'] or secrets.token_hex(8))
+        )
+        if not sig_ok:
+            log.warning('PAYPAL webhook ignored invalid_signature event_id=%s detail=%s',
+                        event_id[:40], str(sig_detail)[:120])
+            REGISTRATION_DB.mark_topup_webhook_processed(wh_id, status='ignored', error_msg=f'invalid signature: {sig_detail}')
+            return self._send_json({'ok': False, 'error': 'invalid signature'}, 400)
+        if linked_order_id:
+            try:
+                current = REGISTRATION_DB.get_topup_order(linked_order_id)
+                current_status = (current['status'] if current else '')
+                if event_type in ('PAYMENT.CAPTURE.REFUNDED', 'PAYMENT.CAPTURE.REVERSED'):
+                    ok_refund, refund_msg = REGISTRATION_DB.refund_topup_order(
+                        linked_order_id,
+                        actor='paypal_webhook',
+                        reason='provider_refund',
+                        detail=f'Webhook {event_type}'
+                    )
+                    if ok_refund:
+                        log.debug('PAYPAL webhook refunded order_id=%s event_type=%s event_id=%s',
+                                  linked_order_id, event_type[:80], event_id[:40])
+                    else:
+                        log.debug('PAYPAL webhook refund_noop order_id=%s event_type=%s event_id=%s detail=%s',
+                                  linked_order_id, event_type[:80], event_id[:40], str(refund_msg)[:120])
+                elif current_status == 'credited':
+                    log.debug('PAYPAL webhook already_credited_skip order_id=%s event_type=%s event_id=%s',
+                              linked_order_id, event_type[:80], event_id[:40])
+                elif event_type in ('PAYMENT.CAPTURE.COMPLETED', 'CHECKOUT.ORDER.APPROVED'):
+                    REGISTRATION_DB.set_topup_provider_refs(
+                        linked_order_id,
+                        provider_checkout_id=refs['checkout_id'] or (linked_order['provider_checkout_id'] if linked_order else ''),
+                        provider_charge_id=refs['capture_id'] or (linked_order['provider_charge_id'] if linked_order else ''),
+                        provider_reference=(linked_order['provider_reference'] if linked_order else ''),
+                        actor='paypal_webhook',
+                    )
+                    REGISTRATION_DB.update_topup_status(
+                        linked_order_id, 'confirmed', actor='paypal_webhook',
+                        reason='provider_confirmed', detail=f'Webhook {event_type}'
+                    )
+                    ok_credit, credit_msg = REGISTRATION_DB.credit_topup_order(linked_order_id, actor='paypal_webhook')
+                    if ok_credit:
+                        log.debug('PAYPAL webhook confirmed+credited order_id=%s event_type=%s event_id=%s',
+                                  linked_order_id, event_type[:80], event_id[:40])
+                    else:
+                        log.debug('PAYPAL webhook confirmed_but_not_credited order_id=%s event_type=%s event_id=%s detail=%s',
+                                  linked_order_id, event_type[:80], event_id[:40], str(credit_msg)[:120])
+                elif event_type in ('PAYMENT.CAPTURE.DENIED', 'CHECKOUT.ORDER.CANCELLED'):
+                    REGISTRATION_DB.update_topup_status(
+                        linked_order_id, 'failed', actor='paypal_webhook',
+                        reason='provider_failed', detail=f'Webhook {event_type}'
+                    )
+                    log.debug('PAYPAL webhook marked_failed order_id=%s event_type=%s event_id=%s',
+                              linked_order_id, event_type[:80], event_id[:40])
+                REGISTRATION_DB._conn().execute(
+                    'UPDATE topup_orders SET last_webhook_at=?, updated_at=? WHERE id=?',
+                    (REGISTRATION_DB._ts(), REGISTRATION_DB._ts(), linked_order_id)
+                )
+                REGISTRATION_DB._conn().commit()
+            except Exception as exc:
+                log.exception('PAYPAL webhook processing_error wh_id=%s order_id=%s event_id=%s err=%s',
+                              wh_id, linked_order_id, event_id[:40], exc)
+                REGISTRATION_DB.mark_topup_webhook_processed(wh_id, status='error', error_msg=str(exc))
+                return self._send_json({'ok': False}, 500)
+        else:
+            log.debug('PAYPAL webhook no_link event_id=%s event_type=%s', event_id[:40], event_type[:80])
+        REGISTRATION_DB.mark_topup_webhook_processed(wh_id, status='processed', error_msg='')
+        log.debug('PAYPAL webhook processed wh_id=%s event_id=%s', wh_id, event_id[:40])
+        return self._send_json({'ok': True})
+
     # ── DM Handlers ─────────────────────────────────────────
 
     def _get_notifications_preview(self):
@@ -6130,6 +7922,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         out = []
         for n in items:
             is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
+            is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
             if is_bounty:
                 bid   = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
@@ -6146,6 +7939,21 @@ class ManageHandler(BaseHTTPRequestHandler):
                 icon, label = icons.get(ntype, ('🔔', 'bounty update on'))
                 anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
                 url = f'/manage/bounty/{bid}{anchor}'
+            elif is_topup:
+                oid = str(n['info_hash']).split(':', 1)[1]
+                oid_disp = oid
+                if oid.isdigit() and REGISTRATION_DB:
+                    try:
+                        seq = REGISTRATION_DB.get_topup_user_sequence(user['id'], int(oid))
+                        if seq > 0:
+                            oid_disp = str(seq)
+                    except Exception:
+                        pass
+                icon = '💳'
+                label = (f'top-up #{oid_disp} refunded'
+                         if n['type'] == 'topup_refunded'
+                         else f'top-up #{oid_disp} credited')
+                url = '/manage/topups'
             else:
                 icon  = '💬' if n['type'] == 'reply' else '@'
                 label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
@@ -6631,11 +8439,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         page = min(page, total_pages)
         history   = REGISTRATION_DB.get_login_history(target['id'], 5)
         allowlist = REGISTRATION_DB.get_ip_allowlist(target['id'])
+        topup_orders = REGISTRATION_DB.list_topup_orders(user_id=target['id'], limit=100)
         base_url  = f'/manage/admin/user/{username}'
         self._send_html(_render_user_detail(viewer, target, torrents, history, is_super,
                                             allowlist=allowlist,
                                             page=page, total_pages=total_pages,
-                                            total=total, base_url=base_url))
+                                            total=total, base_url=base_url,
+                                            topup_orders=topup_orders))
 
     def _get_signup(self):
         if REGISTRATION_DB is None or REGISTRATION_DB.get_setting('free_signup') != '1':
@@ -6701,6 +8511,13 @@ class IPv6ManageServer(ThreadingMixIn, HTTPServer):
                 raise
             conn.settimeout(None)  # clear — timeout was only needed for the handshake
         return conn, addr
+
+    def handle_error(self, request, client_address):
+        exc_type = sys.exc_info()[0]
+        if exc_type in _BENIGN_SOCKET_EXC:
+            log.debug('WEB connection reset from %s', client_address[0])
+            return
+        super().handle_error(request, client_address)
 
 
 def start_manage_server(host: str, port: int, ssl_ctx=None, label='MANAGE'):
@@ -6776,7 +8593,7 @@ class StatsWebHandler(ManageHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path.startswith('/manage'):
+        if path.startswith('/manage') or path in ('/coinbase/webhook', '/paypal/webhook'):
             if not REGISTRATION_MODE:
                 self.send_response(404)
                 self.send_header('Content-Length', '0')
@@ -6814,6 +8631,13 @@ class IPv6StatsWebServer(ThreadingMixIn, HTTPServer):
                 raise
             conn.settimeout(None)  # clear — timeout was only needed for the handshake
         return conn, addr
+
+    def handle_error(self, request, client_address):
+        exc_type = sys.exc_info()[0]
+        if exc_type in _BENIGN_SOCKET_EXC:
+            log.debug('WEB connection reset from %s', client_address[0])
+            return
+        super().handle_error(request, client_address)
 
 
 def start_web_server(host: str, port: int, ssl_ctx=None, label='WEB'):
@@ -7578,6 +9402,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
         dropdown_items = ''
         for n in unread_items:
             is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
+            is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
             if is_bounty:
                 bid = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
@@ -7601,6 +9426,21 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     f'onclick="readNotif({n_id},\'/manage/bounty/{bid}{anchor}\')"'
                     f' aria-label="bounty notification from {from_h}">'
                     f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
+                    f'<div class="notif-item-text"><em>{tname_h}</em></div>'
+                    f'<div class="notif-item-ts">{ts_h}</div>'
+                    f'</button>'
+                )
+            elif is_topup:
+                from_h = _h(n['from_username'])
+                ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
+                n_id = n['id']
+                tname_h = _h(n['torrent_name'][:60] + ('…' if len(n['torrent_name']) > 60 else ''))
+                topup_label = 'top-up refunded' if n['type'] == 'topup_refunded' else 'top-up credited'
+                dropdown_items += (
+                    f'<button class="notif-item" '
+                    f'onclick="readNotif({n_id},\'/manage/topups\')"'
+                    f' aria-label="top-up notification">'
+                    f'<div class="notif-item-type">💳 <strong>{from_h}</strong> {topup_label}</div>'
                     f'<div class="notif-item-text"><em>{tname_h}</em></div>'
                     f'<div class="notif-item-ts">{ts_h}</div>'
                     f'</button>'
@@ -7655,6 +9495,8 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             + ('' if role == 'basic' else
                '<a href="/manage/bounty" class="nav-btn">🎯 Bounties</a>'
                '<a href="/manage/leaderboard" class="nav-btn">🏆 Leaderboard</a>')
+            + (f'<a href="/manage/topups" class="nav-btn">💳 Top-ups</a>'
+               if REGISTRATION_DB and REGISTRATION_DB.topup_enabled_for_user(user) else '')
         )
     else:
         nav = ''
@@ -8448,6 +10290,227 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
       </div>
     </div>'''
 
+    # ── Top-up admin HTML ────────────────────────────────────
+    _topup_cfg = REGISTRATION_DB.get_topup_config() if REGISTRATION_DB else {}
+    _topup_stats = REGISTRATION_DB.get_topup_stats() if REGISTRATION_DB else {}
+    _topup_orders = REGISTRATION_DB.list_topup_orders(limit=200) if REGISTRATION_DB else []
+    _topup_hooks = REGISTRATION_DB.list_topup_webhook_events(limit=200) if REGISTRATION_DB else []
+    _topup_rows = ''
+    for o in _topup_orders:
+        _u = REGISTRATION_DB.get_user_by_id(o['user_id']) if REGISTRATION_DB else None
+        _uname = _h(_u['username']) if _u else f'user-{o["user_id"]}'
+        _user_cell = (f'<a href="/manage/user/{_uname}" class="user-link">{_uname}</a>'
+                      if _u else f'<span class="hash">{_uname}</span>')
+        _status = _h(o['status'])
+        _badge_color = {
+            'credited': 'var(--green)',
+            'confirmed': 'var(--accent)',
+            'pending': 'var(--muted)',
+            'created': 'var(--muted)',
+            'expired': 'var(--danger)',
+            'failed': 'var(--danger)',
+            'exception': 'var(--danger)',
+        }.get(o['status'], 'var(--muted)')
+        _status_badge = (f'<span style="display:inline-block;padding:2px 8px;border:1px solid {_badge_color};'
+                         f'color:{_badge_color};font-size:0.7rem;font-family:var(--mono)">{_status.upper()}</span>')
+        _actions = (
+            f'<form method="POST" action="/manage/admin/topup/reconcile" style="display:inline">'
+            f'<input type="hidden" name="order_id" value="{o["id"]}">'
+            f'<input type="hidden" name="action" value="mark_confirmed">'
+            f'<button class="btn btn-sm">Confirm</button></form>'
+            f'<form method="POST" action="/manage/admin/topup/reconcile" style="display:inline">'
+            f'<input type="hidden" name="order_id" value="{o["id"]}">'
+            f'<input type="hidden" name="action" value="mark_credited">'
+            f'<button class="btn btn-sm btn-green">Credit</button></form>'
+            f'<form method="POST" action="/manage/admin/topup/reconcile" style="display:inline">'
+            f'<input type="hidden" name="order_id" value="{o["id"]}">'
+            f'<input type="hidden" name="action" value="mark_exception">'
+            f'<button class="btn btn-sm btn-danger">Exception</button></form>'
+        )
+        _topup_rows += (
+            f'<tr id="topup-order-{o["id"]}">'
+            f'<td class="hash">#{o["id"]}</td>'
+            f'<td class="hash">{_h((o["provider"] or "").upper() or "COINBASE")}</td>'
+            f'<td>{_user_cell}</td>'
+            f'<td>${o["amount_usd_cents"]/100:.2f}</td>'
+            f'<td style="color:var(--accent)">{o["quoted_points"]} pts</td>'
+            f'<td>{_status_badge}</td>'
+            f'<td class="hash">{(o["updated_at"] or "")[:16].replace("T"," ")}</td>'
+            f'<td><div class="actions">{_actions}</div></td>'
+            '</tr>'
+        )
+    if not _topup_rows:
+        _topup_rows = '<tr><td colspan="8" class="empty">No top-up orders yet</td></tr>'
+    _hook_rows = ''
+    for h in _topup_hooks:
+        _hook_rows += (
+            '<tr>'
+            f'<td class="hash">#{h["id"]}</td>'
+            f'<td class="hash">{_h((h["received_at"] or "")[:16].replace("T"," "))}</td>'
+            f'<td>{_h(h["event_type"])}</td>'
+            f'<td>{_h(h["event_id"] or "-")}</td>'
+            f'<td>{_h(h["process_status"])}</td>'
+            f'<td class="hash">{_h(str(h["linked_order_id"] or ""))}</td>'
+            '</tr>'
+        )
+    if not _hook_rows:
+        _hook_rows = '<tr><td colspan="6" class="empty">No webhook events recorded</td></tr>'
+    _topup_fixed_csv = ', '.join(str(v) for v in _topup_cfg.get('fixed_amounts_usd', [5, 10, 25, 50, 100]))
+    _topup_bands_csv = ', '.join(
+        f'{b["min_usd"]}:{b["multiplier_bp"]/10000:.2f}'
+        for b in _topup_cfg.get('multiplier_bands', [{'min_usd': 5, 'multiplier_bp': 10000}])
+    )
+    topups_html = f'''
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-title">Top-up Overview</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px">
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.3rem;font-weight:700;color:var(--green)">{_topup_stats.get("credited_orders",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Credited Orders</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.3rem;font-weight:700;color:var(--accent)">{_topup_stats.get("pending_orders",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Pending/Confirmed</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.3rem;font-weight:700;color:var(--danger)">{_topup_stats.get("exception_orders",0)}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Exceptions</div>
+        </div>
+        <div style="background:var(--card2);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:1.3rem;font-weight:700;color:var(--text)">${_topup_stats.get("usd_credited_cents",0)/100:.2f}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Credited USD</div>
+        </div>
+      </div>
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <div class="card-title">Top-up Settings</div>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="topup_settings">
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" name="topup_enabled" value="1" {'checked' if _topup_cfg.get('enabled') else ''}> Enable top-up system
+            </label>
+          </div>
+          <div class="form-group"><label>Rollout mode</label>
+            <select name="topup_rollout_mode" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
+              <option value="admin_only" {'selected' if _topup_cfg.get('rollout_mode') == 'admin_only' else ''}>Admin only (staging)</option>
+              <option value="all_users" {'selected' if _topup_cfg.get('rollout_mode') == 'all_users' else ''}>All users</option>
+            </select>
+          </div>
+          <div class="form-group"><label>Default Processor</label>
+            <select name="topup_provider" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
+              <option value="coinbase" {'selected' if _topup_cfg.get('provider','coinbase') == 'coinbase' else ''}>coinbase</option>
+              <option value="paypal" {'selected' if _topup_cfg.get('provider','coinbase') == 'paypal' else ''}>paypal</option>
+            </select></div>
+          <div class="card-title" style="margin-top:10px">Coinbase</div>
+          <div class="form-group"><label>Coinbase processor</label>
+            <div style="display:flex;gap:14px;flex-wrap:wrap">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="radio" name="topup_coinbase_enabled" value="1" {'checked' if _topup_cfg.get('coinbase_enabled') else ''}> Enabled
+              </label>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="radio" name="topup_coinbase_enabled" value="0" {'checked' if not _topup_cfg.get('coinbase_enabled') else ''}> Disabled
+              </label>
+            </div>
+          </div>
+          <div class="form-group"><label>Coinbase environment</label>
+            <select name="topup_coinbase_env" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
+              <option value="sandbox" {'selected' if _topup_cfg.get('coinbase_env') == 'sandbox' else ''}>sandbox</option>
+              <option value="live" {'selected' if _topup_cfg.get('coinbase_env') == 'live' else ''}>live</option>
+            </select></div>
+          <div class="form-group"><label>Coinbase API key (sandbox)</label>
+            <input type="text" name="topup_coinbase_api_key_sandbox" value="{_h(_topup_cfg.get('coinbase_api_key_sandbox',''))}" placeholder="sandbox API key"></div>
+          <div class="form-group"><label>Coinbase webhook secret (sandbox)</label>
+            <input type="text" name="topup_coinbase_webhook_secret_sandbox" value="{_h(_topup_cfg.get('coinbase_webhook_secret_sandbox',''))}" placeholder="sandbox webhook secret"></div>
+          <div class="form-group"><label>Coinbase API key (live)</label>
+            <input type="text" name="topup_coinbase_api_key_live" value="{_h(_topup_cfg.get('coinbase_api_key_live',''))}" placeholder="live API key"></div>
+          <div class="form-group"><label>Coinbase webhook secret (live)</label>
+            <input type="text" name="topup_coinbase_webhook_secret_live" value="{_h(_topup_cfg.get('coinbase_webhook_secret_live',''))}" placeholder="live webhook secret"></div>
+          <div class="form-group"><label>Coinbase create endpoint URL</label>
+            <input type="text" name="topup_coinbase_create_url" value="{_h(_topup_cfg.get('coinbase_create_url',''))}" placeholder="https://api.commerce.coinbase.com/charges"></div>
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" name="topup_auto_redirect_checkout" value="1" {'checked' if _topup_cfg.get('auto_redirect_checkout') else ''}> Auto-redirect user to Coinbase after order creation
+            </label>
+          </div>
+          <div class="card-title" style="margin-top:10px">PayPal</div>
+          <p style="color:var(--muted);font-size:0.78rem;margin:0 0 10px">Webhook verification can be enforced (recommended) or disabled (insecure open mode). If enforced and PayPal is enabled, webhook ID is required for the active PayPal environment.</p>
+          <div class="form-group"><label>PayPal processor</label>
+            <div style="display:flex;gap:14px;flex-wrap:wrap">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="radio" name="topup_paypal_enabled" value="1" {'checked' if _topup_cfg.get('paypal_enabled') else ''}> Enabled
+              </label>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="radio" name="topup_paypal_enabled" value="0" {'checked' if not _topup_cfg.get('paypal_enabled') else ''}> Disabled
+              </label>
+            </div>
+          </div>
+          <div class="form-group"><label>PayPal webhook verification</label>
+            <div style="display:flex;gap:14px;flex-wrap:wrap">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="radio" name="topup_paypal_webhook_enforce" value="1" {'checked' if _topup_cfg.get('paypal_webhook_enforce', True) else ''}> Enforce (Recommended)
+              </label>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="radio" name="topup_paypal_webhook_enforce" value="0" {'checked' if not _topup_cfg.get('paypal_webhook_enforce', True) else ''}> Allow unsigned (Insecure)
+              </label>
+            </div>
+          </div>
+          <div class="form-group"><label>PayPal environment</label>
+            <select name="topup_paypal_env" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
+              <option value="sandbox" {'selected' if _topup_cfg.get('paypal_env') == 'sandbox' else ''}>sandbox</option>
+              <option value="live" {'selected' if _topup_cfg.get('paypal_env') == 'live' else ''}>live</option>
+            </select></div>
+          <div class="form-group"><label>PayPal client id (sandbox)</label>
+            <input type="text" name="topup_paypal_client_id_sandbox" value="{_h(_topup_cfg.get('paypal_client_id_sandbox',''))}" placeholder="PayPal sandbox client id"></div>
+          <div class="form-group"><label>PayPal client secret (sandbox)</label>
+            <input type="text" name="topup_paypal_client_secret_sandbox" value="{_h(_topup_cfg.get('paypal_client_secret_sandbox',''))}" placeholder="PayPal sandbox client secret"></div>
+          <div class="form-group"><label>PayPal webhook id (sandbox)</label>
+            <input type="text" name="topup_paypal_webhook_id_sandbox" value="{_h(_topup_cfg.get('paypal_webhook_id_sandbox',''))}" placeholder="sandbox webhook id"></div>
+          <div class="form-group"><label>PayPal client id (live)</label>
+            <input type="text" name="topup_paypal_client_id_live" value="{_h(_topup_cfg.get('paypal_client_id_live',''))}" placeholder="PayPal live client id"></div>
+          <div class="form-group"><label>PayPal client secret (live)</label>
+            <input type="text" name="topup_paypal_client_secret_live" value="{_h(_topup_cfg.get('paypal_client_secret_live',''))}" placeholder="PayPal live client secret"></div>
+          <div class="form-group"><label>PayPal webhook id (live)</label>
+            <input type="text" name="topup_paypal_webhook_id_live" value="{_h(_topup_cfg.get('paypal_webhook_id_live',''))}" placeholder="live webhook id"></div>
+          <div style="display:flex;gap:12px;flex-wrap:wrap">
+            <div class="form-group"><label>API timeout (sec)</label>
+              <input type="number" min="3" max="120" name="topup_provider_request_timeout_sec" value="{_topup_cfg.get('provider_request_timeout_sec',15)}" style="width:100px"></div>
+            <div class="form-group"><label>Pending SLA (minutes)</label>
+              <input type="number" min="5" max="10080" name="topup_pending_sla_minutes" value="{_topup_cfg.get('pending_sla_minutes',180)}" style="width:120px"></div>
+          </div>
+          <div class="form-group"><label>Base rate (points per USD)</label>
+            <input type="number" min="1" max="100000" name="topup_base_rate_pts_per_usd" value="{_topup_cfg.get('base_rate_pts_per_usd',200)}" style="width:140px"></div>
+          <div class="form-group"><label>Fixed amounts (USD, comma-separated)</label>
+            <input type="text" name="topup_fixed_amounts" value="{_h(_topup_fixed_csv)}"></div>
+          <div class="form-group"><label>Multiplier bands (min:multiplier, comma-separated)</label>
+            <input type="text" name="topup_multiplier_bands" value="{_h(_topup_bands_csv)}" placeholder="5:1.00,10:1.25"></div>
+          <button type="submit" class="btn btn-primary">Save Top-up Settings</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">Quote Preview</div>
+        <table>
+          <tr><th scope="col">Amount</th><th scope="col">Multiplier</th><th scope="col">Quoted Points</th></tr>
+          {''.join(f'<tr><td>${amt}</td><td>{REGISTRATION_DB.quote_topup_points(amt)["multiplier_bp"]/10000:.2f}x</td><td style="color:var(--accent)">{REGISTRATION_DB.quote_topup_points(amt)["quoted_points"]}</td></tr>' for amt in _topup_cfg.get("fixed_amounts_usd",[5,10,25,50,100]))}
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Top-up Orders</div>
+      <div class="table-wrap"><table>
+        <tr><th scope="col">Order</th><th scope="col">Processor</th><th scope="col">User</th><th scope="col">Amount</th><th scope="col">Quoted</th><th scope="col">Status</th><th scope="col">Updated</th><th scope="col">Actions</th></tr>
+        {_topup_rows}
+      </table></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Webhook Events</div>
+      <div class="table-wrap"><table>
+        <tr><th scope="col">ID</th><th scope="col">Received</th><th scope="col">Type</th><th scope="col">Event ID</th><th scope="col">Process</th><th scope="col">Order</th></tr>
+        {_hook_rows}
+      </table></div>
+    </div>'''
+
     # ── Auto-promote + Danger HTML ───────────────────────────
     danger_html = f'''
     <div class="two-col">
@@ -8624,7 +10687,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             acolor = 'var(--danger)'
         elif 'login' in action or 'register' in action or 'award' in action or 'promote' in action:
             acolor = 'var(--green)'
-        elif 'bounty' in action or 'points' in action or 'spend' in action:
+        elif 'bounty' in action or 'points' in action or 'spend' in action or 'topup' in action:
             acolor = 'var(--accent)'
         else:
             acolor = 'var(--text)'
@@ -8648,12 +10711,14 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                       if is_super else '')
     _tab_economy   = ('<button class="tab" onclick="showTab(\'economy\',this)">Economy</button>'
                       if is_super else '')
+    _tab_topups    = ('<button class="tab" onclick="showTab(\'topups\',this)">Top-ups</button>'
+                      if is_super else '')
     _tab_invites   = ('<button class="tab" onclick="showTab(\'invites\',this)">Invites</button>'
                       if (is_super or user['is_admin']) else '')
     _tab_danger    = ('<button class="tab tab-danger" onclick="showTab(\'danger\',this)"'
                       '>Danger</button>'
                       if is_super else '')
-    _tab_names = ['torrents','users','adduser','trackers','settings','database','economy','invites','danger','events']
+    _tab_names = ['torrents','users','adduser','trackers','settings','database','economy','topups','invites','danger','events']
     if tab and tab in _tab_names:
         _safe_tab = tab.replace("'", '')
         _autotab_js = (
@@ -8683,6 +10748,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     {_tab_settings}
     {_tab_database}
     {_tab_economy}
+    {_tab_topups}
     {_tab_invites}
     {_tab_danger}
     <button class="tab" onclick="showTab('events',this)">Event Log</button>
@@ -8775,6 +10841,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
   {'<div class="panel" id="panel-settings">' + settings_html + '</div>' if is_super else ''}
   {'<div class="panel" id="panel-database">' + database_html + '</div>' if is_super else ''}
   {'<div class="panel" id="panel-economy">' + economy_html + '</div>' if is_super else ''}
+  {'<div class="panel" id="panel-topups">' + topups_html + '</div>' if is_super else ''}
   {'<div class="panel" id="panel-invites">' + invites_html + '</div>' if (is_super or user['is_admin']) else ''}
   {'<div class="panel" id="panel-danger">' + danger_html + '</div>' if is_super else ''}
 
@@ -9521,6 +11588,7 @@ def _render_notifications_page(viewer) -> str:
     rows = ''
     for n in notifs:
         is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
+        is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
         ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
         from_h = _h(n['from_username'])
         tname_h = _h(n['torrent_name'])
@@ -9549,6 +11617,31 @@ def _render_notifications_page(viewer) -> str:
                 f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
                 f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                 f' {label} '
+                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                f'<div class="notif-page-meta">{ts_h}</div>'
+                f'</div>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
+                f'</div>'
+            )
+        elif is_topup:
+            oid = str(n['info_hash']).split(':', 1)[1]
+            oid_disp = oid
+            if oid.isdigit() and REGISTRATION_DB:
+                try:
+                    seq = REGISTRATION_DB.get_topup_user_sequence(viewer['id'], int(oid))
+                    if seq > 0:
+                        oid_disp = str(seq)
+                except Exception:
+                    pass
+            url = '/manage/topups'
+            read_js = f"readNotif({n_id},'{url}')"
+            topup_action = 'refunded' if n['type'] == 'topup_refunded' else 'credited'
+            rows += (
+                f'<div class="notif-page-item{unread_cls}">'
+                f'<div>'
+                f'<div style="font-size:0.9rem"><span style="margin-right:6px">💳</span>'
+                f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                f' {topup_action} top-up #{oid_disp}: '
                 f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                 f'<div class="notif-page-meta">{ts_h}</div>'
                 f'</div>'
@@ -9887,7 +11980,7 @@ def _render_public_profile(viewer, target_user, torrents: list,
 def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                         allowlist=None, is_own_profile=False,
                         page: int = 1, total_pages: int = 1, total: int = 0, base_url: str = '',
-                        ledger=None, bounty_data=None,
+                        ledger=None, bounty_data=None, topup_orders=None,
                         msg: str = '', msg_type: str = 'error'):
     uname   = target_user['username']
     uname_h = _h(uname)          # HTML-safe for output
@@ -10269,6 +12362,18 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                   f'class="btn btn-sm">📬 Send DM</a>')
 
     avatar_html = _avatar_html(target_user, 34)
+    show_topup_section = is_own_profile or _user_role(viewer) in ('admin', 'super')
+    focus_topup_id = None
+    if (not is_own_profile) and (topup_orders or []):
+        try:
+            focus_topup_id = int((topup_orders or [])[0]['id'])
+        except Exception:
+            focus_topup_id = None
+    topup_section = _render_topup_history_section(
+        target_user, topup_orders or [], force_show=show_topup_section,
+        admin_context=(not is_own_profile and _user_role(viewer) in ('admin', 'super')),
+        focus_order_id=focus_topup_id
+    )
     body = (
         '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">'
         + avatar_html
@@ -10285,6 +12390,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + '<table style="min-width:unset">' + info_rows + '</table></div>'
         + actions_card
         + '</div>'
+        + topup_section
         + _render_points_section(viewer, target_user, is_own_profile, ledger, bounty_data, part='rest')
         + ip_html
         + delete_all_html
@@ -10300,6 +12406,154 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         body = msg_card + body
     return _manage_page(('My Profile' if is_own_profile else 'User: ' + uname_h), body, user=viewer)
 
+
+
+def _render_topup_history_section(user, orders: list, force_show: bool = False,
+                                  admin_context: bool = False,
+                                  focus_order_id: int | None = None) -> str:
+    if not REGISTRATION_DB:
+        return ''
+    if REGISTRATION_DB.get_setting('topup_enabled', '0') != '1':
+        return ''
+    if not force_show and not REGISTRATION_DB.topup_enabled_for_user(user):
+        return ''
+    user_seq = {}
+    for idx, o in enumerate(sorted(orders, key=lambda r: int(r['id']))):
+        user_seq[int(o['id'])] = idx + 1
+    rows = ''
+    for o in orders[:50]:
+        status = _h(o['status'])
+        color = {
+            'credited': 'var(--green)',
+            'confirmed': 'var(--accent)',
+            'pending': 'var(--muted)',
+            'created': 'var(--muted)',
+            'expired': 'var(--danger)',
+            'failed': 'var(--danger)',
+            'exception': 'var(--danger)',
+            'refunded': 'var(--danger)',
+        }.get(o['status'], 'var(--muted)')
+        rows += (
+            '<tr>'
+            f'<td class="hash">#{user_seq.get(int(o["id"]), 0)}</td>'
+            f'<td>${o["amount_usd_cents"]/100:.2f}</td>'
+            f'<td style="color:var(--accent)">{o["quoted_points"]}</td>'
+            f'<td style="color:{color};font-family:var(--mono);font-size:0.76rem">{status.upper()}</td>'
+            f'<td class="hash">{(o["updated_at"] or "")[:16].replace("T"," ")}</td>'
+            '</tr>'
+        )
+    if not rows:
+        rows = '<tr><td colspan="5" class="empty">No top-up orders yet</td></tr>'
+    open_link = '/manage/topups'
+    if admin_context:
+        if focus_order_id:
+            open_link = f'/manage/admin?tab=topups#topup-order-{focus_order_id}'
+        else:
+            open_link = '/manage/admin?tab=topups'
+    return (
+        '<div class="card">'
+        '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px">'
+        '<div class="card-title" style="margin:0">Top-up Orders</div>'
+        f'<a href="{open_link}" class="btn btn-sm">Open Top-ups</a>'
+        '</div>'
+        '<div class="table-wrap"><table>'
+        '<tr><th scope="col">Order</th><th scope="col">Amount</th><th scope="col">Quoted</th><th scope="col">Status</th><th scope="col">Updated</th></tr>'
+        + rows +
+        '</table></div></div>'
+    )
+
+
+def _render_topups_page(user, orders: list, cfg: dict, msg: str = '', msg_type: str = 'error') -> str:
+    default_provider = cfg.get('provider', 'coinbase')
+    provider_options = cfg.get('providers', ['coinbase'])
+    if default_provider not in provider_options:
+        default_provider = provider_options[0] if provider_options else 'coinbase'
+    provider_control_html = ''
+    if len(provider_options) <= 1:
+        only = (provider_options[0] if provider_options else default_provider).upper()
+        provider_control_html = (
+            '<div class="form-group" style="margin:0">'
+            '<label>Payment Processor</label>'
+            f'<div class="hash" style="padding:8px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);min-width:120px;text-align:center">{_h(only)}</div>'
+            f'<input type="hidden" name="provider" value="{_h((provider_options[0] if provider_options else default_provider))}">'
+            '</div>'
+        )
+    else:
+        provider_control_html = (
+            '<div class="form-group" style="margin:0">'
+            '<label>Payment Processor</label>'
+            '<select name="provider" id="topup-provider" style="padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">'
+            + ''.join(
+                f'<option value="{_h(p)}" {"selected" if p == default_provider else ""}>{_h(p.upper())}</option>'
+                for p in provider_options
+            )
+            + '</select></div>'
+        )
+    amount_buttons = ''
+    for amt in cfg.get('fixed_amounts_usd', [5, 10, 25, 50, 100]):
+        q = REGISTRATION_DB.quote_topup_points(amt) if REGISTRATION_DB else {'quoted_points': 0}
+        amount_buttons += (
+            f'<button type="button" class="btn btn-primary" style="margin-right:8px;margin-bottom:8px" '
+            f'onclick="submitTopupOrder({amt})">${amt} → {q["quoted_points"]} pts</button>'
+        )
+    user_seq = {}
+    for idx, o in enumerate(sorted(orders, key=lambda r: int(r['id']))):
+        user_seq[int(o['id'])] = idx + 1
+    rows = ''
+    for o in orders:
+        status = _h(o['status'])
+        color = {
+            'credited': 'var(--green)',
+            'confirmed': 'var(--accent)',
+            'pending': 'var(--muted)',
+            'created': 'var(--muted)',
+            'expired': 'var(--danger)',
+            'failed': 'var(--danger)',
+            'exception': 'var(--danger)',
+            'refunded': 'var(--danger)',
+        }.get(o['status'], 'var(--muted)')
+        action_html = ''
+        if o['status'] in ('created', 'pending') and o['provider_reference']:
+            safe_url = _h(o['provider_reference'])
+            action_html = f'<a href="{safe_url}" target="_blank" rel="noopener" class="btn btn-sm">Pay Now</a>'
+        rows += (
+            '<tr>'
+            f'<td class="hash">#{user_seq.get(int(o["id"]), 0)}</td>'
+            f'<td class="hash">{_h((o["provider"] or "").upper() or "COINBASE")}</td>'
+            f'<td class="hash">{_h(o["order_uuid"][:10])}...</td>'
+            f'<td>${o["amount_usd_cents"]/100:.2f}</td>'
+            f'<td style="color:var(--accent)">{o["quoted_points"]} pts</td>'
+            f'<td style="color:{color};font-family:var(--mono);font-size:0.76rem">{status.upper()}</td>'
+            f'<td class="hash">{(o["updated_at"] or "")[:16].replace("T"," ")}</td>'
+            f'<td style="font-size:0.8rem;color:var(--muted)">{_h(o["status_detail"] or "")}'
+            + ('' if not action_html else f'<div style="margin-top:6px">{action_html}</div>')
+            + '</td>'
+            '</tr>'
+        )
+    if not rows:
+        rows = '<tr><td colspan="8" class="empty">No top-up orders yet</td></tr>'
+    body = (
+        '<div class="page-title">Top-ups</div>'
+        '<div class="page-sub"><a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a></div>'
+        '<div class="card">'
+        '<div class="card-title">Purchase Points</div>'
+        '<p style="color:var(--muted);font-size:0.86rem;margin-bottom:12px">Credits are issued only after confirmed payment. This may take time.</p>'
+        '<form id="topup-create-form" method="POST" action="/manage/topup/create" style="margin-bottom:12px;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">'
+        '<input type="hidden" name="amount_usd" id="topup-amount-usd" value="">'
+        + provider_control_html
+        + '</form>'
+        '<div style="display:flex;flex-wrap:wrap;align-items:center">' + amount_buttons + '</div>'
+        '<script>function submitTopupOrder(amt){var f=document.getElementById("topup-create-form");var a=document.getElementById("topup-amount-usd");if(!f||!a)return;a.value=String(amt);if(typeof _submitFormWithCsrf==="function"){_submitFormWithCsrf(f);}else{f.submit();}}</script>'
+        '</div>'
+        '<div class="card">'
+        '<div class="card-title">Order History</div>'
+        '<div class="table-wrap"><table>'
+        '<tr><th scope="col">Order</th><th scope="col">Processor</th><th scope="col">Reference</th><th scope="col">Amount</th><th scope="col">Quoted</th><th scope="col">Status</th><th scope="col">Updated</th><th scope="col">Detail</th></tr>'
+        + rows +
+        '</table></div>'
+        '</div>'
+    )
+    return _manage_page('Top-ups', body, user=user, msg=msg, msg_type=msg_type)
 
 
 def _render_points_section(viewer, target_user, is_own_profile: bool,
@@ -10853,6 +13107,12 @@ def main():
                     REGISTRATION_DB.expire_bounties()
                 except Exception as _e:
                     log.warning('expire_bounties failed (non-fatal): %s', _e)
+                try:
+                    stale = REGISTRATION_DB.reconcile_stale_topup_orders()
+                    if stale:
+                        log.info('topup stale reconcile: reconciled %d stale order(s)', stale)
+                except Exception as _e:
+                    log.warning('reconcile_stale_topup_orders failed (non-fatal): %s', _e)
             hashes = REGISTRY.all_hashes()
             total_peers = sum(
                 len(REGISTRY._torrents.get(h, {})) for h in hashes

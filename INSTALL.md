@@ -300,7 +300,7 @@ You should see `2.0Gi` under the Swap row.
 
 ## 9. Registration Mode — First-Run Setup
 
-When `--registration` is enabled the management interface is available at `https://your-domain/manage`.
+When `--registration` is enabled the management interface is available at `https://tracker.example.net/manage`.
 
 ### 9.1 Set the Superuser Password
 
@@ -323,7 +323,7 @@ systemctl start tracker
 
 ### 9.2 Log In
 
-Visit `https://your-domain/manage` and log in with your superuser credentials.
+Visit `https://tracker.example.net/manage` and log in with your superuser credentials.
 
 ### 9.3 Initial Configuration
 
@@ -345,6 +345,25 @@ Then go to **Admin Panel → Economy** tab and configure the points economy:
 - **Bounty Settings** — minimum escrow, payout splits, confirmation window, community vote threshold
 - **Leaderboard** — top N entries per category
 - **Admin Point Grants** — maximum points per admin grant/removal transaction
+
+Then go to **Admin Panel → Top-ups** (Super only) and configure payment processing:
+
+- **Top-up enabled** — global switch for point purchases
+- **Rollout mode** — keep `admin_only` during testing, then open to all users
+- **Provider enablement** — enable Coinbase and/or PayPal independently
+- **Provider environment** — sandbox or live
+- **Provider credentials** — separate sandbox/live API credentials per provider
+- **Webhook configuration**:
+  - Coinbase webhook secret
+  - PayPal webhook ID (active environment) and signature enforcement mode
+- **Pricing model** — base rate, fixed amounts, and multiplier bands
+- **Operational controls** — request timeout and pending SLA
+
+> **Important:** Webhook delivery for provider callbacks requires the site to be reachable over HTTPS at:
+> - `https://tracker.example.net/coinbase/webhook`
+> - `https://tracker.example.net/paypal/webhook`
+>
+> If PayPal webhook enforcement is enabled, the active-environment webhook ID must be configured.
 
 Then go to the **Trackers** tab and add the tracker URLs to include in generated magnet links.
 
