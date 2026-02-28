@@ -1276,6 +1276,11 @@ class RegistrationDB:
         except Exception:
             pass  # column already exists
         try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN allow_follow_visibility INTEGER NOT NULL DEFAULT 1')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
             self._conn().execute('ALTER TABLE users ADD COLUMN gravatar_opt_in INTEGER NOT NULL DEFAULT 0')
             self._conn().commit()
         except Exception:
@@ -5690,6 +5695,19 @@ def _online_badge_html(status: str) -> str:
         f'{label}</span>'
     )
 
+
+def _can_view_follow_visibility(viewer, target_user) -> bool:
+    """Whether `viewer` can see `target_user` follower/following lists."""
+    if viewer is None or target_user is None:
+        return False
+    if int(viewer['id']) == int(target_user['id']):
+        return True
+    if viewer['username'] == SUPER_USER or viewer['is_admin']:
+        return True
+    if 'allow_follow_visibility' not in target_user.keys():
+        return True
+    return bool(target_user['allow_follow_visibility'])
+
 def _gravatar_enabled() -> bool:
     if not REGISTRATION_DB:
         return False
@@ -6028,6 +6046,9 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_invite_signup(path[len('/manage/invite/'):])
         elif path.startswith('/manage/admin/user/'):
             self._get_user_detail(path[len('/manage/admin/user/'):])
+        elif path.startswith('/manage/user/') and path.endswith('/following'):
+            username = path[len('/manage/user/'):-len('/following')].strip('/')
+            self._get_user_following(username)
         elif path.startswith('/manage/user/'):
             self._get_public_profile(path[len('/manage/user/'):])
         elif path == '/manage/profile':
@@ -7145,8 +7166,12 @@ class ManageHandler(BaseHTTPRequestHandler):
         torrents = REGISTRATION_DB.list_torrents(user_id=target['id'], page=page, per_page=per_page)
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
         self._send_html(_render_public_profile(viewer, target, torrents,
-                                               page=page, total_pages=total_pages, total=total))
+                                               page=page, total_pages=total_pages, total=total,
+                                               msg=msg, msg_type=msg_type))
 
     def _get_profile(self):
         user = self._get_session_user()
@@ -7179,10 +7204,43 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage')
         followers = REGISTRATION_DB.list_followers(user['id'], limit=500)
         following = REGISTRATION_DB.list_following(user['id'], limit=500)
+        viewer_following_ids = set(int(r['id']) for r in following)
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg = urllib.parse.unquote(qs.get('msg', [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
-        self._send_html(_render_following_page(user, followers, following, msg=msg, msg_type=msg_type))
+        self._send_html(_render_following_page(
+            user, user, followers, following,
+            base_path='/manage/following',
+            viewer_following_ids=viewer_following_ids,
+            msg=msg, msg_type=msg_type
+        ))
+
+    def _get_user_following(self, username: str):
+        viewer = self._get_session_user()
+        if not viewer:
+            return self._redirect('/manage')
+        if _user_role(viewer) == 'basic':
+            return self._redirect('/manage/dashboard')
+        target = REGISTRATION_DB.get_user(username)
+        if not target:
+            return self._redirect('/manage/dashboard')
+        if not _can_view_follow_visibility(viewer, target):
+            q = urllib.parse.quote_plus('This member has hidden follower visibility.')
+            return self._redirect(f'/manage/user/{urllib.parse.quote(target["username"])}?msg={q}&msg_type=error')
+        followers = REGISTRATION_DB.list_followers(target['id'], limit=500)
+        following = REGISTRATION_DB.list_following(target['id'], limit=500)
+        viewer_following = REGISTRATION_DB.list_following(viewer['id'], limit=500)
+        viewer_following_ids = set(int(r['id']) for r in viewer_following)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        base_path = f'/manage/user/{urllib.parse.quote(target["username"])}/following'
+        self._send_html(_render_following_page(
+            viewer, target, followers, following,
+            base_path=base_path,
+            viewer_following_ids=viewer_following_ids,
+            msg=msg, msg_type=msg_type
+        ))
 
     def _get_topups(self):
         user = self._get_session_user()
@@ -8559,6 +8617,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             show_online = fields.get('show_online', '0') == '1'
             bounty_alerts = fields.get('bounty_alerts', '0') == '1'
             link_torrent_activity = fields.get('link_torrent_activity', '0') == '1'
+            allow_follow_visibility = fields.get('allow_follow_visibility', '0') == '1'
             gravatar_opt_in = fields.get('gravatar_opt_in', '0') == '1'
             gravatar_identity = fields.get('gravatar_identity',
                                            fields.get('gravatar_email', '')).strip()
@@ -8566,6 +8625,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             show_online = ('show_online' not in user.keys() or user['show_online'])
             bounty_alerts = ('bounty_alerts' not in user.keys() or user['bounty_alerts'])
             link_torrent_activity = ('link_torrent_activity' not in user.keys() or user['link_torrent_activity'])
+            allow_follow_visibility = ('allow_follow_visibility' not in user.keys() or user['allow_follow_visibility'])
             gravatar_opt_in = ('gravatar_opt_in' in user.keys() and user['gravatar_opt_in'])
             gravatar_identity = ''
         REGISTRATION_DB.dm_toggle_setting(user['id'], allow)
@@ -8581,11 +8641,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             c.execute(
                 '''UPDATE users
                    SET show_online=?, bounty_alerts=?, link_torrent_activity=?,
-                       gravatar_opt_in=?, gravatar_hash=?
+                       allow_follow_visibility=?, gravatar_opt_in=?, gravatar_hash=?
                    WHERE id=?''',
                 (1 if show_online else 0,
                  1 if bounty_alerts else 0,
                  1 if link_torrent_activity else 0,
+                 1 if allow_follow_visibility else 0,
                  1 if gravatar_opt_in else 0,
                  gravatar_hash if gravatar_opt_in else None,
                  user['id'])
@@ -8593,11 +8654,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         else:
             c.execute(
                 '''UPDATE users
-                   SET show_online=?, bounty_alerts=?, link_torrent_activity=?
+                   SET show_online=?, bounty_alerts=?, link_torrent_activity=?,
+                       allow_follow_visibility=?
                    WHERE id=?''',
                 (1 if show_online else 0,
                  1 if bounty_alerts else 0,
                  1 if link_torrent_activity else 0,
+                 1 if allow_follow_visibility else 0,
                  user['id'])
             )
         c.commit()
@@ -12203,7 +12266,8 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
 
 
 def _render_public_profile(viewer, target_user, torrents: list,
-                            page: int = 1, total_pages: int = 1, total: int = 0) -> str:
+                            page: int = 1, total_pages: int = 1, total: int = 0,
+                            msg: str = '', msg_type: str = 'error') -> str:
     """Public-facing user profile — shows role, join date, torrent count. No sensitive fields."""
     uname     = target_user['username']
     uname_h   = _h(uname)
@@ -12229,6 +12293,15 @@ def _render_public_profile(viewer, target_user, torrents: list,
     followers_count, following_count = REGISTRATION_DB.get_follow_counts(target_user['id']) if REGISTRATION_DB else (0, 0)
     is_following = (REGISTRATION_DB.is_following(viewer['id'], target_user['id'])
                     if (REGISTRATION_DB and not is_own) else False)
+    can_view_follow_lists = _can_view_follow_visibility(viewer, target_user)
+    follow_lists_url = (f'/manage/user/{urllib.parse.quote(uname)}/following'
+                        if not is_own else '/manage/following')
+    if is_own or can_view_follow_lists:
+        followers_value = f'<a href="{follow_lists_url}" class="user-link">{followers_count}</a>'
+        following_value = f'<a href="{follow_lists_url}" class="user-link">{following_count}</a>'
+    else:
+        followers_value = '<span class="hash" title="This member has hidden follower visibility">Private</span>'
+        following_value = '<span class="hash" title="This member has hidden follower visibility">Private</span>'
 
     def _pub_row(label, value):
         return (f'<tr>'
@@ -12292,8 +12365,8 @@ def _render_public_profile(viewer, target_user, torrents: list,
                           + (f' <span style="color:var(--muted);font-size:0.8rem">🔥 {streak}-day streak</span>'
                              if streak > 1 else ''))}
       {_pub_row('Torrents', str(total))}
-      {_pub_row('Followers', f'<a href="/manage/following" class="user-link">{followers_count}</a>')}
-      {_pub_row('Following', f'<a href="/manage/following" class="user-link">{following_count}</a>')}
+      {_pub_row('Followers', followers_value)}
+      {_pub_row('Following', following_value)}
     </table>
   </div>
 
@@ -12314,7 +12387,7 @@ def _render_public_profile(viewer, target_user, torrents: list,
     {_pagination_html(page, total_pages, base_url)}
   </div>'''
 
-    return _manage_page(uname_h, body, user=viewer)
+    return _manage_page(uname_h, body, user=viewer, msg=msg, msg_type=msg_type)
 
 
 def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
@@ -12358,6 +12431,9 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     followers_count, following_count = REGISTRATION_DB.get_follow_counts(target_user['id']) if REGISTRATION_DB else (0, 0)
     is_following = (REGISTRATION_DB.is_following(viewer['id'], target_user['id'])
                     if (REGISTRATION_DB and not is_own_profile) else False)
+    can_view_follow_lists = _can_view_follow_visibility(viewer, target_user)
+    follow_lists_url = (f'/manage/user/{urllib.parse.quote(uname)}/following'
+                        if not is_own_profile else '/manage/following')
     raw_cb = target_user['created_by'] or '--'
     if raw_cb.startswith('invite:'):
         inviter = _h(raw_cb[7:])
@@ -12375,10 +12451,12 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + row('Points',         f'<span style="color:{pts_color};font-weight:bold">{pts_val}</span>'
                                 + (f' <span style="color:var(--muted);font-size:0.8rem">(🔥 {streak_val}-day streak)</span>'
                                    if streak_val > 1 else ''))
-        + row('Followers',      (f'<a href="/manage/following" class="user-link">{followers_count}</a>'
-                                 if is_own_profile else str(followers_count)))
-        + row('Following',      (f'<a href="/manage/following" class="user-link">{following_count}</a>'
-                                 if is_own_profile else str(following_count)))
+        + row('Followers',      (f'<a href="{follow_lists_url}" class="user-link">{followers_count}</a>'
+                                 if (is_own_profile or can_view_follow_lists)
+                                 else '<span class="hash" title="This member has hidden follower visibility">Private</span>'))
+        + row('Following',      (f'<a href="{follow_lists_url}" class="user-link">{following_count}</a>'
+                                 if (is_own_profile or can_view_follow_lists)
+                                 else '<span class="hash" title="This member has hidden follower visibility">Private</span>'))
     )
 
     # ── IP section (superuser only) ───────────────────────────
@@ -12595,6 +12673,10 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<input type="checkbox" name="link_torrent_activity" value="1" '
             + ('checked' if ('link_torrent_activity' not in viewer.keys() or viewer['link_torrent_activity']) else '')
             + '> Allow linking my torrent swarm activity</label>'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            '<input type="checkbox" name="allow_follow_visibility" value="1" '
+            + ('checked' if ('allow_follow_visibility' not in viewer.keys() or viewer['allow_follow_visibility']) else '')
+            + '> Allow others to view my followers and following</label>'
             + gravatar_section
             + '<div><button type="submit" class="btn btn-sm">Save</button></div>'
             '</form>'
@@ -12828,9 +12910,40 @@ def _render_topup_history_section(user, orders: list, force_show: bool = False,
     )
 
 
-def _render_following_page(viewer, followers: list, following: list,
+def _render_following_page(viewer, target_user, followers: list, following: list,
+                           base_path: str = '/manage/following',
+                           viewer_following_ids=None,
                            msg: str = '', msg_type: str = 'error') -> str:
-    viewer_following_ids = set(int(r['id']) for r in following)
+    if viewer_following_ids is None:
+        viewer_following_ids = set(int(r['id']) for r in following)
+    else:
+        viewer_following_ids = set(int(i) for i in viewer_following_ids)
+    is_own = int(viewer['id']) == int(target_user['id'])
+    target_uname = _h(target_user['username'])
+    viewer_id = int(viewer['id'])
+
+    def _follow_action(r, prefer_follow_back: bool = False) -> str:
+        rid = int(r['id'])
+        uname = _h(r['username'])
+        if rid == viewer_id:
+            return '<span class="hash" style="font-size:0.78rem">You</span>'
+        if rid in viewer_following_ids:
+            return (
+                '<form method="POST" action="/manage/unfollow" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname}">'
+                f'<input type="hidden" name="referer" value="{_h(base_path)}">'
+                '<button class="btn btn-sm" onmouseover="this.textContent=\'❌ Unfollow\'" '
+                'onmouseout="this.textContent=\'✅ Following\'">✅ Following</button>'
+                '</form>'
+            )
+        follow_label = 'Follow back' if (is_own and prefer_follow_back) else 'Follow'
+        return (
+            '<form method="POST" action="/manage/follow" style="display:inline">'
+            f'<input type="hidden" name="username" value="{uname}">'
+            f'<input type="hidden" name="referer" value="{_h(base_path)}">'
+            f'<button class="btn btn-sm btn-green">{follow_label}</button>'
+            '</form>'
+        )
 
     def _role_badge_row(u) -> str:
         role = 'basic'
@@ -12848,23 +12961,7 @@ def _render_following_page(viewer, followers: list, following: list,
             uname = _h(r['username'])
             urole = _role_badge_row(r)
             since = _h((r['followed_at'] or '')[:16].replace('T', ' '))
-            rid = int(r['id'])
-            if rid in viewer_following_ids:
-                action = (
-                    '<form method="POST" action="/manage/unfollow" style="display:inline">'
-                    f'<input type="hidden" name="username" value="{uname}">'
-                    '<input type="hidden" name="referer" value="/manage/following">'
-                    '<button class="btn btn-sm">Unfollow</button>'
-                    '</form>'
-                )
-            else:
-                action = (
-                    '<form method="POST" action="/manage/follow" style="display:inline">'
-                    f'<input type="hidden" name="username" value="{uname}">'
-                    '<input type="hidden" name="referer" value="/manage/following">'
-                    '<button class="btn btn-sm btn-green">Follow back</button>'
-                    '</form>'
-                )
+            action = _follow_action(r, prefer_follow_back=True)
             out += (
                 '<tr>'
                 f'<td><a href="/manage/user/{uname}" class="user-link">{uname}</a></td>'
@@ -12883,13 +12980,7 @@ def _render_following_page(viewer, followers: list, following: list,
             uname = _h(r['username'])
             urole = _role_badge_row(r)
             since = _h((r['followed_at'] or '')[:16].replace('T', ' '))
-            action = (
-                '<form method="POST" action="/manage/unfollow" style="display:inline">'
-                f'<input type="hidden" name="username" value="{uname}">'
-                '<input type="hidden" name="referer" value="/manage/following">'
-                '<button class="btn btn-sm">Unfollow</button>'
-                '</form>'
-            )
+            action = _follow_action(r, prefer_follow_back=False)
             out += (
                 '<tr>'
                 f'<td><a href="/manage/user/{uname}" class="user-link">{uname}</a></td>'
@@ -12902,9 +12993,12 @@ def _render_following_page(viewer, followers: list, following: list,
             out = '<tr><td colspan="4" class="empty">You are not following anyone yet</td></tr>'
         return out
 
+    page_title = 'Followers' if is_own else f'{target_uname} Followers'
+    back_url = '/manage/profile' if is_own else f'/manage/user/{urllib.parse.quote(target_user["username"])}'
+    back_label = 'Profile' if is_own else f'{target_uname} profile'
     body = (
-        '<div class="page-title">Followers</div>'
-        '<div class="page-sub"><a href="/manage/profile" style="color:var(--muted);text-decoration:none">&#10094; Profile</a></div>'
+        f'<div class="page-title">{page_title}</div>'
+        f'<div class="page-sub"><a href="{back_url}" style="color:var(--muted);text-decoration:none">&#10094; {back_label}</a></div>'
         '<div class="two-col">'
         '<div class="card">'
         f'<div class="card-title">Followers ({len(followers)})</div>'
@@ -12920,7 +13014,7 @@ def _render_following_page(viewer, followers: list, following: list,
         '</table></div></div>'
         '</div>'
     )
-    return _manage_page('Followers', body, user=viewer, msg=_h(msg), msg_type=msg_type)
+    return _manage_page(page_title, body, user=viewer, msg=_h(msg), msg_type=msg_type)
 
 
 def _render_topups_page(user, orders: list, cfg: dict, msg: str = '', msg_type: str = 'error') -> str:
