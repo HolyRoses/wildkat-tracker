@@ -28,6 +28,7 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Torrent management UI** — upload `.torrent` files, browse/search listings, inspect detail pages, copy hashes/magnets
 - **Upload safety limits** — request-size, file-count, and per-file caps with partial-success batch handling
 - **Profile and privacy controls** — DM opt-in, online status visibility, bounty alerts, torrent activity linking, optional Gravatar
+- **Followers system** — follow/unfollow members, follower activity notifications, and Most Followed leaderboard category
 - **Direct messages** — threaded inbox/sent/compose/blocked flow with optional point cost and daily limits
 - **Comments and notifications** — threaded comments, @mentions, bell dropdown, and full notifications page
 - **Points economy** — earning, spending, transfers, streaks, and ledger-backed accounting

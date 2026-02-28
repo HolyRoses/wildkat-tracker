@@ -1144,6 +1144,17 @@ class RegistrationDB:
                 created_at     TEXT    NOT NULL,
                 is_read        INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS user_follows (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                follower_user_id  INTEGER NOT NULL,
+                followed_user_id  INTEGER NOT NULL,
+                created_at        TEXT    NOT NULL,
+                UNIQUE(follower_user_id, followed_user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_follows_follower
+              ON user_follows(follower_user_id, followed_user_id);
+            CREATE INDEX IF NOT EXISTS idx_user_follows_followed
+              ON user_follows(followed_user_id, follower_user_id);
         ''')
         c.commit()
         # ── Bounty system (migration-safe) ───────────────────
@@ -2895,6 +2906,88 @@ class RegistrationDB:
         self._conn().commit()
         self._log(actor, 'disable_user' if disabled else 'enable_user', username)
 
+    # ── Followers ─────────────────────────────────────────────
+
+    def is_following(self, follower_user_id: int, followed_user_id: int) -> bool:
+        if follower_user_id == followed_user_id:
+            return False
+        row = self._conn().execute(
+            'SELECT 1 FROM user_follows WHERE follower_user_id=? AND followed_user_id=?',
+            (follower_user_id, followed_user_id)
+        ).fetchone()
+        return row is not None
+
+    def follow_user(self, follower_user_id: int, followed_user_id: int) -> tuple[bool, str]:
+        if follower_user_id == followed_user_id:
+            return False, 'You cannot follow yourself.'
+        c = self._conn()
+        follower = c.execute('SELECT id FROM users WHERE id=?', (follower_user_id,)).fetchone()
+        followed = c.execute('SELECT id,is_disabled FROM users WHERE id=?', (followed_user_id,)).fetchone()
+        if not follower or not followed:
+            return False, 'User not found.'
+        if followed['is_disabled']:
+            return False, 'Cannot follow a disabled account.'
+        try:
+            c.execute(
+                'INSERT INTO user_follows (follower_user_id,followed_user_id,created_at) VALUES (?,?,?)',
+                (follower_user_id, followed_user_id, self._ts())
+            )
+            c.commit()
+            return True, 'Now following.'
+        except sqlite3.IntegrityError:
+            return False, 'Already following.'
+
+    def unfollow_user(self, follower_user_id: int, followed_user_id: int) -> tuple[bool, str]:
+        c = self._conn()
+        cur = c.execute(
+            'DELETE FROM user_follows WHERE follower_user_id=? AND followed_user_id=?',
+            (follower_user_id, followed_user_id)
+        )
+        c.commit()
+        if cur.rowcount:
+            return True, 'Unfollowed.'
+        return False, 'Not currently following.'
+
+    def count_followers(self, user_id: int) -> int:
+        return int(self._conn().execute(
+            'SELECT COUNT(*) FROM user_follows WHERE followed_user_id=?',
+            (user_id,)
+        ).fetchone()[0] or 0)
+
+    def count_following(self, user_id: int) -> int:
+        return int(self._conn().execute(
+            'SELECT COUNT(*) FROM user_follows WHERE follower_user_id=?',
+            (user_id,)
+        ).fetchone()[0] or 0)
+
+    def get_follow_counts(self, user_id: int) -> tuple[int, int]:
+        return self.count_followers(user_id), self.count_following(user_id)
+
+    def list_follower_user_ids(self, followed_user_id: int) -> list[int]:
+        rows = self._conn().execute(
+            'SELECT follower_user_id FROM user_follows WHERE followed_user_id=?',
+            (followed_user_id,)
+        ).fetchall()
+        return [int(r['follower_user_id']) for r in rows]
+
+    def list_followers(self, user_id: int, limit: int = 500) -> list:
+        return self._conn().execute(
+            'SELECT u.id,u.username,u.is_admin,u.is_standard,u.is_disabled,f.created_at AS followed_at '
+            'FROM user_follows f JOIN users u ON u.id=f.follower_user_id '
+            'WHERE f.followed_user_id=? '
+            'ORDER BY f.id DESC LIMIT ?',
+            (user_id, limit)
+        ).fetchall()
+
+    def list_following(self, user_id: int, limit: int = 500) -> list:
+        return self._conn().execute(
+            'SELECT u.id,u.username,u.is_admin,u.is_standard,u.is_disabled,f.created_at AS followed_at '
+            'FROM user_follows f JOIN users u ON u.id=f.followed_user_id '
+            'WHERE f.follower_user_id=? '
+            'ORDER BY f.id DESC LIMIT ?',
+            (user_id, limit)
+        ).fetchall()
+
     def delete_all_users(self, actor: str, except_username: str) -> int:
         """Delete every user except the super-user. Returns count deleted."""
         rows = self._conn().execute(
@@ -2905,6 +2998,11 @@ class RegistrationDB:
         self._conn().execute(
             'UPDATE torrents SET uploaded_by_id=NULL, uploaded_by_username=?'
             ' WHERE uploaded_by_username != ?', ('[deleted]', except_username)
+        )
+        self._conn().execute(
+            'DELETE FROM user_follows WHERE follower_user_id IN (SELECT id FROM users WHERE username != ?)'
+            ' OR followed_user_id IN (SELECT id FROM users WHERE username != ?)',
+            (except_username, except_username)
         )
         self._conn().execute('DELETE FROM users WHERE username != ?', (except_username,))
         self._conn().commit()
@@ -2917,6 +3015,11 @@ class RegistrationDB:
         self._conn().execute(
             'UPDATE torrents SET uploaded_by_id=NULL, uploaded_by_username=?'
             ' WHERE uploaded_by_username=?', ('[deleted]', username)
+        )
+        self._conn().execute(
+            'DELETE FROM user_follows WHERE follower_user_id IN (SELECT id FROM users WHERE username=?)'
+            ' OR followed_user_id IN (SELECT id FROM users WHERE username=?)',
+            (username, username)
         )
         self._conn().execute('DELETE FROM users WHERE username=?', (username,))
         self._conn().commit()
@@ -3414,6 +3517,7 @@ class RegistrationDB:
         if claimer_user:
             self._notify_bounty(claimer, 'bounty_fulfilled', b['created_by'], bounty_id,
                                 b['description'], claimer_pay, ih)
+            self.notify_followers_bounty_fulfilled(claimer, bounty_id, b['description'])
         return True, 'Bounty fulfilled.'
 
     def expire_bounties(self):
@@ -3524,6 +3628,12 @@ class RegistrationDB:
             'WHERE u.is_standard=1 OR u.is_admin=1 '
             'GROUP BY u.username ORDER BY comment_count DESC LIMIT ?', top_n)
 
+        popular = _rows(
+            'SELECT u.username, COUNT(f.id) AS follower_count '
+            'FROM users u LEFT JOIN user_follows f ON f.followed_user_id=u.id '
+            'WHERE u.is_standard=1 OR u.is_admin=1 '
+            'GROUP BY u.id ORDER BY follower_count DESC, u.username ASC LIMIT ?', top_n)
+
         return {
             'holders':       holders,
             'earners':       earners,
@@ -3531,6 +3641,7 @@ class RegistrationDB:
             'bounty_hunters':bounty_hunters,
             'streaks':       streaks,
             'chatty':        chatty,
+            'popular':       popular,
         }
 
     def list_bounties_by_user(self, username: str) -> dict:
@@ -3811,6 +3922,7 @@ class RegistrationDB:
         c.execute('DELETE FROM dm_blocklist')
         c.execute('DELETE FROM ip_allowlist')
         c.execute('DELETE FROM login_history')
+        c.execute('DELETE FROM user_follows')
         c.execute('DELETE FROM topup_reconciliation_actions')
         c.execute('DELETE FROM topup_webhook_events')
         c.execute('DELETE FROM topup_orders')
@@ -4002,6 +4114,51 @@ class RegistrationDB:
             (user_id, user_id)
         )
         c.commit()
+
+    def notify_followed_user_new_follower(self, followed_user_id: int,
+                                          follower_user_id: int,
+                                          follower_username: str) -> None:
+        self.add_notification(
+            followed_user_id, 'follow_new_follower', follower_username,
+            'FOLLOW:USER', 'started following you', follower_user_id
+        )
+
+    def notify_followers_torrent_upload(self, actor_user_id: int,
+                                        actor_username: str,
+                                        info_hash: str,
+                                        torrent_name: str) -> int:
+        follower_ids = self.list_follower_user_ids(actor_user_id)
+        sent = 0
+        for fid in follower_ids:
+            if fid == actor_user_id:
+                continue
+            self.add_notification(
+                fid, 'followed_upload', actor_username, info_hash, torrent_name, 0
+            )
+            sent += 1
+        return sent
+
+    def notify_followers_bounty_fulfilled(self, actor_username: str,
+                                          bounty_id: int,
+                                          description: str) -> int:
+        actor = self.get_user(actor_username)
+        if not actor:
+            return 0
+        follower_ids = self.list_follower_user_ids(actor['id'])
+        sent = 0
+        for fid in follower_ids:
+            if fid == actor['id']:
+                continue
+            self._conn().execute(
+                'INSERT INTO notifications (user_id,type,from_username,info_hash,torrent_name,'
+                'comment_id,created_at,is_read) VALUES (?,?,?,?,?,?,?,0)',
+                (fid, 'followed_bounty_fulfilled', actor_username,
+                 f'BOUNTY:{bounty_id}', description[:120], 0, self._ts())
+            )
+            sent += 1
+        if sent:
+            self._conn().commit()
+        return sent
 
     def get_unread_notifications(self, user_id: int, limit: int = 5) -> list:
         return self._conn().execute(
@@ -5875,6 +6032,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_public_profile(path[len('/manage/user/'):])
         elif path == '/manage/profile':
             self._get_profile()
+        elif path == '/manage/following':
+            self._get_following()
         elif path == '/robots.txt':
             self._serve_robots()
         elif path == '/manage/search':
@@ -6097,6 +6256,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_bounty_comment()
         elif path == '/manage/points/transfer':
             self._post_points_transfer()
+        elif path == '/manage/follow':
+            self._post_follow()
+        elif path == '/manage/unfollow':
+            self._post_unfollow()
         elif path == '/manage/topup/create':
             self._post_topup_create()
         elif path == '/manage/admin/topup/reconcile':
@@ -6265,6 +6428,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         else:
             file_list = raw_files
         added = []
+        added_with_hash = []
         skipped_duplicate = 0
         skipped_too_large = 0
         skipped_invalid   = 0
@@ -6287,8 +6451,14 @@ class ManageHandler(BaseHTTPRequestHandler):
                 REGISTRATION_DB.award_upload_points(user['id'], name, ih)
                 REGISTRATION_DB.check_auto_promote(user['id'])
                 added.append(name)
+                added_with_hash.append((ih, name))
             else:
                 skipped_duplicate += 1
+        follower_notifs = 0
+        for ih, tname in added_with_hash:
+            follower_notifs += REGISTRATION_DB.notify_followers_torrent_upload(
+                user['id'], user['username'], ih, tname
+            )
         parts = []
         if added:
             parts.append(f'{len(added)} registered')
@@ -6312,6 +6482,8 @@ class ManageHandler(BaseHTTPRequestHandler):
                   msg[:80], msg_type, len(added),
                   skipped_duplicate + skipped_too_large + skipped_invalid + skipped_over_max_files,
                   skipped_invalid)
+        if follower_notifs:
+            log.debug('UPLOAD follower notifications sent=%d uploader=%s', follower_notifs, user['username'])
         torrents = REGISTRATION_DB.list_torrents(user_id=user['id'])
         self._send_html(_render_dashboard(user, torrents, msg, msg_type))
 
@@ -6463,13 +6635,19 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ih_up = ih.upper()
                 if ih_up.startswith('TOPUP:'):
                     return self._redirect('/manage/topups')
+                if ih_up.startswith('FOLLOW:'):
+                    if int(n['comment_id'] or 0) > 0:
+                        follower = REGISTRATION_DB.get_user_by_id(int(n['comment_id']))
+                        if follower:
+                            return self._redirect(f'/manage/user/{urllib.parse.quote(follower["username"])}')
+                    return self._redirect('/manage/following')
                 if ih_up.startswith('BOUNTY:'):
                     bid = ih.split(':', 1)[1] if ':' in ih else ''
                     if bid.isdigit():
                         return self._redirect(f'/manage/bounty/{bid}')
                     return self._redirect('/manage/bounty')
-                return self._redirect(
-                    f'/manage/torrent/{ih.lower()}#comment-{n["comment_id"]}')
+                anchor = f'#comment-{n["comment_id"]}' if int(n['comment_id'] or 0) > 0 else ''
+                return self._redirect(f'/manage/torrent/{ih.lower()}{anchor}')
         self._redirect('/manage/notifications')
 
     def _post_delete_all_comments_global(self):
@@ -6994,6 +7172,17 @@ class ManageHandler(BaseHTTPRequestHandler):
                                             total=total, base_url='/manage/profile',
                                             ledger=ledger, bounty_data=bounty_data, topup_orders=topup_orders,
                                             msg=msg, msg_type=msg_type))
+
+    def _get_following(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        followers = REGISTRATION_DB.list_followers(user['id'], limit=500)
+        following = REGISTRATION_DB.list_following(user['id'], limit=500)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        self._send_html(_render_following_page(user, followers, following, msg=msg, msg_type=msg_type))
 
     def _get_topups(self):
         user = self._get_session_user()
@@ -7556,6 +7745,45 @@ class ManageHandler(BaseHTTPRequestHandler):
         q = urllib.parse.quote(msg)
         self._redirect(f'/manage/profile?msg={q}&msg_type={"success" if ok else "error"}')
 
+    def _post_follow(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target_username = fields.get('username', '').strip()
+        referer = fields.get('referer', '').strip()
+        target = REGISTRATION_DB.get_user(target_username) if target_username else None
+        if not target:
+            return self._redirect('/manage/following?msg=User+not+found.&msg_type=error')
+        ok, msg = REGISTRATION_DB.follow_user(user['id'], target['id'])
+        if ok:
+            REGISTRATION_DB._log(user['username'], 'follow_user', target['username'])
+            REGISTRATION_DB.notify_followed_user_new_follower(
+                target['id'], user['id'], user['username']
+            )
+        dest = referer if referer.startswith('/manage/') else f'/manage/user/{urllib.parse.quote(target["username"])}'
+        glue = '&' if '?' in dest else '?'
+        self._redirect(f'{dest}{glue}msg={urllib.parse.quote(msg)}&msg_type={"success" if ok else "error"}')
+
+    def _post_unfollow(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target_username = fields.get('username', '').strip()
+        referer = fields.get('referer', '').strip()
+        target = REGISTRATION_DB.get_user(target_username) if target_username else None
+        if not target:
+            return self._redirect('/manage/following?msg=User+not+found.&msg_type=error')
+        ok, msg = REGISTRATION_DB.unfollow_user(user['id'], target['id'])
+        if ok:
+            REGISTRATION_DB._log(user['username'], 'unfollow_user', target['username'])
+        dest = referer if referer.startswith('/manage/') else '/manage/following'
+        glue = '&' if '?' in dest else '?'
+        self._redirect(f'{dest}{glue}msg={urllib.parse.quote(msg)}&msg_type={"success" if ok else "error"}')
+
     def _post_topup_create(self):
         user = self._get_session_user()
         if not user:
@@ -7923,6 +8151,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         for n in items:
             is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
             is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
+            is_follow = str(n['info_hash']).upper().startswith('FOLLOW:')
             if is_bounty:
                 bid   = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
@@ -7935,6 +8164,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                     'bounty_contribution':    ('➕', 'added points to your bounty'),
                     'bounty_expired':         ('⏰', 'bounty expired:'),
                     'bounty_uploader_payout': ('💰', 'fulfilled a bounty using your upload:'),
+                    'followed_bounty_fulfilled': ('✅', 'fulfilled a bounty:'),
                 }
                 icon, label = icons.get(ntype, ('🔔', 'bounty update on'))
                 anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
@@ -7954,10 +8184,25 @@ class ManageHandler(BaseHTTPRequestHandler):
                          if n['type'] == 'topup_refunded'
                          else f'top-up #{oid_disp} credited')
                 url = '/manage/topups'
+            elif is_follow:
+                icon = '👥'
+                label = 'is now following you!'
+                follow_uid = int(n['comment_id'] or 0)
+                url = '/manage/following'
+                if follow_uid > 0 and REGISTRATION_DB:
+                    fu = REGISTRATION_DB.get_user_by_id(follow_uid)
+                    if fu:
+                        url = f'/manage/user/{urllib.parse.quote(fu["username"])}'
             else:
-                icon  = '💬' if n['type'] == 'reply' else '@'
-                label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
-                url   = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
+                if n['type'] == 'followed_upload':
+                    icon = '📦'
+                    label = 'uploaded a new torrent'
+                    url = f'/manage/torrent/{n["info_hash"].lower()}'
+                else:
+                    icon  = '💬' if n['type'] == 'reply' else '@'
+                    label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
+                    anchor = f'#comment-{n["comment_id"]}' if int(n['comment_id'] or 0) > 0 else ''
+                    url = f'/manage/torrent/{n["info_hash"].lower()}{anchor}'
             out.append({
                 'id':       n['id'],
                 'icon':     icon,
@@ -9403,6 +9648,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
         for n in unread_items:
             is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
             is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
+            is_follow = str(n['info_hash']).upper().startswith('FOLLOW:')
             if is_bounty:
                 bid = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
@@ -9415,6 +9661,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     'bounty_contribution':     ('➕', 'added points to your bounty'),
                     'bounty_expired':          ('⏰', 'bounty expired:'),
                     'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
+                    'followed_bounty_fulfilled': ('✅', 'fulfilled a bounty:'),
                 }.get(ntype, ('🔔', 'bounty update on'))
                 tname_h = _h(n['torrent_name'][:40] + ('…' if len(n['torrent_name']) > 40 else ''))
                 from_h  = _h(n['from_username'])
@@ -9445,24 +9692,54 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     f'<div class="notif-item-ts">{ts_h}</div>'
                     f'</button>'
                 )
+            elif is_follow:
+                from_h = _h(n['from_username'])
+                ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
+                n_id = n['id']
+                target_url = '/manage/following'
+                follow_uid = int(n['comment_id'] or 0)
+                if follow_uid > 0 and REGISTRATION_DB:
+                    fu = REGISTRATION_DB.get_user_by_id(follow_uid)
+                    if fu:
+                        target_url = f'/manage/user/{urllib.parse.quote(fu["username"])}'
+                dropdown_items += (
+                    f'<button class="notif-item" '
+                    f'onclick="readNotif({n_id},\'{target_url}\')"'
+                    f' aria-label="follow notification from {from_h}">'
+                    f'<div class="notif-item-type">👥 <strong>{from_h}</strong> is now following you!</div>'
+                    f'<div class="notif-item-text"><em>{_h(n["torrent_name"] or "")}</em></div>'
+                    f'<div class="notif-item-ts">{ts_h}</div>'
+                    f'</button>'
+                )
             else:
-                icon = '💬' if n['type'] == 'reply' else '@'
-                label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
                 tname_h = _h(n['torrent_name'][:40] + ('…' if len(n['torrent_name']) > 40 else ''))
                 from_h = _h(n['from_username'])
                 ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
                 n_id   = n['id']
                 n_hash = n['info_hash'].lower()
-                n_cid  = n['comment_id']
-                dropdown_items += (
-                    f'<button class="notif-item" '
-                    f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}#comment-{n_cid}\')"'
-                    f' aria-label="{label} by {from_h} on {tname_h}">'
-                    f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
-                    f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
-                    f'<div class="notif-item-ts">{ts_h}</div>'
-                    f'</button>'
-                )
+                if n['type'] == 'followed_upload':
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}\')"'
+                        f' aria-label="new upload by {from_h}">'
+                        f'<div class="notif-item-type">📦 <strong>{from_h}</strong> uploaded a new torrent</div>'
+                        f'<div class="notif-item-text"><em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
+                else:
+                    icon = '💬' if n['type'] == 'reply' else '@'
+                    label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
+                    n_cid  = n['comment_id']
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}#comment-{n_cid}\')"'
+                        f' aria-label="{label} by {from_h} on {tname_h}">'
+                        f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
+                        f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
         if not dropdown_items:
             dropdown_items = '<div class="notif-empty">No unread notifications</div>'
         bell_html = (
@@ -9492,6 +9769,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
         center_nav = (
             '<a href="/manage/dashboard" class="nav-btn">🖥 Dashboard</a>'
             '<a href="/manage/search" class="nav-btn">🔍 Search</a>'
+            '<a href="/manage/following" class="nav-btn">👥 Following</a>'
             + ('' if role == 'basic' else
                '<a href="/manage/bounty" class="nav-btn">🎯 Bounties</a>'
                '<a href="/manage/leaderboard" class="nav-btn">🏆 Leaderboard</a>')
@@ -11589,6 +11867,7 @@ def _render_notifications_page(viewer) -> str:
     for n in notifs:
         is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
         is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
+        is_follow = str(n['info_hash']).upper().startswith('FOLLOW:')
         ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
         from_h = _h(n['from_username'])
         tname_h = _h(n['torrent_name'])
@@ -11607,6 +11886,7 @@ def _render_notifications_page(viewer) -> str:
                 'bounty_contribution':     ('➕', 'added points to your bounty'),
                 'bounty_expired':          ('⏰', 'bounty expired:'),
                 'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
+                'followed_bounty_fulfilled': ('✅', 'fulfilled a bounty:'),
             }.get(ntype, ('🔔', 'bounty update on'))
             anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
             url = f'/manage/bounty/{bid}{anchor}'
@@ -11648,23 +11928,58 @@ def _render_notifications_page(viewer) -> str:
                 f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
                 f'</div>'
             )
-        else:
-            icon  = '💬' if n['type'] == 'reply' else '@ '
-            label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
-            url   = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
-            read_js = f"readNotif({n_id},'{url}')"
+        elif is_follow:
+            target_url = '/manage/following'
+            follow_uid = int(n['comment_id'] or 0)
+            if follow_uid > 0 and REGISTRATION_DB:
+                fu = REGISTRATION_DB.get_user_by_id(follow_uid)
+                if fu:
+                    target_url = f'/manage/user/{urllib.parse.quote(fu["username"])}'
+            read_js = f"readNotif({n_id},'{target_url}')"
             rows += (
                 f'<div class="notif-page-item{unread_cls}">'
                 f'<div>'
-                f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
-                f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
-                f' {label} on '
-                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                f'<div style="font-size:0.9rem"><span style="margin-right:6px">👥</span>'
+                f'<a href="{target_url}" class="user-link">{from_h}</a>'
+                f' is now following you!</div>'
                 f'<div class="notif-page-meta">{ts_h}</div>'
                 f'</div>'
-                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
                 f'</div>'
             )
+        else:
+            if n['type'] == 'followed_upload':
+                url = f'/manage/torrent/{n["info_hash"].lower()}'
+                read_js = f"readNotif({n_id},'{url}')"
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">📦</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' uploaded a new torrent: '
+                    f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                    f'</div>'
+                )
+            else:
+                icon  = '💬' if n['type'] == 'reply' else '@ '
+                label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
+                url   = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
+                read_js = f"readNotif({n_id},'{url}')"
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' {label} on '
+                    f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                    f'</div>'
+                )
 
     if not rows:
         rows = '<div style="text-align:center;padding:48px;color:var(--muted);font-family:var(--mono);font-size:0.85rem">No notifications yet</div>'
@@ -11911,6 +12226,9 @@ def _render_public_profile(viewer, target_user, torrents: list,
     streak    = target_user['login_streak'] if 'login_streak' in target_user.keys() else 0
     pts_color = 'var(--danger)' if pts_val < 0 else 'var(--accent)'
     status_badge = _online_badge_html(_online_status(target_user))
+    followers_count, following_count = REGISTRATION_DB.get_follow_counts(target_user['id']) if REGISTRATION_DB else (0, 0)
+    is_following = (REGISTRATION_DB.is_following(viewer['id'], target_user['id'])
+                    if (REGISTRATION_DB and not is_own) else False)
 
     def _pub_row(label, value):
         return (f'<tr>'
@@ -11930,6 +12248,25 @@ def _render_public_profile(viewer, target_user, torrents: list,
     sharing_card = _render_profile_sharing_card(target_user)
 
     avatar_html = _avatar_html(target_user, 34)
+    follow_btn = ''
+    if not is_own:
+        if is_following:
+            follow_btn = (
+                '<form method="POST" action="/manage/unfollow" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname_h}">'
+                f'<input type="hidden" name="referer" value="/manage/user/{uname_h}">'
+                '<button class="btn btn-sm" onmouseover="this.textContent=\'❌ Unfollow\'" '
+                'onmouseout="this.textContent=\'✅ Following\'">✅ Following</button>'
+                '</form>'
+            )
+        else:
+            follow_btn = (
+                '<form method="POST" action="/manage/follow" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname_h}">'
+                f'<input type="hidden" name="referer" value="/manage/user/{uname_h}">'
+                '<button class="btn btn-sm btn-green">Follow</button>'
+                '</form>'
+            )
     body = f'''
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
     {avatar_html}
@@ -11941,6 +12278,7 @@ def _render_public_profile(viewer, target_user, torrents: list,
     &nbsp;&#183;&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
     {admin_link}
     {'&nbsp;&#183;&nbsp; <a href="/manage/messages?to=' + uname_h + '" class="btn btn-sm">📬 Send DM</a>' if (not is_own and vrole != 'basic' and REGISTRATION_DB and REGISTRATION_DB.get_setting('dm_enabled','1') == '1' and not target_user['is_disabled']) else ''}
+    {'&nbsp;&#183;&nbsp; ' + follow_btn if follow_btn else ''}
   </div>
 
   <div class="card" style="max-width:400px">
@@ -11954,6 +12292,8 @@ def _render_public_profile(viewer, target_user, torrents: list,
                           + (f' <span style="color:var(--muted);font-size:0.8rem">🔥 {streak}-day streak</span>'
                              if streak > 1 else ''))}
       {_pub_row('Torrents', str(total))}
+      {_pub_row('Followers', f'<a href="/manage/following" class="user-link">{followers_count}</a>')}
+      {_pub_row('Following', f'<a href="/manage/following" class="user-link">{following_count}</a>')}
     </table>
   </div>
 
@@ -12015,6 +12355,9 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     credits_val = target_user['credits'] if 'credits' in target_user.keys() else 0
     pts_val     = target_user['points']  if 'points'  in target_user.keys() else 0
     streak_val  = target_user['login_streak'] if 'login_streak' in target_user.keys() else 0
+    followers_count, following_count = REGISTRATION_DB.get_follow_counts(target_user['id']) if REGISTRATION_DB else (0, 0)
+    is_following = (REGISTRATION_DB.is_following(viewer['id'], target_user['id'])
+                    if (REGISTRATION_DB and not is_own_profile) else False)
     raw_cb = target_user['created_by'] or '--'
     if raw_cb.startswith('invite:'):
         inviter = _h(raw_cb[7:])
@@ -12032,6 +12375,10 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + row('Points',         f'<span style="color:{pts_color};font-weight:bold">{pts_val}</span>'
                                 + (f' <span style="color:var(--muted);font-size:0.8rem">(🔥 {streak_val}-day streak)</span>'
                                    if streak_val > 1 else ''))
+        + row('Followers',      (f'<a href="/manage/following" class="user-link">{followers_count}</a>'
+                                 if is_own_profile else str(followers_count)))
+        + row('Following',      (f'<a href="/manage/following" class="user-link">{following_count}</a>'
+                                 if is_own_profile else str(following_count)))
     )
 
     # ── IP section (superuser only) ───────────────────────────
@@ -12225,6 +12572,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<div style="display:flex;flex-direction:column;gap:14px">'
             '<div>'
             '<a href="/manage/password" class="btn btn-primary">Change Password</a>'
+            '&nbsp; <a href="/manage/following" class="btn btn-sm">Followers</a>'
             '</div>'
             '</div>'
             '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
@@ -12360,6 +12708,23 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             and not target_user['is_disabled']):
         dm_btn = (f' &nbsp;&#183;&nbsp; <a href="/manage/messages?tab=compose&to={uname_h}" '
                   f'class="btn btn-sm">📬 Send DM</a>')
+    follow_btn = ''
+    if not is_own_profile:
+        if is_following:
+            follow_btn = (
+                f' &nbsp;&#183;&nbsp; <form method="POST" action="/manage/unfollow" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname_h}">'
+                f'<input type="hidden" name="referer" value="/manage/admin/user/{uname_h}">'
+                f'<button class="btn btn-sm" onmouseover="this.textContent=\'❌ Unfollow\'" '
+                f'onmouseout="this.textContent=\'✅ Following\'">✅ Following</button></form>'
+            )
+        else:
+            follow_btn = (
+                f' &nbsp;&#183;&nbsp; <form method="POST" action="/manage/follow" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname_h}">'
+                f'<input type="hidden" name="referer" value="/manage/admin/user/{uname_h}">'
+                f'<button class="btn btn-sm btn-green">Follow</button></form>'
+            )
 
     avatar_html = _avatar_html(target_user, 34)
     show_topup_section = is_own_profile or _user_role(viewer) in ('admin', 'super')
@@ -12383,7 +12748,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + '<div class="page-sub" style="margin-bottom:20px">'
         + ('Your profile' if is_own_profile else 'User profile')
         + nav_links
-        + dm_btn + '</div>'
+        + dm_btn + follow_btn + '</div>'
         + '<div style="display:flex;flex-direction:column;gap:24px">'
         + '<div class="two-col">'
         + '<div class="card"><div class="card-title">Account Details</div>'
@@ -12461,6 +12826,101 @@ def _render_topup_history_section(user, orders: list, force_show: bool = False,
         + rows +
         '</table></div></div>'
     )
+
+
+def _render_following_page(viewer, followers: list, following: list,
+                           msg: str = '', msg_type: str = 'error') -> str:
+    viewer_following_ids = set(int(r['id']) for r in following)
+
+    def _role_badge_row(u) -> str:
+        role = 'basic'
+        if u['username'] == SUPER_USER:
+            role = 'super'
+        elif u['is_admin']:
+            role = 'admin'
+        elif u['is_standard']:
+            role = 'standard'
+        return f'<span class="badge badge-{role}">{role.upper()}</span>'
+
+    def _followers_rows() -> str:
+        out = ''
+        for r in followers:
+            uname = _h(r['username'])
+            urole = _role_badge_row(r)
+            since = _h((r['followed_at'] or '')[:16].replace('T', ' '))
+            rid = int(r['id'])
+            if rid in viewer_following_ids:
+                action = (
+                    '<form method="POST" action="/manage/unfollow" style="display:inline">'
+                    f'<input type="hidden" name="username" value="{uname}">'
+                    '<input type="hidden" name="referer" value="/manage/following">'
+                    '<button class="btn btn-sm">Unfollow</button>'
+                    '</form>'
+                )
+            else:
+                action = (
+                    '<form method="POST" action="/manage/follow" style="display:inline">'
+                    f'<input type="hidden" name="username" value="{uname}">'
+                    '<input type="hidden" name="referer" value="/manage/following">'
+                    '<button class="btn btn-sm btn-green">Follow back</button>'
+                    '</form>'
+                )
+            out += (
+                '<tr>'
+                f'<td><a href="/manage/user/{uname}" class="user-link">{uname}</a></td>'
+                f'<td>{urole}</td>'
+                f'<td class="hash">{since}</td>'
+                f'<td>{action}</td>'
+                '</tr>'
+            )
+        if not out:
+            out = '<tr><td colspan="4" class="empty">No followers yet</td></tr>'
+        return out
+
+    def _following_rows() -> str:
+        out = ''
+        for r in following:
+            uname = _h(r['username'])
+            urole = _role_badge_row(r)
+            since = _h((r['followed_at'] or '')[:16].replace('T', ' '))
+            action = (
+                '<form method="POST" action="/manage/unfollow" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname}">'
+                '<input type="hidden" name="referer" value="/manage/following">'
+                '<button class="btn btn-sm">Unfollow</button>'
+                '</form>'
+            )
+            out += (
+                '<tr>'
+                f'<td><a href="/manage/user/{uname}" class="user-link">{uname}</a></td>'
+                f'<td>{urole}</td>'
+                f'<td class="hash">{since}</td>'
+                f'<td>{action}</td>'
+                '</tr>'
+            )
+        if not out:
+            out = '<tr><td colspan="4" class="empty">You are not following anyone yet</td></tr>'
+        return out
+
+    body = (
+        '<div class="page-title">Followers</div>'
+        '<div class="page-sub"><a href="/manage/profile" style="color:var(--muted);text-decoration:none">&#10094; Profile</a></div>'
+        '<div class="two-col">'
+        '<div class="card">'
+        f'<div class="card-title">Followers ({len(followers)})</div>'
+        '<div class="table-wrap"><table>'
+        '<tr><th scope="col">Member</th><th scope="col">Role</th><th scope="col">Since</th><th scope="col">Action</th></tr>'
+        + _followers_rows() +
+        '</table></div></div>'
+        '<div class="card">'
+        f'<div class="card-title">Following ({len(following)})</div>'
+        '<div class="table-wrap"><table>'
+        '<tr><th scope="col">Member</th><th scope="col">Role</th><th scope="col">Since</th><th scope="col">Action</th></tr>'
+        + _following_rows() +
+        '</table></div></div>'
+        '</div>'
+    )
+    return _manage_page('Followers', body, user=viewer, msg=_h(msg), msg_type=msg_type)
 
 
 def _render_topups_page(user, orders: list, cfg: dict, msg: str = '', msg_type: str = 'error') -> str:
@@ -12573,6 +13033,8 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
 
     # Basic sandbox teaser
     if role == 'basic':
+        if part == 'rest':
+            return ''
         threshold  = int(REGISTRATION_DB.get_setting('auto_promote_threshold', '100'))
         ap_enabled = REGISTRATION_DB.get_setting('auto_promote_enabled', '0') == '1'
         if ap_enabled:
@@ -13140,7 +13602,7 @@ def _bounty_status_badge(status: str) -> str:
 
 
 def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
-    """Render the five-category leaderboard page."""
+    """Render leaderboard categories."""
     def _lb_table(rows, cols):
         """cols: list of (header, key, formatter_fn) — _rank and _user are special keys"""
         if not rows:
@@ -13201,6 +13663,7 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
     cols_hunters  = [('Fulfilled',    'fulfilled_count',count('bounties'))]
     cols_streaks  = [('Streak',       'login_streak',   streak_fmt)]
     cols_chatty   = [('Comments',     'comment_count',  count('comments'))]
+    cols_popular  = [('Followers',    'follower_count', count('followers'))]
 
     def _card(title, icon, rows, cols, desc):
         return (f'<div class="card">'
@@ -13223,6 +13686,8 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
                            "Longest consecutive daily login streak.")
     card_chatty    = _card("Most Chatty",      "💬", data["chatty"],         cols_chatty,
                            "Most comments posted — the voices of the community.")
+    card_popular   = _card("Most Followed",    "👥", data["popular"],        cols_popular,
+                           "Most followed members in the community.")
 
     body = f'''
     <div class="page-title">🏆 Leaderboard</div>
@@ -13239,6 +13704,7 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
       {card_hunters}
       {card_streaks}
       {card_chatty}
+      {card_popular}
     </div>'''
 
     return _manage_page('Leaderboard', body, user=viewer)
@@ -13286,7 +13752,7 @@ def _render_bounty_board(viewer, bounties: list, total: int, page: int, total_pa
     rows = ''
     for b in bounties:
         bid   = b['id']
-        desc  = _h(b['description'][:80] + ('…' if len(b['description']) > 80 else ''))
+        desc  = _h(b['description'][:120] + ('…' if len(b['description']) > 120 else ''))
         badge = _bounty_status_badge(b['status'])
         pts_disp = f'<span style="color:var(--accent);font-weight:700">{b["total_escrow"]} pts</span>'
         by    = _h(b['created_by'])
@@ -13294,19 +13760,29 @@ def _render_bounty_board(viewer, bounties: list, total: int, page: int, total_pa
         ff    = _h(b['fulfilled_by'] or '')
         rows += (
             f'<tr>'
-            f'<td><a href="/manage/bounty/{bid}" style="color:var(--text)">{desc}</a></td>'
-            f'<td style="text-align:center">{pts_disp}</td>'
-            f'<td style="text-align:center">{badge}</td>'
-            f'<td class="hash"><a href="/manage/user/{by}" class="user-link">{by}</a></td>'
-            f'<td class="hash">{ff if ff else "—"}</td>'
-            f'<td class="hash">{exp}</td>'
-            f'<td><a href="/manage/bounty/{bid}" class="btn btn-sm">View →</a></td>'
+            f'<td style="word-break:break-word;overflow-wrap:anywhere;line-height:1.45">'
+            f'<a href="/manage/bounty/{bid}" style="color:var(--text)">{desc}</a></td>'
+            f'<td style="text-align:center;white-space:nowrap">{pts_disp}</td>'
+            f'<td style="text-align:center;white-space:nowrap">{badge}</td>'
+            f'<td class="hash" style="white-space:nowrap"><a href="/manage/user/{by}" class="user-link">{by}</a></td>'
+            f'<td class="hash" style="white-space:nowrap">{ff if ff else "—"}</td>'
+            f'<td class="hash" style="white-space:nowrap">{exp}</td>'
+            f'<td style="white-space:nowrap"><a href="/manage/bounty/{bid}" class="btn btn-sm">View →</a></td>'
             f'</tr>'
         )
     if not rows:
         rows = '<tr><td colspan="7" class="empty">No bounties found</td></tr>'
 
-    table = f'''<div class="table-wrap"><table class="torrent-table">
+    table = f'''<div class="table-wrap"><table class="torrent-table" style="width:100%;table-layout:fixed;min-width:0">
+      <colgroup>
+        <col>
+        <col style="width:96px">
+        <col style="width:120px">
+        <col style="width:116px">
+        <col style="width:116px">
+        <col style="width:110px">
+        <col style="width:92px">
+      </colgroup>
       <thead><tr>
         <th>Description</th><th style="text-align:center">Points</th>
         <th style="text-align:center">Status</th><th>Posted By</th>
