@@ -4173,6 +4173,7 @@ class RegistrationDB:
         c.execute('DELETE FROM login_history')
         c.execute('DELETE FROM user_follows')
         c.execute('DELETE FROM account_delete_challenges')
+        c.execute('DELETE FROM webauthn_challenges')
         c.execute('DELETE FROM topup_reconciliation_actions')
         c.execute('DELETE FROM topup_webhook_events')
         c.execute('DELETE FROM topup_orders')
