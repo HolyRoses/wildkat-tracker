@@ -247,6 +247,21 @@ The Actions card contains:
   - Use Gravatar avatar
   - Gravatar email or MD5 hash input (stores only the hash)
 
+### Self-Delete Account
+
+Your profile Actions card includes a **Danger Zone** self-delete flow.
+
+- Start by typing `DELETE MY ACCOUNT` and submitting the delete request.
+- The system immediately signs you out and starts a short deletion challenge window (default 5 minutes).
+- Sign in again within the window. If a valid challenge exists, you are routed to a dedicated confirmation page.
+- Final confirmation requires:
+  - your current password
+  - re-typing `DELETE MY ACCOUNT`
+  - a final irreversible confirmation prompt
+- If successful, the account is removed, sessions are revoked, and a goodbye page is shown.
+- If the challenge expires, or too many failed confirmation attempts occur, you must restart from your profile.
+- The Super account cannot self-delete.
+
 ### Points and Invite Generation
 
 Your current points balance is shown in the **Account Details** card. Points are earned automatically for daily logins (with streak bonuses), torrent uploads, and comments. See [Section 11](#11-points-economy) for full details.
