@@ -7497,6 +7497,11 @@ class ManageHandler(BaseHTTPRequestHandler):
         user = REGISTRATION_DB.get_user_by_id(int(ch['user_id'])) if ch['user_id'] else None
         if not user:
             return self._send_json({'ok': False, 'error': 'Account not found.'}, 404)
+        client_ip = self.client_address[0] if self.client_address else ''
+        if not REGISTRATION_DB.is_ip_allowed(user['id'], client_ip):
+            log.warning('WEBAUTHN auth blocked by IP allowlist user=%r ip=%s', user['username'], client_ip)
+            REGISTRATION_DB._log(user['username'], 'webauthn_auth_ip_blocked', client_ip)
+            return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 403)
         rows = REGISTRATION_DB.list_webauthn_credentials(user['id'])
         stored = []
         by_cred_id = {}
@@ -7521,11 +7526,20 @@ class ManageHandler(BaseHTTPRequestHandler):
             if row:
                 REGISTRATION_DB.touch_webauthn_credential(int(row['id']), int(auth_data.counter))
                 REGISTRATION_DB.set_webauthn_primary_credential(int(user['id']), int(row['id']))
-            token = REGISTRATION_DB.create_session(user['id'])
-            REGISTRATION_DB.record_login_ip(user['id'], self.client_address[0] if self.client_address else '')
+            policy = _auth_factor_policy_for_user(user)
+            token = REGISTRATION_DB.create_session(
+                user['id'],
+                must_enroll_passkey=bool(policy.get('must_enroll_passkey'))
+            )
+            REGISTRATION_DB.record_login_ip(user['id'], client_ip)
             REGISTRATION_DB.daily_login_check(user['id'])
             REGISTRATION_DB._log(user['username'], 'webauthn_auth_success', user['username'],
                                  f'challenge_id={challenge_id}')
+            if policy.get('must_enroll_passkey'):
+                redirect = '/manage/passkey-enroll'
+            else:
+                delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
+                redirect = '/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard'
             self.send_response(200)
             self._set_session_cookie(token)
             if row and str(row['credential_id'] or '').strip():
@@ -7537,7 +7551,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                     same_site='Lax',
                     path='/manage',
                 )
-            body = json.dumps({'ok': True, 'redirect': '/manage/dashboard'}).encode('utf-8')
+            body = json.dumps({'ok': True, 'redirect': redirect}).encode('utf-8')
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Cache-Control', 'no-store')
@@ -7655,7 +7669,11 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB._log(user['username'], 'webauthn_register_finish', user['username'],
                                  f'challenge_id={challenge_id} cred={cred_id_b64[:14]}...')
             policy = _auth_factor_policy_for_user(REGISTRATION_DB.get_user_by_id(user['id']) or user)
-            redirect = '/manage/passkey-enroll' if policy.get('must_enroll_passkey') else '/manage/dashboard'
+            if policy.get('must_enroll_passkey'):
+                redirect = '/manage/passkey-enroll'
+            else:
+                delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
+                redirect = '/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard'
             return self._send_json({'ok': True, 'message': 'Passkey registered.', 'redirect': redirect})
         except Exception as e:
             log.warning('WEBAUTHN register finish failed user=%s challenge_id=%s err=%s',
