@@ -28,6 +28,7 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Torrent management UI** — upload `.torrent` files, browse/search listings, inspect detail pages, copy hashes/magnets
 - **Upload safety limits** — request-size, file-count, and per-file caps with partial-success batch handling
 - **Profile and privacy controls** — DM opt-in, online status visibility, bounty alerts, torrent activity linking, optional Gravatar
+- **Passkey authentication (WebAuthn)** — optional passkey login with Touch ID / Face ID / security-key support, profile enrollment, and policy enforcement controls
 - **Self-service account deletion** — multi-step forced logout + fresh login + final phrase/password confirmation flow
 - **Followers system** — follow/unfollow members, follower activity notifications, and Most Followed leaderboard category
 - **Torrent peer snapshots** — manual Seeds/Peers refresh from torrent detail pages (3-hour cooldown) plus optional auto-queued refresh after upload with configurable cap
@@ -116,7 +117,7 @@ python3 tracker_server.py \
   --redirect-http \
   --domain tracker.example.net:8443 \
   --registration \
-  --super-user admin \
+  --super-user super \
   --db /opt/tracker/tracker.db
 ```
 
@@ -189,6 +190,8 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 | `--registration` | off | Enable registration mode and the `/manage` web interface |
 | `--super-user` | — | Superuser username (required with `--registration`) |
 | `--super-user-password` | — | Set or reset the superuser password (process exits after setting) |
+| `--super-user-reset-passkeys` | off | Reset superuser passkeys and passkey-required flags, then exit |
+| `--auth-break-glass` | off | Temporary startup override that bypasses passkey enforcement gates |
 | `--db` | `/opt/tracker/tracker.db` | Path to SQLite database |
 | `--manage-port` | same as `--web-https-port` | Management interface HTTPS port if different from stats port |
 | `--manage-http-port` | 80 | Management HTTP redirect port (0 to disable) |
@@ -196,4 +199,4 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 ## Requirements
 
 - Python 3.10+
-- No external packages — standard library only
+- No external packages required for core tracker features (optional passkey support requires `python3-fido2`)

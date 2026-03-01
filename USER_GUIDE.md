@@ -58,6 +58,8 @@ Visit `https://tracker.example.net/manage`. Enter your username and password and
 
 Sessions are HTTPS-only — the cookie cannot be sent over plain HTTP.
 
+If passkey login is enabled by the operator, the login form also shows **Sign in with Passkey**. Enter your username first, then start passkey login. If the first authenticator prompt is not the one you want, use the switch guidance in [Passkey Device Switching at Login](#passkey-device-switching-at-login).
+
 ### Registering an Account
 
 There are three ways to get an account:
@@ -246,6 +248,44 @@ The Actions card contains:
   - Allow linking my torrent swarm activity
   - Use Gravatar avatar
   - Gravatar email or MD5 hash input (stores only the hash)
+  - Passkey settings:
+    - Enable passkey sign-in
+    - Prefer passkey on this account
+    - Require passkey (password-only login blocked)
+    - Add passkey
+    - Rename/remove passkeys
+
+### Passkey Device Switching at Login
+
+In your profile's passkey table, each row has a **Save** action. Clicking it saves the passkey name and sets that credential as your account's primary passkey.
+
+The primary passkey is used first on the next passkey login attempt. In most cases this lets you go directly to the authenticator you want, without canceling prompts to switch devices at the login screen.
+
+Supported passkey authenticator types include:
+
+- Hardware security keys (for example, Google Titan Key and YubiKey)
+- Apple platform authenticators (Touch ID / Face ID)
+- Browser/platform-managed passkeys (for example, Chrome passkeys)
+
+If a member does not have a physical security key and is not using Apple Touch ID/Face ID, they can still authenticate with a browser-managed passkey when the browser offers that option.
+
+Browser prompt behavior can vary by browser and OS. The account's selected primary passkey is attempted first when the browser allows it.
+
+If your browser shows an Apple Touch ID/Face ID prompt but you want to use a different physical security key (for example, Titan Key), use this flow:
+
+1. Cancel the Apple passkey prompt.
+2. If needed, cancel once more (some browsers require two cancels before they re-check other authenticators).
+3. Wait for the Apple prompt to appear again.
+4. Press the button on your physical security key.
+
+When authentication succeeds with that device, it becomes your preferred (primary) passkey for future sign-ins.
+
+If you are prompted for a physical security key (for example, Titan Key) and want to switch back to Apple Touch ID/Face ID:
+
+1. Cancel the security-key prompt.
+2. If needed, cancel a second time so the browser refreshes available authenticators.
+3. Wait for the Apple prompt to appear.
+4. Authenticate with Touch ID or Face ID.
 
 ### Self-Delete Account
 
@@ -599,6 +639,8 @@ Admins can promote or demote Standard and Basic users. Superusers can also promo
 
 - **Locked** — set automatically after 5 consecutive failed login attempts. An admin must click **Unlock Account** to restore access
 - **Disable / Enable** — a manual block admins can toggle at any time
+- **Passkey Optional / Enforce Passkey** — admins and super can enforce per-user passkey requirement from Admin View
+- **Reset Passkeys** — admins and super can clear a user's passkeys for account recovery
 
 ### Super-Only Danger Operations
 
@@ -689,6 +731,56 @@ The content returned at `/robots.txt`. By default, search engine crawlers are in
 | Setting | Default | Description |
 |---------|---------|-------------|
 | Enable Gravatar avatars | off | Global switch for external Gravatar avatar rendering in the web UI. Users may supply email or MD5 hash; stored value is hash-only |
+
+### Passkey Settings and Super Recovery
+
+Passkey login can be enabled and enforced from Settings.
+
+Available settings:
+
+- **Enable WebAuthn login** — enables passkey login support
+- **Enforce passkey for Admin + Super accounts** — requires passkeys for admin/super roles
+- **Enforce passkey site-wide** — requires passkeys for all users
+
+Enforcement behavior:
+
+- If enforcement applies and a user has no passkey yet, they are routed to a required passkey enrollment page after login/signup.
+- If enforcement applies and a user already has passkeys, password-only login is blocked for that account.
+- On profile settings, enforcement displays a policy notice:
+  - `Server policy is enforcing passkey requirements.`
+  - or `Admin policy is enforcing passkey requirement for this account.`
+
+If enforcement is active and the superuser loses passkey access, use CLI recovery.
+
+Run recovery commands as the service account (example super account name: `super`):
+
+```bash
+sudo -u tracker /opt/tracker/tracker_server.py \
+  --registration \
+  --db /opt/tracker/tracker.db \
+  --super-user super \
+  --manage-port 443 \
+  --super-user-reset-passkeys
+```
+
+What this does:
+
+- Removes all passkeys from the super account
+- Clears active sessions for that account
+- Allows fresh password login and re-enrollment of passkeys
+
+To reset only the super password:
+
+```bash
+sudo -u tracker /opt/tracker/tracker_server.py \
+  --registration \
+  --db /opt/tracker/tracker.db \
+  --super-user super \
+  --manage-port 443 \
+  --super-user-password 'NEW_STRONG_PASSWORD'
+```
+
+If your deployment uses a separate management TLS configuration, include the same TLS flags used by your service startup command.
 
 ---
 

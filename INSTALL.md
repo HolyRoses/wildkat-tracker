@@ -9,6 +9,7 @@ For day-to-day operation and UI workflows, use `USER_GUIDE.md`.
 - Python 3.10+
 - A public-facing server with ports accessible from the internet
 - A domain name pointed at your server
+- Optional for passkey/WebAuthn login: `python3-fido2`
 
 ---
 
@@ -174,7 +175,7 @@ ExecStart=/usr/bin/python3 /opt/tracker/tracker_server.py \
   --peer-ttl 3600 \
   --max-peers 200 \
   --registration \
-  --super-user youradminusername \
+  --super-user super \
   --db /opt/tracker/tracker.db
 ```
 
@@ -310,7 +311,7 @@ On first run the superuser account is created automatically. To set its password
 systemctl stop tracker
 python3 /opt/tracker/tracker_server.py \
   --registration \
-  --super-user youradminusername \
+  --super-user super \
   --super-user-password 'YourStrongP@ssw0rd!' \
   --db /opt/tracker/tracker.db
 ```
@@ -385,7 +386,7 @@ If you are locked out of the superuser account:
 systemctl stop tracker
 python3 /opt/tracker/tracker_server.py \
   --registration \
-  --super-user youradminusername \
+  --super-user super \
   --super-user-password 'NewStrongP@ssw0rd!' \
   --db /opt/tracker/tracker.db
 systemctl start tracker
@@ -424,6 +425,8 @@ systemctl start tracker
 | `--registration` | off | Enable registration mode and the `/manage` web interface |
 | `--super-user` | — | Superuser username — required when `--registration` is set |
 | `--super-user-password` | — | Set or reset the superuser password (process exits after setting) |
+| `--super-user-reset-passkeys` | off | Reset superuser passkeys and passkey-required flags, then exit |
+| `--auth-break-glass` | off | Temporary startup override that bypasses passkey enforcement gates |
 | `--db` | `/opt/tracker/tracker.db` | Path to the SQLite database file |
 | `--manage-port` | same as `--web-https-port` | HTTPS port for the management interface if different from stats port |
 | `--manage-http-port` | 80 | HTTP redirect port for management interface (0 to disable) |

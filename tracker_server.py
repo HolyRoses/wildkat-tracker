@@ -58,9 +58,11 @@ import sys
 import threading
 import time
 import queue
+import pickle
 import urllib.parse
 import urllib.request
 import urllib.error
+from typing import Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -108,6 +110,7 @@ DEFAULT_INTERVAL    = 1800   # seconds
 DEFAULT_MIN_INTERVAL = 60
 PEER_SCRAPE_MIN_INTERVAL_SECONDS = 3 * 60 * 60
 ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES = 5
+WEBAUTHN_CHALLENGE_TTL_SECONDS = 300
 PEER_TTL            = 3600   # seconds before a peer is purged
 MAX_PEERS_PER_REPLY  = 200
 MAX_SCRAPE_HASHES    = 5      # max info_hashes per scrape request
@@ -120,6 +123,23 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 log = logging.getLogger('tracker')
+
+try:
+    from fido2.server import Fido2Server
+    from fido2.webauthn import (
+        AttestedCredentialData,
+        AttestationObject,
+        AuthenticatorData,
+        CollectedClientData,
+    )
+    _WEBAUTHN_LIB_AVAILABLE = True
+except Exception:
+    Fido2Server = None
+    AttestedCredentialData = None
+    AttestationObject = None
+    AuthenticatorData = None
+    CollectedClientData = None
+    _WEBAUTHN_LIB_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────
 # Bencode encoder  (decoder not needed – server only sends)
@@ -498,6 +518,7 @@ OPEN_TRACKER       = False  # mirrors settings[open_tracker]; updated without re
 SUPER_USER         = ''
 _MANAGE_HTTPS_PORT = 0      # set in main() so /manage routes know the HTTPS port
 PEER_UPDATE_QUEUE  = None   # background queue for async peer snapshot refresh
+AUTH_BREAK_GLASS   = False  # startup override to bypass auth-factor enforcement gates
 
 # ─────────────────────────────────────────────────────────────
 # Bencode decoder  (for .torrent parsing)
@@ -753,6 +774,29 @@ def _validate_password(password: str, settings: dict) -> list[str]:
     return errors
 
 
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def _b64url_decode(s: str) -> bytes:
+    s = (s or '').strip()
+    pad = '=' * ((4 - (len(s) % 4)) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _json_safe_obj(value: Any):
+    if isinstance(value, (bytes, bytearray)):
+        return _b64url_encode(bytes(value))
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            out[str(k)] = _json_safe_obj(v)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_obj(v) for v in value]
+    return value
+
+
 def _nested_get(obj, path: list[str], default=''):
     cur = obj
     for p in path:
@@ -971,6 +1015,7 @@ class RegistrationDB:
                 token       TEXT    NOT NULL UNIQUE,
                 created_at  TEXT    NOT NULL,
                 expires_at  TEXT    NOT NULL,
+                must_enroll_passkey INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS events (
@@ -1001,6 +1046,43 @@ class RegistrationDB:
               ON account_delete_challenges(user_id, status, id DESC);
             CREATE INDEX IF NOT EXISTS idx_delete_challenges_expires
               ON account_delete_challenges(status, expires_at);
+            CREATE TABLE IF NOT EXISTS webauthn_credentials (
+                id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id                    INTEGER NOT NULL,
+                credential_id              TEXT    NOT NULL UNIQUE,
+                public_key_cose            BLOB    NOT NULL,
+                sign_count                 INTEGER NOT NULL DEFAULT 0,
+                aaguid                     TEXT    NOT NULL DEFAULT '',
+                transports                 TEXT    NOT NULL DEFAULT '[]',
+                authenticator_attachment   TEXT    NOT NULL DEFAULT '',
+                is_resident_key            INTEGER NOT NULL DEFAULT 0,
+                user_verification          INTEGER NOT NULL DEFAULT 0,
+                nickname                   TEXT    NOT NULL DEFAULT '',
+                created_at                 TEXT    NOT NULL,
+                last_used_at               TEXT,
+                is_active                  INTEGER NOT NULL DEFAULT 1,
+                is_primary                 INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user_active
+              ON webauthn_credentials(user_id, is_active, id DESC);
+            CREATE TABLE IF NOT EXISTS webauthn_challenges (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER,
+                flow_type     TEXT    NOT NULL,
+                challenge     TEXT    NOT NULL,
+                state_json    TEXT    NOT NULL DEFAULT '',
+                created_at    TEXT    NOT NULL,
+                expires_at    TEXT    NOT NULL,
+                used_at       TEXT,
+                session_hint  TEXT    NOT NULL DEFAULT '',
+                client_ip     TEXT    NOT NULL DEFAULT '',
+                user_agent    TEXT    NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_flow_exp
+              ON webauthn_challenges(flow_type, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_user_flow
+              ON webauthn_challenges(user_id, flow_type, id DESC);
         ''')
         # ── Migrations ────────────────────────────────────────
         cols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
@@ -1326,6 +1408,54 @@ class RegistrationDB:
             self._conn().commit()
         except Exception:
             pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN webauthn_enabled INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN webauthn_preferred INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN webauthn_required INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN webauthn_required_admin INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_enabled INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_required INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_method TEXT NOT NULL DEFAULT ""')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_enrolled_at TEXT')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        scols = [r[1] for r in c.execute('PRAGMA table_info(sessions)').fetchall()]
+        if 'must_enroll_passkey' not in scols:
+            c.execute('ALTER TABLE sessions ADD COLUMN must_enroll_passkey INTEGER NOT NULL DEFAULT 0')
+            c.commit()
+        wcols = [r[1] for r in c.execute('PRAGMA table_info(webauthn_credentials)').fetchall()]
+        if 'is_primary' not in wcols:
+            c.execute('ALTER TABLE webauthn_credentials ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0')
+            c.commit()
 
     def _init_defaults(self, announce_urls: list):
         """Seed magnet_trackers and settings if not already present."""
@@ -1418,6 +1548,13 @@ class RegistrationDB:
             'peer_query_retry_wait_sec':    '2',
             'peer_query_auto_on_upload':    '0',
             'peer_query_auto_upload_cap':   '5',
+            'webauthn_login_enabled':       '0',
+            'webauthn_enforce_sitewide':    '0',
+            'webauthn_enforce_admins':      '0',
+            # TFA scaffolding (future Google Authenticator rollout)
+            'tfa_login_enabled':            '0',
+            'tfa_enforce_sitewide':         '0',
+            'tfa_enforce_admins':           '0',
         }
         for k, v in defaults.items():
             c.execute('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)', (k, v))
@@ -4090,13 +4227,13 @@ class RegistrationDB:
 
     # ── Sessions ───────────────────────────────────────────────
 
-    def create_session(self, user_id: int) -> str:
+    def create_session(self, user_id: int, must_enroll_passkey: bool = False) -> str:
         token      = secrets.token_hex(32)
         now        = datetime.datetime.now()
         expires_at = (now + datetime.timedelta(hours=48)).isoformat(timespec='seconds')
         self._conn().execute(
-            'INSERT INTO sessions (user_id,token,created_at,expires_at) VALUES (?,?,?,?)',
-            (user_id, token, now.isoformat(timespec='seconds'), expires_at)
+            'INSERT INTO sessions (user_id,token,created_at,expires_at,must_enroll_passkey) VALUES (?,?,?,?,?)',
+            (user_id, token, now.isoformat(timespec='seconds'), expires_at, 1 if must_enroll_passkey else 0)
         )
         self._conn().commit()
         return token
@@ -4134,6 +4271,21 @@ class RegistrationDB:
 
     def delete_sessions_for_user(self, user_id: int):
         self._conn().execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+        self._conn().commit()
+
+    def session_requires_passkey_enroll(self, token: str) -> bool:
+        now = datetime.datetime.now().isoformat(timespec='seconds')
+        row = self._conn().execute(
+            'SELECT must_enroll_passkey FROM sessions WHERE token=? AND expires_at>?',
+            (token, now)
+        ).fetchone()
+        return bool(row and int(row['must_enroll_passkey'] or 0) == 1)
+
+    def set_session_passkey_enroll(self, token: str, required: bool):
+        self._conn().execute(
+            'UPDATE sessions SET must_enroll_passkey=? WHERE token=?',
+            (1 if required else 0, token)
+        )
         self._conn().commit()
 
     def purge_expired_sessions(self):
@@ -4259,6 +4411,213 @@ class RegistrationDB:
         self._log(actor, 'account_deleted_self', user['username'],
                   f'ip={consumed_ip[:64]}')
         return True, 'Account deleted.'
+
+    # ── WebAuthn / Passkeys ──────────────────────────────────
+
+    def set_user_webauthn_preferences(self, user_id: int, enabled: bool,
+                                      preferred: bool, required: bool):
+        self._conn().execute(
+            'UPDATE users SET webauthn_enabled=?, webauthn_preferred=?, webauthn_required=? WHERE id=?',
+            (1 if enabled else 0, 1 if preferred else 0, 1 if required else 0, user_id)
+        )
+        self._conn().commit()
+
+    def list_webauthn_credentials(self, user_id: int, include_inactive: bool = False) -> list:
+        if include_inactive:
+            return self._conn().execute(
+                'SELECT * FROM webauthn_credentials WHERE user_id=? ORDER BY id DESC',
+                (user_id,)
+            ).fetchall()
+        return self._conn().execute(
+            'SELECT * FROM webauthn_credentials WHERE user_id=? AND is_active=1 ORDER BY id DESC',
+            (user_id,)
+        ).fetchall()
+
+    def count_webauthn_credentials(self, user_id: int, include_inactive: bool = False) -> int:
+        if include_inactive:
+            row = self._conn().execute(
+                'SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id=?',
+                (user_id,)
+            ).fetchone()
+        else:
+            row = self._conn().execute(
+                'SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id=? AND is_active=1',
+                (user_id,)
+            ).fetchone()
+        return int(row['c'] if row else 0)
+
+    def get_webauthn_credential_by_cred_id(self, credential_id_b64: str):
+        return self._conn().execute(
+            'SELECT * FROM webauthn_credentials WHERE credential_id=?',
+            (credential_id_b64,)
+        ).fetchone()
+
+    def add_webauthn_credential(self, user_id: int, credential_id_b64: str,
+                                public_key_cose: bytes, sign_count: int,
+                                aaguid: str = '', transports_json: str = '[]',
+                                authenticator_attachment: str = '',
+                                is_resident_key: bool = False,
+                                user_verification: bool = False,
+                                nickname: str = '') -> bool:
+        try:
+            has_primary = self._conn().execute(
+                'SELECT id FROM webauthn_credentials WHERE user_id=? AND is_active=1 AND is_primary=1 LIMIT 1',
+                (user_id,)
+            ).fetchone() is not None
+            self._conn().execute(
+                '''INSERT INTO webauthn_credentials
+                   (user_id,credential_id,public_key_cose,sign_count,aaguid,transports,
+                    authenticator_attachment,is_resident_key,user_verification,nickname,created_at,last_used_at,is_active,is_primary)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)''',
+                (user_id, credential_id_b64, public_key_cose, int(sign_count),
+                 aaguid[:64], transports_json[:2048], authenticator_attachment[:32],
+                 1 if is_resident_key else 0, 1 if user_verification else 0,
+                 nickname[:120], self._ts(), self._ts(), 0 if has_primary else 1)
+            )
+            self._conn().commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def touch_webauthn_credential(self, cred_id: int, sign_count: int):
+        self._conn().execute(
+            'UPDATE webauthn_credentials SET sign_count=?, last_used_at=? WHERE id=?',
+            (int(sign_count), self._ts(), cred_id)
+        )
+        self._conn().commit()
+
+    def set_webauthn_primary_credential(self, user_id: int, cred_id: int) -> bool:
+        c = self._conn()
+        row = c.execute(
+            'SELECT id FROM webauthn_credentials WHERE id=? AND user_id=? AND is_active=1',
+            (cred_id, user_id)
+        ).fetchone()
+        if not row:
+            return False
+        c.execute(
+            'UPDATE webauthn_credentials SET is_primary=0 WHERE user_id=?',
+            (user_id,)
+        )
+        c.execute(
+            'UPDATE webauthn_credentials SET is_primary=1 WHERE id=? AND user_id=?',
+            (cred_id, user_id)
+        )
+        c.commit()
+        return True
+
+    def set_webauthn_credential_active(self, user_id: int, cred_id: int, is_active: bool) -> bool:
+        cur = self._conn().execute(
+            'UPDATE webauthn_credentials SET is_active=? WHERE id=? AND user_id=?',
+            (1 if is_active else 0, cred_id, user_id)
+        )
+        self._conn().commit()
+        return bool(cur.rowcount)
+
+    def delete_webauthn_credential(self, user_id: int, cred_id: int) -> bool:
+        c = self._conn()
+        row = c.execute(
+            'SELECT is_primary FROM webauthn_credentials WHERE id=? AND user_id=?',
+            (cred_id, user_id)
+        ).fetchone()
+        cur = c.execute(
+            'DELETE FROM webauthn_credentials WHERE id=? AND user_id=?',
+            (cred_id, user_id)
+        )
+        if cur.rowcount and row and int(row['is_primary'] or 0) == 1:
+            repl = c.execute(
+                'SELECT id FROM webauthn_credentials WHERE user_id=? AND is_active=1 ORDER BY last_used_at DESC, id DESC LIMIT 1',
+                (user_id,)
+            ).fetchone()
+            if repl:
+                c.execute(
+                    'UPDATE webauthn_credentials SET is_primary=1 WHERE id=? AND user_id=?',
+                    (int(repl['id']), user_id)
+                )
+        c.commit()
+        return bool(cur.rowcount)
+
+    def rename_webauthn_credential(self, user_id: int, cred_id: int, nickname: str) -> bool:
+        cur = self._conn().execute(
+            'UPDATE webauthn_credentials SET nickname=? WHERE id=? AND user_id=?',
+            (nickname[:120], cred_id, user_id)
+        )
+        self._conn().commit()
+        return bool(cur.rowcount)
+
+    def reset_user_webauthn(self, user_id: int) -> int:
+        """Remove all passkeys and clear passkey flags for account recovery."""
+        c = self._conn()
+        removed = c.execute(
+            'DELETE FROM webauthn_credentials WHERE user_id=?',
+            (user_id,),
+        ).rowcount
+        c.execute(
+            'UPDATE users SET webauthn_enabled=0, webauthn_preferred=0, webauthn_required=0, webauthn_required_admin=0 WHERE id=?',
+            (user_id,),
+        )
+        c.execute('DELETE FROM webauthn_challenges WHERE user_id=?', (user_id,))
+        c.commit()
+        return int(removed or 0)
+
+    def admin_set_user_webauthn_required(self, username: str, required: bool, actor: str) -> bool:
+        user = self.get_user(username)
+        if user is None:
+            return False
+        c = self._conn()
+        if required:
+            c.execute(
+                'UPDATE users SET webauthn_required_admin=1, webauthn_enabled=1 WHERE id=?',
+                (user['id'],)
+            )
+        else:
+            c.execute(
+                'UPDATE users SET webauthn_required_admin=0 WHERE id=?',
+                (user['id'],)
+            )
+        c.commit()
+        self._log(actor, 'admin_set_webauthn_required', username, f'admin_required={1 if required else 0}')
+        return True
+
+    def create_webauthn_challenge(self, user_id: int | None, flow_type: str,
+                                  challenge_b64: str, state_json: str,
+                                  session_hint: str = '', client_ip: str = '',
+                                  user_agent: str = '',
+                                  ttl_seconds: int = WEBAUTHN_CHALLENGE_TTL_SECONDS) -> int:
+        now_dt = datetime.datetime.now()
+        now = now_dt.isoformat(timespec='seconds')
+        exp = (now_dt + datetime.timedelta(seconds=max(30, min(600, int(ttl_seconds))))).isoformat(timespec='seconds')
+        cur = self._conn().execute(
+            '''INSERT INTO webauthn_challenges
+               (user_id,flow_type,challenge,state_json,created_at,expires_at,session_hint,client_ip,user_agent)
+               VALUES (?,?,?,?,?,?,?,?,?)''',
+            (user_id, flow_type[:20], challenge_b64[:1024], state_json[:100000], now, exp,
+             session_hint[:128], client_ip[:64], user_agent[:255])
+        )
+        self._conn().commit()
+        return int(cur.lastrowid)
+
+    def get_webauthn_challenge(self, challenge_id: int, flow_type: str):
+        now = self._ts()
+        return self._conn().execute(
+            'SELECT * FROM webauthn_challenges WHERE id=? AND flow_type=? AND used_at IS NULL AND expires_at>?',
+            (challenge_id, flow_type[:20], now)
+        ).fetchone()
+
+    def consume_webauthn_challenge(self, challenge_id: int) -> bool:
+        cur = self._conn().execute(
+            'UPDATE webauthn_challenges SET used_at=? WHERE id=? AND used_at IS NULL',
+            (self._ts(), challenge_id)
+        )
+        self._conn().commit()
+        return bool(cur.rowcount)
+
+    def expire_webauthn_challenges(self) -> int:
+        cur = self._conn().execute(
+            "DELETE FROM webauthn_challenges WHERE (used_at IS NOT NULL) OR expires_at<=?",
+            (self._ts(),)
+        )
+        self._conn().commit()
+        return int(cur.rowcount or 0)
 
     # ── Comments ──────────────────────────────────────────────
 
@@ -5944,6 +6303,51 @@ def _gravatar_enabled() -> bool:
         return False
     return REGISTRATION_DB.get_setting('gravatar_enabled', '0') == '1'
 
+
+def _webauthn_login_enabled() -> bool:
+    if not REGISTRATION_DB:
+        return False
+    if not _WEBAUTHN_LIB_AVAILABLE:
+        return False
+    return REGISTRATION_DB.get_setting('webauthn_login_enabled', '0') == '1'
+
+
+def _auth_factor_policy_for_user(user) -> dict:
+    """Centralized auth-factor policy resolver (passkey now, TFA scaffolded for future)."""
+    out = {
+        'break_glass': bool(AUTH_BREAK_GLASS),
+        'passkey_required': False,
+        'passkey_user_required': False,
+        'passkey_sitewide': False,
+        'passkey_admin_scope': False,
+        'must_enroll_passkey': False,
+        'password_blocked': False,
+        # TFA scaffolding only (not active enforcement in this rollout)
+        'tfa_login_enabled': False,
+        'tfa_required': False,
+    }
+    if not user or not REGISTRATION_DB or AUTH_BREAK_GLASS:
+        return out
+    role = _user_role(user)
+    sitewide = (REGISTRATION_DB.get_setting('webauthn_enforce_sitewide', '0') == '1')
+    admin_scope = ((REGISTRATION_DB.get_setting('webauthn_enforce_admins', '0') == '1')
+                   and role in ('admin', 'super'))
+    user_required = bool('webauthn_required' in user.keys() and user['webauthn_required'])
+    admin_required = bool('webauthn_required_admin' in user.keys() and user['webauthn_required_admin'])
+    passkey_required = bool(sitewide or admin_scope or admin_required or user_required)
+    has_passkey = REGISTRATION_DB.count_webauthn_credentials(int(user['id'])) > 0
+    out.update({
+        'passkey_required': passkey_required,
+        'passkey_user_required': user_required,
+        'passkey_admin_user_required': admin_required,
+        'passkey_sitewide': sitewide,
+        'passkey_admin_scope': admin_scope,
+        'must_enroll_passkey': (passkey_required and not has_passkey),
+        'password_blocked': (passkey_required and has_passkey),
+        'tfa_login_enabled': (REGISTRATION_DB.get_setting('tfa_login_enabled', '0') == '1'),
+    })
+    return out
+
 def _gravatar_url(user_row, size: int = 48) -> str:
     if not _gravatar_enabled() or not user_row:
         return ''
@@ -6304,6 +6708,14 @@ class ManageHandler(BaseHTTPRequestHandler):
                 return part[10:]
         return ''
 
+    def _get_cookie_value(self, name: str) -> str:
+        needle = name + '='
+        for part in self.headers.get('Cookie', '').split(';'):
+            part = part.strip()
+            if part.startswith(needle):
+                return part[len(needle):]
+        return ''
+
     def _get_session_user(self):
         """Return user row from session cookie, or None.
         Tries every wksession cookie; browsers can accumulate stale duplicates
@@ -6329,6 +6741,19 @@ class ManageHandler(BaseHTTPRequestHandler):
         if candidates:
             log.debug('SESSION all %d candidates invalid', len(candidates))
         return None
+
+    def _current_valid_session_token(self) -> str:
+        return getattr(self, '_valid_token', '') or self._get_session_token()
+
+    def _session_requires_passkey_enroll(self) -> bool:
+        if AUTH_BREAK_GLASS:
+            return False
+        if not REGISTRATION_DB:
+            return False
+        token = self._current_valid_session_token()
+        if not token:
+            return False
+        return REGISTRATION_DB.session_requires_passkey_enroll(token)
 
     def _refresh_csrf_cookie(self) -> None:
         """Re-set the wkcsrf cookie from the currently validated session token.
@@ -6366,6 +6791,15 @@ class ManageHandler(BaseHTTPRequestHandler):
         self.send_header('Set-Cookie',
             f'wkcsrf={csrf}; Path=/; SameSite=Strict; Expires={expires}; Secure')
 
+    def _set_cookie(self, name: str, value: str, hours: int = 48,
+                    http_only: bool = False, same_site: str = 'Lax', path: str = '/manage'):
+        expires = (datetime.datetime.now() + datetime.timedelta(hours=max(1, int(hours)))).strftime(
+            '%a, %d %b %Y %H:%M:%S GMT')
+        attrs = [f'{name}={value}', f'Path={path}', f'SameSite={same_site}', f'Expires={expires}', 'Secure']
+        if http_only:
+            attrs.insert(2, 'HttpOnly')
+        self.send_header('Set-Cookie', '; '.join(attrs))
+
     def _clear_session_cookie(self):
         expired = 'Expires=Thu, 01 Jan 1970 00:00:00 GMT'
         self.send_header('Set-Cookie', f'wksession=; Path=/; HttpOnly; {expired}')
@@ -6391,6 +6825,26 @@ class ManageHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         self._body_cache = self.rfile.read(length) if length else b''
         return self._body_cache
+
+    def _read_json_body(self) -> dict:
+        raw = self._read_body()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw.decode('utf-8', errors='replace'))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _send_json_with_session(self, data: dict, session_token: str, code: int = 200):
+        body = json.dumps(data).encode('utf-8')
+        self.send_response(code)
+        self._set_session_cookie(session_token)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
 
     def _drain_request_body(self, length: int) -> None:
         """Consume and discard request body bytes to keep the connection stable."""
@@ -6424,13 +6878,27 @@ class ManageHandler(BaseHTTPRequestHandler):
             return
         path = urllib.parse.urlparse(self.path).path.rstrip('/')
 
+        # Enforced passkey-enrollment gate (session-scoped). User can only access
+        # enrollment and logout endpoints until a passkey is successfully enrolled.
+        gate_allow = (
+            '/manage', '/manage/logout', '/manage/passkey-enroll',
+            '/manage/poll', '/manage/notifications/preview',
+        )
+        if path not in gate_allow:
+            user = self._get_session_user()
+            if user and self._session_requires_passkey_enroll():
+                return self._redirect('/manage/passkey-enroll')
+
         if path in ('/manage', ''):
             user = self._get_session_user()
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             msg = urllib.parse.unquote(qs.get('msg', [''])[0])
             msg_type = qs.get('msg_type', ['error'])[0]
             if user:
-                self._redirect('/manage/dashboard')
+                if self._session_requires_passkey_enroll():
+                    self._redirect('/manage/passkey-enroll')
+                else:
+                    self._redirect('/manage/dashboard')
             else:
                 self._send_html(_render_login(msg, msg_type=msg_type))
         elif path == '/manage/dashboard':
@@ -6458,6 +6926,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_public_profile(path[len('/manage/user/'):])
         elif path == '/manage/profile':
             self._get_profile()
+        elif path == '/manage/passkey-enroll':
+            self._get_passkey_enroll()
         elif path == '/manage/account/delete/confirm':
             self._get_account_delete_confirm()
         elif path == '/manage/goodbye':
@@ -6558,7 +7028,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         # the CSRF token derived from whichever session token the browser used.
         # Browsers can hold multiple wksession cookies (stale + current); we try
         # all candidates so the valid one matches regardless of order.
-        _no_csrf = ('/manage/login', '/manage/signup', '/manage', '/manage/messages/typing', '/coinbase/webhook', '/paypal/webhook')
+        _no_csrf = ('/manage/login', '/manage/signup', '/manage',
+                    '/manage/messages/typing', '/coinbase/webhook', '/paypal/webhook',
+                    '/manage/webauthn/auth/start', '/manage/webauthn/auth/finish',
+                    '/manage/webauthn/register/start', '/manage/webauthn/register/finish')
         if path not in _no_csrf:
             raw_cookie = self.headers.get('Cookie', '')
             session_candidates = [p.strip()[10:] for p in raw_cookie.split(';')
@@ -6578,8 +7051,28 @@ class ManageHandler(BaseHTTPRequestHandler):
                     self._redirect('/manage?msg=csrf')
                     return
 
+        # Session-scoped passkey enrollment gate for POST requests.
+        if path not in ('/manage/logout', '/manage/webauthn/register/start', '/manage/webauthn/register/finish'):
+            user = self._get_session_user()
+            if user and self._session_requires_passkey_enroll():
+                return self._redirect('/manage/passkey-enroll')
+
         if path == '/manage/login':
             self._post_login()
+        elif path == '/manage/webauthn/auth/start':
+            self._post_webauthn_auth_start()
+        elif path == '/manage/webauthn/auth/finish':
+            self._post_webauthn_auth_finish()
+        elif path == '/manage/webauthn/register/start':
+            self._post_webauthn_register_start()
+        elif path == '/manage/webauthn/register/finish':
+            self._post_webauthn_register_finish()
+        elif path == '/manage/webauthn/preferences':
+            self._post_webauthn_preferences()
+        elif path == '/manage/webauthn/credential/rename':
+            self._post_webauthn_credential_rename()
+        elif path == '/manage/webauthn/credential/delete':
+            self._post_webauthn_credential_delete()
         elif path == '/manage/account/delete/start':
             self._post_account_delete_start()
         elif path == '/manage/account/delete/confirm':
@@ -6612,6 +7105,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_set_disabled(True)
         elif path == '/manage/admin/enable-user':
             self._post_set_disabled(False)
+        elif path == '/manage/admin/set-user-passkey-required':
+            self._post_admin_set_user_passkey_required()
+        elif path == '/manage/admin/reset-webauthn':
+            self._post_admin_reset_webauthn()
         elif path == '/manage/admin/set-admin':
             self._post_set_admin()
         elif path == '/manage/admin/set-standard':
@@ -6791,6 +7288,20 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage')
         self._send_html(_render_password_page(user))
 
+    def _get_passkey_enroll(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        msg = ''
+        msg_type = 'error'
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+            msg_type = qs.get('msg_type', ['error'])[0]
+        except Exception:
+            pass
+        self._send_html(_render_passkey_enroll_page(user, msg=msg, msg_type=msg_type))
+
     def _do_logout(self):
         cookie_hdr = self.headers.get('Cookie', '')
         # Identify who is logging out before we delete the session
@@ -6817,6 +7328,15 @@ class ManageHandler(BaseHTTPRequestHandler):
         password = fields.get('password', '')
         client_ip = self.client_address[0]
         log.debug('LOGIN attempt user=%r ip=%s', username, client_ip)
+        user_probe = REGISTRATION_DB.get_user(username) if username else None
+        if user_probe and not user_probe['is_disabled'] and not user_probe['is_locked']:
+            policy = _auth_factor_policy_for_user(user_probe)
+            if policy.get('password_blocked'):
+                log.info('LOGIN password_blocked_passkey_required user=%r ip=%s policy=%s',
+                         username, client_ip, policy)
+                REGISTRATION_DB._log(username, 'login_password_blocked_passkey_required', client_ip)
+                self._send_html(_render_login('Password sign-in is disabled for this account. Use Sign in with Passkey.'))
+                return
         user = REGISTRATION_DB.authenticate(username, password)
         if user is None:
             log.debug('LOGIN failed user=%r', username)
@@ -6829,12 +7349,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB._log(username, 'login_ip_blocked', client_ip)
             self._send_html(_render_login('Invalid credentials.'))
             return
-        token = REGISTRATION_DB.create_session(user['id'])
+        policy = _auth_factor_policy_for_user(user)
+        token = REGISTRATION_DB.create_session(user['id'], must_enroll_passkey=bool(policy.get('must_enroll_passkey')))
         REGISTRATION_DB.record_login_ip(user['id'], client_ip)
         REGISTRATION_DB.daily_login_check(user['id'])
         REGISTRATION_DB._log(username, 'login', client_ip)
-        delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
-        login_redirect = '/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard'
+        if policy.get('must_enroll_passkey'):
+            login_redirect = '/manage/passkey-enroll'
+        else:
+            delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
+            login_redirect = '/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard'
         log.debug('LOGIN success user=%r token=%s...', username, token[:8])
         self.send_response(303)
         try:
@@ -6846,6 +7370,372 @@ class ManageHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', '0')
         self.end_headers()
         log.debug('LOGIN 303 sent for user=%r location=%s', username, login_redirect)
+
+    def _webauthn_rp_id(self) -> str:
+        host = (self.headers.get('Host', '') or '').strip().split(':')[0].lower()
+        if not host:
+            return 'localhost'
+        return host
+
+    def _webauthn_server(self):
+        if not _WEBAUTHN_LIB_AVAILABLE:
+            return None
+        rp_id = self._webauthn_rp_id()
+        try:
+            return Fido2Server({'id': rp_id, 'name': 'Wildkat Tracker'})
+        except Exception:
+            return None
+
+    def _webauthn_guard(self) -> tuple[bool, str]:
+        if not _WEBAUTHN_LIB_AVAILABLE:
+            return False, 'WebAuthn verifier backend is not installed on this server.'
+        if not REGISTRATION_DB or REGISTRATION_DB.get_setting('webauthn_login_enabled', '0') != '1':
+            return False, 'WebAuthn login is currently disabled by the operator.'
+        return True, ''
+
+    def _post_webauthn_auth_start(self):
+        ok, err = self._webauthn_guard()
+        if not ok:
+            return self._send_json({'ok': False, 'error': err}, 400)
+        payload = self._read_json_body()
+        username = str(payload.get('username', '')).strip()
+        all_credentials = bool(payload.get('all_credentials'))
+        if not username:
+            return self._send_json({'ok': False, 'error': 'Username is required.'}, 400)
+        user = REGISTRATION_DB.get_user(username)
+        if not user or user['is_disabled'] or user['is_locked']:
+            return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 403)
+        if 'webauthn_enabled' in user.keys() and not user['webauthn_enabled']:
+            return self._send_json({'ok': False, 'error': 'Passkey sign-in is not enabled for this account.'}, 400)
+        rows = REGISTRATION_DB.list_webauthn_credentials(user['id'])
+        if not rows:
+            return self._send_json({'ok': False, 'error': 'No registered passkeys for this account.'}, 400)
+        server = self._webauthn_server()
+        if not server:
+            return self._send_json({'ok': False, 'error': 'Unable to initialize WebAuthn server.'}, 500)
+        preferred_cookie = self._get_cookie_value(f'wk_last_passkey_{int(user["id"])}').strip()
+        primary_row = next((r for r in rows if int(r['is_primary'] or 0) == 1), None)
+        selected_rows = list(rows)
+        used_preferred = False
+        preferred_source = ''
+        if not all_credentials and primary_row:
+            selected_rows = [primary_row]
+            used_preferred = True
+            preferred_source = 'primary'
+            log.debug('WEBAUTHN auth start user=%s using primary credential', username)
+        elif not all_credentials and preferred_cookie:
+            narrowed = [r for r in rows if str(r['credential_id'] or '').strip() == preferred_cookie]
+            if narrowed:
+                selected_rows = narrowed
+                used_preferred = True
+                preferred_source = 'cookie'
+                log.debug('WEBAUTHN auth start user=%s using preferred credential cookie', username)
+        creds = []
+        for r in selected_rows:
+            try:
+                creds.append(AttestedCredentialData(bytes(r['public_key_cose'])))
+            except Exception:
+                continue
+        if not creds and used_preferred:
+            # Cookie points to stale/invalid credential; fall back to full credential list.
+            used_preferred = False
+            preferred_source = ''
+            for r in rows:
+                try:
+                    creds.append(AttestedCredentialData(bytes(r['public_key_cose'])))
+                except Exception:
+                    continue
+        if not creds:
+            return self._send_json({'ok': False, 'error': 'Stored passkey data is invalid.'}, 500)
+        try:
+            auth_data, state = server.authenticate_begin(creds, user_verification='preferred')
+            options = auth_data.get('publicKey', auth_data)
+            state_blob = base64.b64encode(pickle.dumps(state)).decode('ascii')
+            challenge = options.get('challenge')
+            challenge_b64 = _b64url_encode(challenge if isinstance(challenge, (bytes, bytearray)) else bytes(challenge))
+            challenge_id = REGISTRATION_DB.create_webauthn_challenge(
+                user['id'],
+                'auth',
+                challenge_b64,
+                state_blob,
+                session_hint='',
+                client_ip=self.client_address[0] if self.client_address else '',
+                user_agent=self.headers.get('User-Agent', '')
+            )
+            options_json = _json_safe_obj(options)
+            REGISTRATION_DB._log(username, 'webauthn_auth_start', username, f'challenge_id={challenge_id}')
+            return self._send_json({
+                'ok': True,
+                'challenge_id': challenge_id,
+                'publicKey': options_json,
+                'used_preferred': used_preferred,
+                'preferred_source': preferred_source,
+                'can_try_all': (used_preferred and len(rows) > 1),
+            })
+        except Exception as e:
+            log.exception('WEBAUTHN auth start failed user=%s: %s', username, e)
+            return self._send_json({'ok': False, 'error': 'Unable to start passkey authentication.'}, 500)
+
+    def _post_webauthn_auth_finish(self):
+        ok, err = self._webauthn_guard()
+        if not ok:
+            return self._send_json({'ok': False, 'error': err}, 400)
+        payload = self._read_json_body()
+        try:
+            challenge_id = int(payload.get('challenge_id', 0))
+        except Exception:
+            challenge_id = 0
+        cred = payload.get('credential') if isinstance(payload.get('credential'), dict) else {}
+        if not challenge_id or not cred:
+            return self._send_json({'ok': False, 'error': 'Missing authentication payload.'}, 400)
+        ch = REGISTRATION_DB.get_webauthn_challenge(challenge_id, 'auth')
+        if not ch:
+            return self._send_json({'ok': False, 'error': 'Authentication challenge expired or invalid.'}, 400)
+        server = self._webauthn_server()
+        if not server:
+            return self._send_json({'ok': False, 'error': 'Unable to initialize WebAuthn server.'}, 500)
+        user = REGISTRATION_DB.get_user_by_id(int(ch['user_id'])) if ch['user_id'] else None
+        if not user:
+            return self._send_json({'ok': False, 'error': 'Account not found.'}, 404)
+        rows = REGISTRATION_DB.list_webauthn_credentials(user['id'])
+        stored = []
+        by_cred_id = {}
+        for r in rows:
+            try:
+                acd = AttestedCredentialData(bytes(r['public_key_cose']))
+                stored.append(acd)
+                by_cred_id[_b64url_encode(acd.credential_id)] = r
+            except Exception:
+                continue
+        try:
+            state = pickle.loads(base64.b64decode(ch['state_json']))
+            cred_id_b64 = str(cred.get('id', '')).strip()
+            resp = cred.get('response', {}) if isinstance(cred.get('response'), dict) else {}
+            client_data = CollectedClientData(_b64url_decode(str(resp.get('clientDataJSON', ''))))
+            auth_data = AuthenticatorData(_b64url_decode(str(resp.get('authenticatorData', ''))))
+            signature = _b64url_decode(str(resp.get('signature', '')))
+            cred_id_raw = _b64url_decode(cred_id_b64)
+            server.authenticate_complete(state, stored, cred_id_raw, client_data, auth_data, signature)
+            REGISTRATION_DB.consume_webauthn_challenge(challenge_id)
+            row = by_cred_id.get(cred_id_b64)
+            if row:
+                REGISTRATION_DB.touch_webauthn_credential(int(row['id']), int(auth_data.counter))
+                REGISTRATION_DB.set_webauthn_primary_credential(int(user['id']), int(row['id']))
+            token = REGISTRATION_DB.create_session(user['id'])
+            REGISTRATION_DB.record_login_ip(user['id'], self.client_address[0] if self.client_address else '')
+            REGISTRATION_DB.daily_login_check(user['id'])
+            REGISTRATION_DB._log(user['username'], 'webauthn_auth_success', user['username'],
+                                 f'challenge_id={challenge_id}')
+            self.send_response(200)
+            self._set_session_cookie(token)
+            if row and str(row['credential_id'] or '').strip():
+                self._set_cookie(
+                    f'wk_last_passkey_{int(user["id"])}',
+                    str(row['credential_id']).strip(),
+                    hours=24 * 30,
+                    http_only=False,
+                    same_site='Lax',
+                    path='/manage',
+                )
+            body = json.dumps({'ok': True, 'redirect': '/manage/dashboard'}).encode('utf-8')
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        except Exception as e:
+            REGISTRATION_DB._log(user['username'], 'webauthn_auth_failed', user['username'],
+                                 f'challenge_id={challenge_id}')
+            log.warning('WEBAUTHN auth finish failed user=%s challenge_id=%s err=%s',
+                        user['username'], challenge_id, e)
+            return self._send_json({'ok': False, 'error': 'Passkey authentication failed.'}, 403)
+
+    def _post_webauthn_register_start(self):
+        user = self._get_session_user()
+        if not user:
+            return self._send_json({'ok': False, 'error': 'Authentication required.'}, 401)
+        ok, err = self._webauthn_guard()
+        if not ok:
+            return self._send_json({'ok': False, 'error': err}, 400)
+        server = self._webauthn_server()
+        if not server:
+            return self._send_json({'ok': False, 'error': 'Unable to initialize WebAuthn server.'}, 500)
+        rows = REGISTRATION_DB.list_webauthn_credentials(user['id'])
+        existing = []
+        for r in rows:
+            try:
+                existing.append(AttestedCredentialData(bytes(r['public_key_cose'])))
+            except Exception:
+                continue
+        user_entity = {
+            'id': str(user['id']).encode('utf-8'),
+            'name': user['username'],
+            'displayName': user['username'],
+        }
+        try:
+            reg_data, state = server.register_begin(
+                user_entity,
+                credentials=existing,
+                user_verification='preferred',
+            )
+            options = reg_data.get('publicKey', reg_data)
+            challenge = options.get('challenge')
+            challenge_b64 = _b64url_encode(challenge if isinstance(challenge, (bytes, bytearray)) else bytes(challenge))
+            state_blob = base64.b64encode(pickle.dumps(state)).decode('ascii')
+            challenge_id = REGISTRATION_DB.create_webauthn_challenge(
+                user['id'],
+                'register',
+                challenge_b64,
+                state_blob,
+                client_ip=self.client_address[0] if self.client_address else '',
+                user_agent=self.headers.get('User-Agent', '')
+            )
+            REGISTRATION_DB._log(user['username'], 'webauthn_register_start', user['username'],
+                                 f'challenge_id={challenge_id}')
+            return self._send_json({'ok': True, 'challenge_id': challenge_id, 'publicKey': _json_safe_obj(options)})
+        except Exception as e:
+            log.exception('WEBAUTHN register start failed user=%s: %s', user['username'], e)
+            return self._send_json({'ok': False, 'error': 'Unable to start passkey registration.'}, 500)
+
+    def _post_webauthn_register_finish(self):
+        user = self._get_session_user()
+        if not user:
+            return self._send_json({'ok': False, 'error': 'Authentication required.'}, 401)
+        ok, err = self._webauthn_guard()
+        if not ok:
+            return self._send_json({'ok': False, 'error': err}, 400)
+        payload = self._read_json_body()
+        try:
+            challenge_id = int(payload.get('challenge_id', 0))
+        except Exception:
+            challenge_id = 0
+        nickname = str(payload.get('nickname', '')).strip()
+        cred = payload.get('credential') if isinstance(payload.get('credential'), dict) else {}
+        if not challenge_id or not cred:
+            return self._send_json({'ok': False, 'error': 'Missing registration payload.'}, 400)
+        ch = REGISTRATION_DB.get_webauthn_challenge(challenge_id, 'register')
+        if not ch or int(ch['user_id'] or 0) != int(user['id']):
+            return self._send_json({'ok': False, 'error': 'Registration challenge expired or invalid.'}, 400)
+        server = self._webauthn_server()
+        if not server:
+            return self._send_json({'ok': False, 'error': 'Unable to initialize WebAuthn server.'}, 500)
+        try:
+            state = pickle.loads(base64.b64decode(ch['state_json']))
+            resp = cred.get('response', {}) if isinstance(cred.get('response'), dict) else {}
+            client_data = CollectedClientData(_b64url_decode(str(resp.get('clientDataJSON', ''))))
+            att_obj = AttestationObject(_b64url_decode(str(resp.get('attestationObject', ''))))
+            auth_data = server.register_complete(state, client_data, att_obj)
+            cd = auth_data.credential_data
+            cred_id_b64 = _b64url_encode(cd.credential_id)
+            added = REGISTRATION_DB.add_webauthn_credential(
+                user['id'],
+                cred_id_b64,
+                bytes(cd),
+                int(auth_data.counter),
+                aaguid=str(getattr(cd, 'aaguid', '') or ''),
+                transports_json=json.dumps(cred.get('transports', [])),
+                authenticator_attachment=str(cred.get('authenticatorAttachment', '') or ''),
+                is_resident_key=False,
+                user_verification=True,
+                nickname=nickname or 'Passkey',
+            )
+            if not added:
+                return self._send_json({'ok': False, 'error': 'Credential already registered.'}, 409)
+            REGISTRATION_DB.consume_webauthn_challenge(challenge_id)
+            REGISTRATION_DB.set_user_webauthn_preferences(
+                user['id'],
+                enabled=True,
+                preferred=bool(user['webauthn_preferred']) if 'webauthn_preferred' in user.keys() else False,
+                required=bool(user['webauthn_required']) if 'webauthn_required' in user.keys() else False,
+            )
+            tok = self._current_valid_session_token()
+            if tok and REGISTRATION_DB.session_requires_passkey_enroll(tok):
+                REGISTRATION_DB.set_session_passkey_enroll(tok, False)
+            REGISTRATION_DB._log(user['username'], 'webauthn_register_finish', user['username'],
+                                 f'challenge_id={challenge_id} cred={cred_id_b64[:14]}...')
+            policy = _auth_factor_policy_for_user(REGISTRATION_DB.get_user_by_id(user['id']) or user)
+            redirect = '/manage/passkey-enroll' if policy.get('must_enroll_passkey') else '/manage/dashboard'
+            return self._send_json({'ok': True, 'message': 'Passkey registered.', 'redirect': redirect})
+        except Exception as e:
+            log.warning('WEBAUTHN register finish failed user=%s challenge_id=%s err=%s',
+                        user['username'], challenge_id, e)
+            return self._send_json({'ok': False, 'error': 'Passkey registration failed.'}, 400)
+
+    def _post_webauthn_preferences(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        admin_required = bool('webauthn_required_admin' in user.keys() and user['webauthn_required_admin'])
+        enabled = fields.get('webauthn_enabled') == '1'
+        preferred = fields.get('webauthn_preferred') == '1'
+        required = fields.get('webauthn_required') == '1'
+        if required and not _webauthn_login_enabled():
+            return self._redirect('/manage/profile?msg=Operator+must+enable+WebAuthn+login+before+requiring+passkeys.&msg_type=error')
+        if admin_required and not _webauthn_login_enabled():
+            return self._redirect('/manage/profile?msg=Admin-enforced+passkey+policy+requires+WebAuthn+login+to+remain+enabled.&msg_type=error')
+        if admin_required:
+            enabled = True
+            required = True
+        if required and not enabled:
+            required = False
+        REGISTRATION_DB.set_user_webauthn_preferences(user['id'], enabled, preferred, required)
+        REGISTRATION_DB._log(
+            user['username'],
+            'webauthn_preferences',
+            user['username'],
+            f'enabled={int(enabled)} preferred={int(preferred)} required={int(required)} admin_required={1 if admin_required else 0}'
+        )
+        if admin_required:
+            self._redirect('/manage/profile?msg=Passkey+preferences+saved.+Admin+policy+keeps+passkey+requirement+enabled.&msg_type=success')
+            return
+        self._redirect('/manage/profile?msg=Passkey+preferences+saved&msg_type=success')
+
+    def _post_webauthn_credential_delete(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            cred_id = int(fields.get('cred_id', '0'))
+        except Exception:
+            cred_id = 0
+        policy = _auth_factor_policy_for_user(user)
+        if policy.get('passkey_required'):
+            active_count = REGISTRATION_DB.count_webauthn_credentials(user['id'])
+            if active_count <= 1:
+                return self._redirect('/manage/profile?msg=Cannot+remove+your+last+passkey+while+passkey+enforcement+is+active.&msg_type=error')
+        if cred_id and REGISTRATION_DB.delete_webauthn_credential(user['id'], cred_id):
+            REGISTRATION_DB._log(user['username'], 'webauthn_credential_delete', user['username'], f'cred_id={cred_id}')
+            self._redirect('/manage/profile?msg=Passkey+removed&msg_type=success')
+            return
+        self._redirect('/manage/profile?msg=Unable+to+remove+passkey&msg_type=error')
+
+    def _post_webauthn_credential_rename(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            cred_id = int(fields.get('cred_id', '0'))
+        except Exception:
+            cred_id = 0
+        nickname = (fields.get('nickname', '') or '').strip()
+        if not cred_id:
+            return self._redirect('/manage/profile?msg=Invalid+passkey+selection&msg_type=error')
+        if not nickname:
+            return self._redirect('/manage/profile?msg=Passkey+name+cannot+be+empty&msg_type=error')
+        renamed = REGISTRATION_DB.rename_webauthn_credential(user['id'], cred_id, nickname)
+        set_primary = REGISTRATION_DB.set_webauthn_primary_credential(user['id'], cred_id)
+        if renamed and set_primary:
+            REGISTRATION_DB._log(user['username'], 'webauthn_credential_rename', user['username'],
+                                 f'cred_id={cred_id} nickname={nickname[:80]!r} primary=1')
+            return self._redirect('/manage/profile?msg=Passkey+updated+and+set+as+primary&msg_type=success')
+        self._redirect('/manage/profile?msg=Unable+to+rename+passkey&msg_type=error')
 
     def _post_upload(self):
         user = self._get_session_user()
@@ -7489,6 +8379,50 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not back.startswith('/manage'): back = '/manage/admin'
         self._redirect(back)
 
+    def _post_admin_set_user_passkey_required(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        is_super = user['username'] == SUPER_USER
+        if not (user['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
+        if not _webauthn_login_enabled():
+            return self._redirect('/manage/admin?tab=settings&msg=Enable+WebAuthn+login+before+enforcing+passkeys.&msg_type=error')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target = fields.get('username', '').strip()
+        required = fields.get('required', '0') == '1'
+        if target and target != SUPER_USER:
+            REGISTRATION_DB.admin_set_user_webauthn_required(target, required, user['username'])
+        ref = self.headers.get('Referer', '')
+        back = urllib.parse.urlparse(ref).path or '/manage/admin'
+        if not back.startswith('/manage'):
+            back = '/manage/admin'
+        self._redirect(back)
+
+    def _post_admin_reset_webauthn(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        is_super = user['username'] == SUPER_USER
+        if not (user['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target_username = fields.get('username', '').strip()
+        target = REGISTRATION_DB.get_user(target_username) if target_username else None
+        if target and target['username'] != SUPER_USER:
+            removed = REGISTRATION_DB.reset_user_webauthn(int(target['id']))
+            REGISTRATION_DB._log(user['username'], 'admin_reset_webauthn', target_username,
+                                 f'removed_credentials={removed}')
+            log.warning('ADMIN reset passkeys actor=%s target=%s removed=%d',
+                        user['username'], target_username, removed)
+        ref = self.headers.get('Referer', '')
+        back = urllib.parse.urlparse(ref).path or '/manage/admin'
+        if not back.startswith('/manage'):
+            back = '/manage/admin'
+        self._redirect(back)
+
     def _post_set_admin(self):
         user = self._get_session_user()
         if not user:
@@ -7875,8 +8809,12 @@ class ManageHandler(BaseHTTPRequestHandler):
                 if user:
                     return self._redirect(location)
                 owner = REGISTRATION_DB.get_user_by_id(order['user_id'])
-                if owner and not owner['disabled']:
-                    new_token = REGISTRATION_DB.create_session(owner['id'])
+                if owner and not owner['is_disabled']:
+                    policy = _auth_factor_policy_for_user(owner)
+                    new_token = REGISTRATION_DB.create_session(
+                        owner['id'],
+                        must_enroll_passkey=bool(policy.get('must_enroll_passkey'))
+                    )
                     return self._redirect_with_session(location, new_token)
                 return self._redirect('/manage')
 
@@ -8113,6 +9051,20 @@ class ManageHandler(BaseHTTPRequestHandler):
         elif form_id == 'gravatar_settings':
             val = '1' if fields.get('gravatar_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('gravatar_enabled', val, user['username'])
+        elif form_id == 'webauthn_settings':
+            login_enabled = '1' if fields.get('webauthn_login_enabled') == '1' else '0'
+            enforce_sitewide = '1' if fields.get('webauthn_enforce_sitewide') == '1' else '0'
+            enforce_admins = '1' if fields.get('webauthn_enforce_admins') == '1' else '0'
+            if login_enabled == '1' and not _WEBAUTHN_LIB_AVAILABLE:
+                log.warning('WebAuthn enable rejected: python-fido2 unavailable actor=%s', user['username'])
+                return self._redirect('/manage/admin?tab=settings&msg=Cannot+enable+WebAuthn%3A+python-fido2+is+not+installed+on+this+server.&msg_type=error')
+            if (enforce_sitewide == '1' or enforce_admins == '1') and not _WEBAUTHN_LIB_AVAILABLE:
+                return self._redirect('/manage/admin?tab=settings&msg=Cannot+enable+passkey+enforcement%3A+python-fido2+is+not+installed.&msg_type=error')
+            if (enforce_sitewide == '1' or enforce_admins == '1') and login_enabled != '1':
+                return self._redirect('/manage/admin?tab=settings&msg=Enable+WebAuthn+login+before+enabling+passkey+enforcement.&msg_type=error')
+            REGISTRATION_DB.set_setting('webauthn_login_enabled', login_enabled, user['username'])
+            REGISTRATION_DB.set_setting('webauthn_enforce_sitewide', enforce_sitewide, user['username'])
+            REGISTRATION_DB.set_setting('webauthn_enforce_admins', enforce_admins, user['username'])
         elif form_id == 'topup_settings':
             # PayPal webhook verification policy:
             # enforce=1 -> fail closed and require active env webhook ID when PayPal enabled
@@ -9343,12 +10295,16 @@ class ManageHandler(BaseHTTPRequestHandler):
                                                   invited_by=invite['created_by_username']))
         REGISTRATION_DB.consume_invite_code(code, username)
         user = REGISTRATION_DB.authenticate(username, password)
-        token = REGISTRATION_DB.create_session(user['id'])
+        policy = _auth_factor_policy_for_user(user)
+        token = REGISTRATION_DB.create_session(
+            user['id'],
+            must_enroll_passkey=bool(policy.get('must_enroll_passkey'))
+        )
         REGISTRATION_DB.record_login_ip(user['id'], self.client_address[0])
         REGISTRATION_DB._log(username, 'login', self.client_address[0])
         self.send_response(303)
         self._set_session_cookie(token)
-        self.send_header('Location', '/manage/dashboard')
+        self.send_header('Location', '/manage/passkey-enroll' if policy.get('must_enroll_passkey') else '/manage/dashboard')
         self.send_header('Content-Length', '0')
         self.end_headers()
 
@@ -9411,12 +10367,16 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not ok:
             return self._send_html(_render_signup(f'Username {username!r} is already taken.', pw_settings=pw_settings))
         user = REGISTRATION_DB.authenticate(username, password)
-        token = REGISTRATION_DB.create_session(user['id'])
+        policy = _auth_factor_policy_for_user(user)
+        token = REGISTRATION_DB.create_session(
+            user['id'],
+            must_enroll_passkey=bool(policy.get('must_enroll_passkey'))
+        )
         REGISTRATION_DB.record_login_ip(user['id'], self.client_address[0])
         REGISTRATION_DB._log(username, 'login', self.client_address[0])
         self.send_response(303)
         self._set_session_cookie(token)
-        self.send_header('Location', '/manage/dashboard')
+        self.send_header('Location', '/manage/passkey-enroll' if policy.get('must_enroll_passkey') else '/manage/dashboard')
         self.send_header('Content-Length', '0')
         self.end_headers()
 
@@ -9645,6 +10605,8 @@ _MANAGE_CSS = '''
   .btn-sm { padding: 4px 12px; font-size: 0.72rem; }
   .btn-green { border-color: var(--green); color: var(--green); }
   .btn-green:hover { background: var(--green); color: #000; }
+  .btn-accent-rev { border-color: var(--accent); color: var(--accent); }
+  .btn-accent-rev:hover { background: var(--accent); color: #000; border-color: var(--green); }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
           padding: 24px 28px; margin-bottom: 24px; }
   .card-title { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.2em;
@@ -10536,6 +11498,76 @@ def _render_invite_invalid() -> str:
 
 
 def _render_login(msg: str = '', msg_type: str = 'error') -> str:
+    webauthn_on = _webauthn_login_enabled()
+    passkey_block = ''
+    if webauthn_on:
+        passkey_block = (
+            '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
+            '<button type="button" class="btn btn-sm" style="width:100%" onclick="startPasskeyLogin()">Sign in with Passkey</button>'
+            '<div id="passkey-login-msg" style="margin-top:8px;color:var(--muted);font-size:0.82rem"></div>'
+            '<button type="button" id="passkey-try-all" class="btn btn-sm" style="display:none;width:100%;margin-top:8px" onclick="startPasskeyLogin(true)">Try a different passkey</button>'
+            '</div>'
+            '<script>'
+            '(function(){'
+            'window.startPasskeyLogin = async function(allCreds,autoRetried){'
+            'var u=document.querySelector(\'input[name=\"username\"]\');'
+            'var m=document.getElementById(\"passkey-login-msg\");'
+            'var alt=document.getElementById(\"passkey-try-all\");'
+            'var showAlt=function(v){if(alt)alt.style.display=v?\"block\":\"none\";};'
+            'var retried=!!autoRetried;'
+            'var username=(u&&u.value?u.value.trim():\"\");'
+            'if(!username){if(m)m.textContent=\"Enter your username first.\";return;}'
+            'if(!window.PublicKeyCredential){if(m)m.textContent=\"Passkeys are not supported in this browser.\";return;}'
+            'try{'
+            'showAlt(false);'
+            'if(m)m.textContent=\"Starting passkey authentication...\";'
+            'var s=await fetch(\"/manage/webauthn/auth/start\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({username:username,all_credentials:!!allCreds})});'
+            'var sj={};try{sj=await s.json();}catch(_e){sj={ok:false,error:\"Passkey start failed (invalid server response).\"};}'
+            'if(!sj.ok){if(m)m.textContent=sj.error||\"Passkey start failed.\";return;}'
+            'var canTryAll=(!allCreds)&&!!sj.can_try_all;'
+            'var pk=sj.publicKey||{};'
+            'var b64d=function(v){v=(v||\"\").replace(/-/g,\"+\").replace(/_/g,\"/\");while(v.length%4)v+=\"=\";var b=atob(v);var a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;};'
+            'pk.challenge=b64d(pk.challenge);'
+            'if(Array.isArray(pk.allowCredentials)){pk.allowCredentials=pk.allowCredentials.map(function(c){if(c&&c.id)c.id=b64d(c.id);return c;});}'
+            'var cred=await navigator.credentials.get({publicKey:pk});'
+            'if(!cred){if(m)m.textContent=\"No credential selected.\";return;}'
+            'var b64e=function(buf){var b=\"\";var bytes=new Uint8Array(buf);for(var i=0;i<bytes.length;i++)b+=String.fromCharCode(bytes[i]);return btoa(b).replace(/\\+/g,\"-\").replace(/\\//g,\"_\").replace(/=+$/g,\"\");};'
+            'var payload={'
+            'challenge_id:sj.challenge_id,'
+            'credential:{'
+            'id:cred.id,'
+            'type:cred.type,'
+            'rawId:b64e(cred.rawId),'
+            'response:{'
+            'clientDataJSON:b64e(cred.response.clientDataJSON),'
+            'authenticatorData:b64e(cred.response.authenticatorData),'
+            'signature:b64e(cred.response.signature),'
+            'userHandle:cred.response.userHandle?b64e(cred.response.userHandle):\"\"'
+            '},'
+            'authenticatorAttachment:cred.authenticatorAttachment||\"\"'
+            '}'
+            '};'
+            'var f=await fetch(\"/manage/webauthn/auth/finish\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(payload)});'
+            'var fj={};try{fj=await f.json();}catch(_e){fj={ok:false,error:\"Passkey finish failed (invalid server response).\"};}'
+            'if(!fj.ok){'
+            'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return window.startPasskeyLogin(true,true);}'
+            'if(m)m.textContent=fj.error||\"Passkey authentication failed.\";if(canTryAll)showAlt(true);return;}'
+            'window.location.href=fj.redirect||\"/manage/dashboard\";'
+            '}catch(e){'
+            'var n=(e&&e.name)||\"\";'
+            'if(n===\"NotAllowedError\"){'
+            'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return window.startPasskeyLogin(true,true);}'
+            'if(m)m.textContent=\"Authentication was canceled or the selected key is not valid for this username. Try again and choose the matching passkey.\";if(canTryAll)showAlt(true);return;}'
+            'if(n===\"InvalidStateError\"){'
+            'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return window.startPasskeyLogin(true,true);}'
+            'if(m)m.textContent=\"Selected key is not registered for this account.\";if(canTryAll)showAlt(true);return;}'
+            'if(n===\"AbortError\"){if(m)m.textContent=\"Passkey request was interrupted. Please try again.\";return;}'
+            'if(m)m.textContent=\"Passkey authentication failed.\";'
+            '}'
+            '};'
+            '})();'
+            '</script>'
+        )
     body = '''
   <div style="max-width:380px;margin:60px auto">
     <div class="page-title">Sign In</div>
@@ -10552,9 +11584,54 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
         </div>
         <button type="submit" class="btn btn-primary" style="width:100%;margin-top:8px">Sign In</button>
       </form>
+      ''' + passkey_block + '''
     </div>
   </div>'''
     return _manage_page('Login', body, msg=msg, msg_type=msg_type)
+
+
+def _render_passkey_enroll_page(user, msg: str = '', msg_type: str = 'error') -> str:
+    uname = _h(user['username'])
+    body = (
+        '<div style="max-width:560px;margin:40px auto">'
+        '<div class="page-title">Passkey Enrollment Required</div>'
+        '<div class="page-sub">Security policy requires a passkey before accessing the site.</div>'
+        '<div class="card">'
+        '<div style="font-size:0.9rem;color:var(--muted);margin-bottom:12px">'
+        f'Signed in as <strong style="color:var(--text)">{uname}</strong>. Add at least one passkey to continue.'
+        '</div>'
+        '<button type="button" class="btn btn-primary" onclick="wkEnrollRequiredPasskey()">Add Passkey</button>'
+        '<a href="/manage/logout" class="btn btn-sm" style="margin-left:8px">Logout</a>'
+        '<div id="wk-enroll-msg" style="margin-top:10px;font-size:0.84rem;color:var(--muted)"></div>'
+        '</div>'
+        '<script>'
+        '(function(){'
+        'window.wkEnrollRequiredPasskey=async function(){'
+        'var m=document.getElementById("wk-enroll-msg");'
+        'if(!window.PublicKeyCredential){if(m)m.textContent="Passkeys are not supported in this browser.";return;}'
+        'try{'
+        'if(m)m.textContent="Starting passkey registration...";'
+        'var s=await fetch("/manage/webauthn/register/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});'
+        'var sj=await s.json();'
+        'if(!sj.ok){if(m)m.textContent=sj.error||"Unable to start registration.";return;}'
+        'var b64d=function(v){v=(v||"").replace(/-/g,"+").replace(/_/g,"/");while(v.length%4)v+="=";var b=atob(v);var a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;};'
+        'var b64e=function(buf){var b="";var bytes=new Uint8Array(buf);for(var i=0;i<bytes.length;i++)b+=String.fromCharCode(bytes[i]);return btoa(b).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");};'
+        'var pk=sj.publicKey||{};pk.challenge=b64d(pk.challenge);'
+        'if(pk.user&&pk.user.id)pk.user.id=b64d(pk.user.id);'
+        'if(Array.isArray(pk.excludeCredentials)){pk.excludeCredentials=pk.excludeCredentials.map(function(c){if(c&&c.id)c.id=b64d(c.id);return c;});}'
+        'var cred=await navigator.credentials.create({publicKey:pk});'
+        'if(!cred){if(m)m.textContent="No credential created.";return;}'
+        'var payload={challenge_id:sj.challenge_id,nickname:"Passkey",credential:{id:cred.id,type:cred.type,rawId:b64e(cred.rawId),response:{clientDataJSON:b64e(cred.response.clientDataJSON),attestationObject:b64e(cred.response.attestationObject)},authenticatorAttachment:cred.authenticatorAttachment||"",transports:[]}};'
+        'var f=await fetch("/manage/webauthn/register/finish",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});'
+        'var fj=await f.json();'
+        'if(!fj.ok){if(m)m.textContent=fj.error||"Registration failed.";return;}'
+        'if(m)m.textContent="Passkey registered.";'
+        'window.location.href=fj.redirect||"/manage/dashboard";'
+        '}catch(e){if(m)m.textContent="Passkey registration failed.";}};})();'
+        '</script>'
+        '</div>'
+    )
+    return _manage_page('Passkey Enrollment Required', body, user=user, msg=msg, msg_type=msg_type)
 
 
 def _render_account_delete_confirm_page(user, remaining_sec: int,
@@ -11038,6 +12115,35 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
             <input type="checkbox" name="gravatar_enabled" value="1" {'checked' if settings.get('gravatar_enabled','0')=='1' else ''}> Enable Gravatar avatars
           </label>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">WebAuthn / Passkeys</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Enable passkey authentication for platform authenticators (Touch ID / Face ID / Windows Hello)
+          and roaming security keys (YubiKey / Titan). Requires python-fido2 on the server.
+        </p>
+        {('<div style="font-size:0.82rem;color:var(--danger);margin-bottom:12px">'
+          'python-fido2 is not installed on this server. Install it before enabling WebAuthn.'
+          '</div>') if not _WEBAUTHN_LIB_AVAILABLE else ''}
+        {('<div style="font-size:0.82rem;color:var(--danger);margin-bottom:12px">'
+          'Break-glass startup override is active. Passkey enforcement is currently bypassed.'
+          '</div>') if AUTH_BREAK_GLASS else ''}
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="webauthn_settings">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
+            <input type="checkbox" name="webauthn_login_enabled" value="1" {'checked' if settings.get('webauthn_login_enabled','0')=='1' else ''}> Enable WebAuthn login
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="webauthn_enforce_admins" value="1" {'checked' if settings.get('webauthn_enforce_admins','0')=='1' else ''}> Enforce passkey for Admin + Super accounts
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
+            <input type="checkbox" name="webauthn_enforce_sitewide" value="1" {'checked' if settings.get('webauthn_enforce_sitewide','0')=='1' else ''}> Enforce passkey site-wide
+          </label>
+          <div style="font-size:0.8rem;color:var(--muted);margin-bottom:16px">
+            TFA scaffold is enabled in backend architecture for future Google Authenticator rollout, but TFA login is not active yet.
+          </div>
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
       </div>
@@ -13443,6 +14549,105 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         _invite_html = _render_invite_section(viewer, target_user, True, REGISTRATION_DB)
         # Build send points inline for right column
         _points_top  = _render_points_section(viewer, target_user, True, ledger, bounty_data, part='top')
+        _webauthn_rows = ''
+        if REGISTRATION_DB:
+            for cred in REGISTRATION_DB.list_webauthn_credentials(viewer['id'], include_inactive=True):
+                _cid = int(cred['id'])
+                _nick = _h(cred['nickname'] or 'Passkey')
+                _last = _h((cred['last_used_at'] or cred['created_at'] or '')[:16].replace('T', ' '))
+                _is_primary = int(cred['is_primary'] or 0) == 1
+                _state = 'PRIMARY' if _is_primary else 'ACTIVE'
+                _state_col = 'var(--green)'
+                _webauthn_rows += (
+                    '<tr>'
+                    '<td>'
+                    '<form method="POST" action="/manage/webauthn/credential/rename" style="display:flex;gap:6px;align-items:center;min-width:260px">'
+                    f'<input type="hidden" name="cred_id" value="{_cid}">'
+                    f'<input type="text" name="nickname" value="{_nick}" maxlength="120" '
+                    'style="flex:1;min-width:140px;padding:6px 8px;background:var(--card2);border:1px solid var(--border);'
+                    'border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
+                    '<button class="btn btn-sm" type="submit">Save</button>'
+                    '</form>'
+                    '</td>'
+                    f'<td class="hash" style="font-size:0.74rem;color:{_state_col}">{_state}</td>'
+                    f'<td class="hash">{_last}</td>'
+                    '<td>'
+                    '<form method="POST" action="/manage/webauthn/credential/delete" style="display:inline" '
+                    'data-confirm="Remove this passkey?">'
+                    f'<input type="hidden" name="cred_id" value="{_cid}">'
+                    '<button class="btn btn-sm btn-danger">Remove</button>'
+                    '</form>'
+                    '</td>'
+                    '</tr>'
+                )
+        if not _webauthn_rows:
+            _webauthn_rows = '<tr><td colspan="4" class="empty">No passkeys registered</td></tr>'
+        _webauthn_enabled = ('webauthn_enabled' in viewer.keys() and viewer['webauthn_enabled'])
+        _webauthn_preferred = ('webauthn_preferred' in viewer.keys() and viewer['webauthn_preferred'])
+        _webauthn_required = ('webauthn_required' in viewer.keys() and viewer['webauthn_required'])
+        _webauthn_required_admin = ('webauthn_required_admin' in viewer.keys() and viewer['webauthn_required_admin'])
+        _webauthn_login_enabled = (REGISTRATION_DB.get_setting('webauthn_login_enabled', '0') == '1') if REGISTRATION_DB else False
+        _sitewide_enforced = (REGISTRATION_DB.get_setting('webauthn_enforce_sitewide', '0') == '1') if REGISTRATION_DB else False
+        _admin_scope_enforced = (
+            REGISTRATION_DB.get_setting('webauthn_enforce_admins', '0') == '1'
+            and _user_role(viewer) in ('admin', 'super')
+        ) if REGISTRATION_DB else False
+        _server_policy_enforced = bool(_sitewide_enforced or _admin_scope_enforced)
+        _effective_required = bool(_webauthn_required or _webauthn_required_admin)
+        _required_disabled_attr = 'disabled' if (_webauthn_required_admin or _server_policy_enforced) else ''
+        if _server_policy_enforced:
+            _required_note = '<div class="muted" style="font-size:0.78rem;margin-top:4px">Server policy is enforcing passkey requirements.</div>'
+        elif _webauthn_required_admin:
+            _required_note = '<div class="muted" style="font-size:0.78rem;margin-top:4px">Admin policy is enforcing passkey requirement for this account.</div>'
+        else:
+            _required_note = ''
+        _webauthn_card = (
+            '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
+            '<div style="font-size:0.85rem;color:var(--muted);margin-bottom:8px">Passkeys &amp; Security Keys</div>'
+            + '<form method="POST" action="/manage/webauthn/preferences" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            f'<input type="checkbox" name="webauthn_enabled" value="1" {"checked" if _webauthn_enabled else ""}> Enable passkey sign-in</label>'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            f'<input type="checkbox" name="webauthn_preferred" value="1" {"checked" if _webauthn_preferred else ""}> Prefer passkey on this account</label>'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            f'<input type="checkbox" name="webauthn_required" value="1" {"checked" if _effective_required else ""} {_required_disabled_attr}> Require passkey (password-only login blocked)</label>'
+            + _required_note +
+            '<div><button type="submit" class="btn btn-sm btn-accent-rev">Save Passkey Settings</button></div>'
+            '</form>'
+            + ('' if (not _WEBAUTHN_LIB_AVAILABLE or not _webauthn_login_enabled) else
+               '<button type="button" class="btn btn-sm btn-green" onclick="wkStartPasskeyEnroll()">Add Passkey</button>'
+               '<div id="wk-passkey-msg" style="margin-top:8px;font-size:0.8rem;color:var(--muted)"></div>'
+               '<script>'
+               '(function(){'
+               'window.wkStartPasskeyEnroll=async function(){'
+               'var m=document.getElementById("wk-passkey-msg");'
+               'if(!window.PublicKeyCredential){if(m)m.textContent="Passkeys are not supported in this browser.";return;}'
+               'try{'
+               'if(m)m.textContent="Starting passkey registration...";'
+               'var s=await fetch("/manage/webauthn/register/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});'
+               'var sj=await s.json();'
+               'if(!sj.ok){if(m)m.textContent=sj.error||"Unable to start registration.";return;}'
+               'var b64d=function(v){v=(v||"").replace(/-/g,"+").replace(/_/g,"/");while(v.length%4)v+="=";var b=atob(v);var a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;};'
+               'var b64e=function(buf){var b="";var bytes=new Uint8Array(buf);for(var i=0;i<bytes.length;i++)b+=String.fromCharCode(bytes[i]);return btoa(b).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");};'
+               'var pk=sj.publicKey||{};pk.challenge=b64d(pk.challenge);'
+               'if(pk.user&&pk.user.id)pk.user.id=b64d(pk.user.id);'
+               'if(Array.isArray(pk.excludeCredentials)){pk.excludeCredentials=pk.excludeCredentials.map(function(c){if(c&&c.id)c.id=b64d(c.id);return c;});}'
+               'var cred=await navigator.credentials.create({publicKey:pk});'
+               'if(!cred){if(m)m.textContent="No credential created.";return;}'
+               'var payload={challenge_id:sj.challenge_id,nickname:"Passkey",credential:{id:cred.id,type:cred.type,rawId:b64e(cred.rawId),response:{clientDataJSON:b64e(cred.response.clientDataJSON),attestationObject:b64e(cred.response.attestationObject)},authenticatorAttachment:cred.authenticatorAttachment||"",transports:[]}};'
+               'var f=await fetch("/manage/webauthn/register/finish",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});'
+               'var fj=await f.json();'
+               'if(!fj.ok){if(m)m.textContent=fj.error||"Registration failed.";return;}'
+               'if(m)m.textContent="Passkey registered.";'
+               'setTimeout(function(){window.location.reload();},700);'
+               '}catch(e){if(m)m.textContent="Passkey registration failed.";}};})();'
+               '</script>')
+            + '<div class="table-wrap" style="margin-top:10px"><table>'
+            '<tr><th scope="col">Nickname</th><th scope="col">State</th><th scope="col">Last Used</th><th scope="col">Actions</th></tr>'
+            + _webauthn_rows +
+            '</table></div>'
+            '</div>'
+        )
         actions_card = (
             '<div style="display:flex;flex-direction:column;gap:24px">'
             '<div class="card"><div class="card-title">Actions</div>'
@@ -13499,6 +14704,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                '<div><button type="submit" class="btn btn-sm btn-danger">Delete My Account</button></div>'
                '</form>')
             + '</div>'
+            + _webauthn_card
             + '</div></div>'
             + _invite_html
             + _points_top
@@ -13560,6 +14766,30 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                 f'<form method="POST" action="/manage/admin/delete-user" style="display:inline" data-confirm="Delete {uname_h}? This cannot be undone.">'
                 + hi + '<button class="btn btn-sm btn-danger">Delete User</button></form>'
             )
+        _target_passkey_required = bool('webauthn_required_admin' in target_user.keys() and target_user['webauthn_required_admin'])
+        passkey_req_btn = ''
+        if not t_is_super and viewer_role in ('admin', 'super'):
+            if _target_passkey_required:
+                passkey_req_btn = (
+                    f'<form method="POST" action="/manage/admin/set-user-passkey-required" style="display:inline" '
+                    f'data-confirm="Allow password login for {uname_h} (remove per-user passkey enforcement)?">'
+                    + hi + '<input type="hidden" name="required" value="0">'
+                    + '<button class="btn btn-sm">Passkey Optional</button></form>'
+                )
+            else:
+                passkey_req_btn = (
+                    f'<form method="POST" action="/manage/admin/set-user-passkey-required" style="display:inline" '
+                    f'data-confirm="Enforce passkey login for {uname_h}?">'
+                    + hi + '<input type="hidden" name="required" value="1">'
+                    + '<button class="btn btn-sm btn-green">Enforce Passkey</button></form>'
+                )
+        webauthn_reset_btn = ''
+        if not t_is_super and (is_super or viewer_role in ('admin', 'super')):
+            webauthn_reset_btn = (
+                f'<form method="POST" action="/manage/admin/reset-webauthn" style="display:inline" '
+                f'data-confirm="Reset all passkeys for {uname_h} and allow password login recovery?">'
+                + hi + '<button class="btn btn-sm btn-danger">Reset Passkeys</button></form>'
+            )
         hi_referer = '/manage/profile' if is_own_profile else '/manage/admin/user/' + uname_h
         max_grant  = int(REGISTRATION_DB.get_setting('admin_max_point_grant', '1000')) if REGISTRATION_DB else 1000
         credit_btns = (
@@ -13593,7 +14823,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<div class="card"><div class="card-title">Actions</div>'
             + '<div style="display:flex;flex-direction:column;gap:14px">'
             + (('<div>' + pw_form + '</div>') if pw_form else '')
-            + (('<div style="display:flex;flex-wrap:wrap;gap:8px">' + unlock_btn + dis_btn + role_btns + del_btn + '</div>') if any([unlock_btn, dis_btn, role_btns, del_btn]) else '')
+            + (('<div style="display:flex;flex-wrap:wrap;gap:8px">' + unlock_btn + dis_btn + role_btns + passkey_req_btn + webauthn_reset_btn + del_btn + '</div>') if any([unlock_btn, dis_btn, role_btns, passkey_req_btn, webauthn_reset_btn, del_btn]) else '')
             + '<div style="display:flex;flex-wrap:wrap;gap:8px">'
             + credit_btns
             + '</div>'
@@ -14245,7 +15475,8 @@ def main():
     global DEFAULT_INTERVAL, DEFAULT_MIN_INTERVAL, PEER_TTL, MAX_PEERS_PER_REPLY, \
            DEFAULT_TRACKER_ID, MAX_SCRAPE_HASHES, ALLOW_FULL_SCRAPE, \
            REGISTRATION_MODE, REGISTRATION_DB, OPEN_TRACKER, \
-           REWARD_ENABLED, REWARD_THRESHOLD, SUPER_USER, _MANAGE_HTTPS_PORT
+           REWARD_ENABLED, REWARD_THRESHOLD, SUPER_USER, _MANAGE_HTTPS_PORT, \
+           AUTH_BREAK_GLASS
 
     parser = argparse.ArgumentParser(
         description='BitTorrent Tracker Server (HTTP + HTTPS + UDP)',
@@ -14299,6 +15530,10 @@ def main():
                         help='Superuser username (required with --registration)')
     parser.add_argument('--super-user-password', default='',
                         help='Set/reset superuser password (service must be stopped)')
+    parser.add_argument('--super-user-reset-passkeys', action='store_true',
+                        help='Reset super-user passkeys and passkey-required flags, then exit')
+    parser.add_argument('--auth-break-glass', action='store_true',
+                        help='Temporary startup override to bypass passkey enforcement gates')
     parser.add_argument('--manage-port', type=int, default=0,
                         help='Management HTTPS port (default: same as --web-https-port)')
 
@@ -14306,6 +15541,9 @@ def main():
 
     if args.verbose:
         log.setLevel(logging.DEBUG)
+    AUTH_BREAK_GLASS = bool(args.auth_break_glass)
+    if AUTH_BREAK_GLASS:
+        log.warning('AUTH BREAK-GLASS is ACTIVE: passkey enforcement gates are bypassed.')
 
     # Override globals with CLI args
     DEFAULT_TRACKER_ID  = args.tracker_id
@@ -14355,6 +15593,21 @@ def main():
         conn.commit()
         conn.close()
         print(f'Superuser {args.super_user!r} password set.')
+        sys.exit(0)
+
+    # ── Super-user passkey reset (run offline, exits) ─────────
+    if args.super_user_reset_passkeys:
+        if not args.super_user:
+            print('Error: --super-user-reset-passkeys requires --super-user', file=sys.stderr)
+            sys.exit(1)
+        db = RegistrationDB(args.db)
+        u = db.get_user(args.super_user)
+        if not u:
+            print(f'Error: super user {args.super_user!r} not found in {args.db}', file=sys.stderr)
+            sys.exit(1)
+        removed = db.reset_user_webauthn(int(u['id']))
+        db.delete_sessions_for_user(int(u['id']))
+        print(f'Superuser {args.super_user!r} passkeys reset. Removed credentials: {removed}. Sessions cleared.')
         sys.exit(0)
 
     # ── TLS / HTTPS ──────────────────────────────────────────
@@ -14494,6 +15747,10 @@ def main():
                         log.info('topup stale reconcile: reconciled %d stale order(s)', stale)
                 except Exception as _e:
                     log.warning('reconcile_stale_topup_orders failed (non-fatal): %s', _e)
+                try:
+                    REGISTRATION_DB.expire_webauthn_challenges()
+                except Exception as _e:
+                    log.warning('expire_webauthn_challenges failed (non-fatal): %s', _e)
             hashes = REGISTRY.all_hashes()
             total_peers = sum(
                 len(REGISTRY._torrents.get(h, {})) for h in hashes
