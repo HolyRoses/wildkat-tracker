@@ -107,6 +107,7 @@ DEFAULT_UDP_PORT    = 6969
 DEFAULT_INTERVAL    = 1800   # seconds
 DEFAULT_MIN_INTERVAL = 60
 PEER_SCRAPE_MIN_INTERVAL_SECONDS = 3 * 60 * 60
+ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES = 5
 PEER_TTL            = 3600   # seconds before a peer is purged
 MAX_PEERS_PER_REPLY  = 200
 MAX_SCRAPE_HASHES    = 5      # max info_hashes per scrape request
@@ -980,6 +981,26 @@ class RegistrationDB:
                 target     TEXT    NOT NULL DEFAULT '',
                 detail     TEXT    NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS account_delete_challenges (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id               INTEGER NOT NULL,
+                status                TEXT    NOT NULL DEFAULT 'challenged',
+                created_at            TEXT    NOT NULL,
+                expires_at            TEXT    NOT NULL,
+                completed_at          TEXT,
+                canceled_at           TEXT,
+                requested_ip          TEXT    NOT NULL DEFAULT '',
+                requested_user_agent  TEXT    NOT NULL DEFAULT '',
+                consumed_ip           TEXT    NOT NULL DEFAULT '',
+                consumed_user_agent   TEXT    NOT NULL DEFAULT '',
+                attempt_count         INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at       TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_delete_challenges_user_status
+              ON account_delete_challenges(user_id, status, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_delete_challenges_expires
+              ON account_delete_challenges(status, expires_at);
         ''')
         # ── Migrations ────────────────────────────────────────
         cols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
@@ -4014,6 +4035,7 @@ class RegistrationDB:
         c.execute('DELETE FROM ip_allowlist')
         c.execute('DELETE FROM login_history')
         c.execute('DELETE FROM user_follows')
+        c.execute('DELETE FROM account_delete_challenges')
         c.execute('DELETE FROM topup_reconciliation_actions')
         c.execute('DELETE FROM topup_webhook_events')
         c.execute('DELETE FROM topup_orders')
@@ -4110,10 +4132,133 @@ class RegistrationDB:
         self._conn().execute('DELETE FROM sessions WHERE token=?', (token,))
         self._conn().commit()
 
+    def delete_sessions_for_user(self, user_id: int):
+        self._conn().execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+        self._conn().commit()
+
     def purge_expired_sessions(self):
         now = datetime.datetime.now().isoformat(timespec='seconds')
         self._conn().execute('DELETE FROM sessions WHERE expires_at<=?', (now,))
         self._conn().commit()
+
+    # ── Self-delete challenges ───────────────────────────────
+
+    def expire_account_delete_challenges(self) -> int:
+        now = self._ts()
+        c = self._conn()
+        rows = c.execute(
+            "SELECT id,user_id FROM account_delete_challenges "
+            "WHERE status='challenged' AND expires_at<=?",
+            (now,)
+        ).fetchall()
+        cur = c.execute(
+            "UPDATE account_delete_challenges SET status='expired' "
+            "WHERE status='challenged' AND expires_at<=?",
+            (now,)
+        )
+        c.commit()
+        for r in rows:
+            self._log('system', 'account_delete_expired', str(r['user_id']),
+                      f'challenge_id={r[0]}')
+        return int(cur.rowcount or 0)
+
+    def get_active_account_delete_challenge(self, user_id: int):
+        self.expire_account_delete_challenges()
+        now = self._ts()
+        return self._conn().execute(
+            "SELECT * FROM account_delete_challenges "
+            "WHERE user_id=? AND status='challenged' AND expires_at>? "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id, now)
+        ).fetchone()
+
+    def create_account_delete_challenge(self, user_id: int, actor: str,
+                                        requested_ip: str, requested_user_agent: str,
+                                        ttl_minutes: int = ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES):
+        ttl = max(1, min(30, int(ttl_minutes)))
+        now_dt = datetime.datetime.now()
+        now = now_dt.isoformat(timespec='seconds')
+        expires_at = (now_dt + datetime.timedelta(minutes=ttl)).isoformat(timespec='seconds')
+        c = self._conn()
+        c.execute(
+            "UPDATE account_delete_challenges SET status='canceled', canceled_at=? "
+            "WHERE user_id=? AND status='challenged'",
+            (now, user_id)
+        )
+        cur = c.execute(
+            '''INSERT INTO account_delete_challenges
+               (user_id,status,created_at,expires_at,requested_ip,requested_user_agent)
+               VALUES (?,?,?,?,?,?)''',
+            (user_id, 'challenged', now, expires_at, requested_ip[:64], requested_user_agent[:255])
+        )
+        c.commit()
+        self._log(actor, 'account_delete_challenge_issued', str(user_id),
+                  f'expires_at={expires_at} ip={requested_ip[:64]}')
+        return c.execute('SELECT * FROM account_delete_challenges WHERE id=?', (cur.lastrowid,)).fetchone()
+
+    def mark_account_delete_attempt(self, challenge_id: int) -> int:
+        now = self._ts()
+        c = self._conn()
+        c.execute(
+            'UPDATE account_delete_challenges '
+            'SET attempt_count=attempt_count+1,last_attempt_at=? WHERE id=?',
+            (now, challenge_id)
+        )
+        c.commit()
+        row = c.execute('SELECT attempt_count FROM account_delete_challenges WHERE id=?', (challenge_id,)).fetchone()
+        return int(row['attempt_count']) if row else 0
+
+    def cancel_account_delete_challenge(self, user_id: int, actor: str, detail: str = '') -> bool:
+        ch = self.get_active_account_delete_challenge(user_id)
+        if not ch:
+            return False
+        now = self._ts()
+        c = self._conn()
+        c.execute(
+            "UPDATE account_delete_challenges SET status='canceled', canceled_at=? WHERE id=?",
+            (now, ch['id'])
+        )
+        c.commit()
+        self._log(actor, 'account_delete_canceled', str(user_id), detail[:255])
+        return True
+
+    def self_delete_account(self, user_id: int, actor: str,
+                            consumed_ip: str = '', consumed_user_agent: str = '',
+                            challenge_id: int | None = None) -> tuple[bool, str]:
+        user = self.get_user_by_id(user_id)
+        if not user:
+            return False, 'Account not found.'
+        if user['username'] == SUPER_USER:
+            return False, 'Super account cannot self-delete.'
+        now = self._ts()
+        c = self._conn()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            if challenge_id:
+                c.execute(
+                    "UPDATE account_delete_challenges "
+                    "SET status='completed',completed_at=?,consumed_ip=?,consumed_user_agent=? "
+                    "WHERE id=?",
+                    (now, consumed_ip[:64], consumed_user_agent[:255], challenge_id)
+                )
+            c.execute(
+                "UPDATE torrents SET uploaded_by_id=NULL, uploaded_by_username='[deleted]' "
+                "WHERE uploaded_by_id=? OR uploaded_by_username=?",
+                (user_id, user['username'])
+            )
+            c.execute(
+                'DELETE FROM user_follows WHERE follower_user_id=? OR followed_user_id=?',
+                (user_id, user_id)
+            )
+            c.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+            c.execute('DELETE FROM users WHERE id=?', (user_id,))
+            c.commit()
+        except Exception as e:
+            c.rollback()
+            return False, f'Account deletion failed: {e}'
+        self._log(actor, 'account_deleted_self', user['username'],
+                  f'ip={consumed_ip[:64]}')
+        return True, 'Account deleted.'
 
     # ── Comments ──────────────────────────────────────────────
 
@@ -6281,10 +6426,13 @@ class ManageHandler(BaseHTTPRequestHandler):
 
         if path in ('/manage', ''):
             user = self._get_session_user()
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+            msg_type = qs.get('msg_type', ['error'])[0]
             if user:
                 self._redirect('/manage/dashboard')
             else:
-                self._send_html(_render_login())
+                self._send_html(_render_login(msg, msg_type=msg_type))
         elif path == '/manage/dashboard':
             self._get_dashboard()
         elif path == '/manage/admin':
@@ -6310,6 +6458,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_public_profile(path[len('/manage/user/'):])
         elif path == '/manage/profile':
             self._get_profile()
+        elif path == '/manage/account/delete/confirm':
+            self._get_account_delete_confirm()
+        elif path == '/manage/goodbye':
+            self._send_html(_render_goodbye_page())
         elif path == '/manage/following':
             self._get_following()
         elif path == '/robots.txt':
@@ -6428,6 +6580,12 @@ class ManageHandler(BaseHTTPRequestHandler):
 
         if path == '/manage/login':
             self._post_login()
+        elif path == '/manage/account/delete/start':
+            self._post_account_delete_start()
+        elif path == '/manage/account/delete/confirm':
+            self._post_account_delete_confirm()
+        elif path == '/manage/account/delete/cancel':
+            self._post_account_delete_cancel()
         elif path == '/manage/upload':
             self._post_upload()
         elif path == '/manage/delete-torrent':
@@ -6675,6 +6833,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         REGISTRATION_DB.record_login_ip(user['id'], client_ip)
         REGISTRATION_DB.daily_login_check(user['id'])
         REGISTRATION_DB._log(username, 'login', client_ip)
+        delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
+        login_redirect = '/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard'
         log.debug('LOGIN success user=%r token=%s...', username, token[:8])
         self.send_response(303)
         try:
@@ -6682,10 +6842,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             log.error('LOGIN _set_session_cookie failed: %s', exc, exc_info=True)
             raise
-        self.send_header('Location', '/manage/dashboard')
+        self.send_header('Location', login_redirect)
         self.send_header('Content-Length', '0')
         self.end_headers()
-        log.debug('LOGIN 303 sent for user=%r', username)
+        log.debug('LOGIN 303 sent for user=%r location=%s', username, login_redirect)
 
     def _post_upload(self):
         user = self._get_session_user()
@@ -7524,6 +7684,104 @@ class ManageHandler(BaseHTTPRequestHandler):
                                             total=total, base_url='/manage/profile',
                                             ledger=ledger, bounty_data=bounty_data, topup_orders=topup_orders,
                                             msg=msg, msg_type=msg_type))
+
+    def _get_account_delete_confirm(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        ch = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
+        if not ch:
+            q = urllib.parse.quote_plus('No active account deletion request. Start from your profile.')
+            return self._redirect(f'/manage/profile?msg={q}&msg_type=error')
+        expires_dt = _parse_iso_ts(ch['expires_at'] or '')
+        remaining_sec = 0
+        if expires_dt:
+            remaining_sec = max(0, int((expires_dt - datetime.datetime.now()).total_seconds()))
+        msg = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('msg', [''])[0])
+        msg_type = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('msg_type', ['error'])[0]
+        self._send_html(_render_account_delete_confirm_page(user, remaining_sec, msg=msg, msg_type=msg_type))
+
+    def _post_account_delete_start(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if user['username'] == SUPER_USER:
+            return self._redirect('/manage/profile?msg=Super+account+cannot+self-delete.&msg_type=error')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        phrase = (fields.get('delete_phrase', '') or '').strip()
+        if phrase != 'DELETE MY ACCOUNT':
+            return self._redirect('/manage/profile?msg=Type+DELETE+MY+ACCOUNT+to+continue.&msg_type=error')
+        challenge = REGISTRATION_DB.create_account_delete_challenge(
+            user['id'],
+            user['username'],
+            self.client_address[0] if self.client_address else '',
+            self.headers.get('User-Agent', '')
+        )
+        REGISTRATION_DB.delete_sessions_for_user(user['id'])
+        REGISTRATION_DB._log(user['username'], 'account_delete_start', user['username'],
+                             f'challenge_id={challenge["id"] if challenge else "?"}')
+        self.send_response(303)
+        self._clear_session_cookie()
+        msg = urllib.parse.quote_plus(
+            f'Account deletion started. Sign in again and complete within {ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES} minutes.'
+        )
+        self.send_header('Location', f'/manage?msg={msg}&msg_type=success')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def _post_account_delete_cancel(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        REGISTRATION_DB.cancel_account_delete_challenge(user['id'], user['username'], 'User canceled from confirm page')
+        self._redirect('/manage/profile?msg=Account+deletion+canceled.&msg_type=success')
+
+    def _post_account_delete_confirm(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        ch = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
+        if not ch:
+            q = urllib.parse.quote_plus('Deletion window expired. Start again from your profile.')
+            return self._redirect(f'/manage/profile?msg={q}&msg_type=error')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        phrase = (fields.get('delete_phrase', '') or '').strip()
+        password = fields.get('password', '')
+        if phrase != 'DELETE MY ACCOUNT' or not _verify_password(password, user['password_hash'], user['salt']):
+            attempts = REGISTRATION_DB.mark_account_delete_attempt(ch['id'])
+            REGISTRATION_DB._log(user['username'], 'account_delete_confirm_failed', user['username'],
+                                 f'challenge_id={ch["id"]} attempts={attempts}')
+            if attempts >= 5:
+                REGISTRATION_DB.cancel_account_delete_challenge(
+                    user['id'], user['username'],
+                    'Too many failed account deletion confirmation attempts'
+                )
+                self.send_response(303)
+                self._clear_session_cookie()
+                q = urllib.parse.quote_plus('Deletion confirmation canceled after too many failed attempts.')
+                self.send_header('Location', f'/manage?msg={q}&msg_type=error')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            q = urllib.parse.quote_plus('Password or deletion phrase was incorrect.')
+            return self._redirect(f'/manage/account/delete/confirm?msg={q}&msg_type=error')
+        ok, detail = REGISTRATION_DB.self_delete_account(
+            user['id'],
+            user['username'],
+            consumed_ip=self.client_address[0] if self.client_address else '',
+            consumed_user_agent=self.headers.get('User-Agent', ''),
+            challenge_id=ch['id']
+        )
+        if not ok:
+            q = urllib.parse.quote_plus(detail)
+            return self._redirect(f'/manage/account/delete/confirm?msg={q}&msg_type=error')
+        self.send_response(303)
+        self._clear_session_cookie()
+        self.send_header('Location', '/manage/goodbye')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
 
     def _get_following(self):
         user = self._get_session_user()
@@ -10277,7 +10535,7 @@ def _render_invite_invalid() -> str:
     return _manage_page('Invalid Invite', body)
 
 
-def _render_login(msg: str = '') -> str:
+def _render_login(msg: str = '', msg_type: str = 'error') -> str:
     body = '''
   <div style="max-width:380px;margin:60px auto">
     <div class="page-title">Sign In</div>
@@ -10296,7 +10554,79 @@ def _render_login(msg: str = '') -> str:
       </form>
     </div>
   </div>'''
-    return _manage_page('Login', body, msg=msg)
+    return _manage_page('Login', body, msg=msg, msg_type=msg_type)
+
+
+def _render_account_delete_confirm_page(user, remaining_sec: int,
+                                        msg: str = '', msg_type: str = 'error') -> str:
+    mins = max(0, int(remaining_sec // 60))
+    secs = max(0, int(remaining_sec % 60))
+    timer = f'{mins}m {secs}s'
+    countdown_js = (
+        '<script>'
+        '(function(){'
+        f'var remain={max(0, int(remaining_sec))};'
+        'var el=document.getElementById("delete-expire-timer");'
+        'if(!el)return;'
+        'function tick(){'
+        'if(remain<0)remain=0;'
+        'var m=Math.floor(remain/60);'
+        'var s=remain%60;'
+        'el.textContent=m+"m "+s+"s";'
+        'if(remain===0){return;}'
+        'remain-=1;'
+        'setTimeout(tick,1000);'
+        '}'
+        'tick();'
+        '})();'
+        '</script>'
+    )
+    body = (
+        '<div style="max-width:560px;margin:40px auto">'
+        '<div class="page-title">Confirm Account Deletion</div>'
+        '<div class="page-sub">Final step - this action is irreversible.</div>'
+        '<div class="card">'
+        '<div style="padding:10px 12px;background:var(--danger)22;border:1px solid var(--danger);'
+        'border-radius:8px;color:var(--danger);margin-bottom:14px;font-size:0.9rem">'
+        'You must complete this confirmation before the deletion challenge expires.'
+        f' Time remaining: <strong id="delete-expire-timer">{timer}</strong>.'
+        '</div>'
+        '<form method="POST" action="/manage/account/delete/confirm" style="display:flex;flex-direction:column;gap:12px">'
+        '<div class="form-group">'
+        '<label>Re-enter Password</label>'
+        '<input type="password" name="password" autocomplete="current-password" required>'
+        '</div>'
+        '<div class="form-group">'
+        '<label>Type exactly: DELETE MY ACCOUNT</label>'
+        '<input type="text" name="delete_phrase" autocomplete="off" required placeholder="DELETE MY ACCOUNT">'
+        '</div>'
+        '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+        '<button type="submit" class="btn btn-danger" '
+        'onclick="return confirm(\'Last chance: your account will be permanently deleted. Continue?\')">Delete Permanently</button>'
+        '</form>'
+        '<form method="POST" action="/manage/account/delete/cancel" style="display:inline">'
+        '<button type="submit" class="btn btn-sm">Cancel</button>'
+        '</form>'
+        '</div>'
+        '</div>'
+        + countdown_js +
+        '</div>'
+    )
+    return _manage_page('Confirm Deletion', body, user=user, msg=msg, msg_type=msg_type)
+
+
+def _render_goodbye_page() -> str:
+    body = (
+        '<div style="max-width:560px;margin:60px auto">'
+        '<div class="page-title">Goodbye</div>'
+        '<div class="card">'
+        '<p style="margin-bottom:10px">Your account has been deleted.</p>'
+        '<p style="color:var(--muted);margin-bottom:18px">If this was not expected, contact the operator.</p>'
+        '<a href="/manage" class="btn btn-primary">Return to Sign In</a>'
+        '</div>'
+        '</div>'
+    )
+    return _manage_page('Goodbye', body)
 
 
 def _fmt_size(b: int) -> str:
@@ -13148,9 +13478,28 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + '> Allow others to view my followers and following</label>'
             + gravatar_section
             + '<div><button type="submit" class="btn btn-sm">Save</button></div>'
-            '</form>'
-            '</div>'
-            '</div></div>'
+            + '</form>'
+            + '</div>'
+            + '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
+            + '<div style="font-size:0.85rem;color:var(--danger);margin-bottom:8px">Danger Zone</div>'
+            + ('<div style="font-size:0.82rem;color:var(--muted);margin-bottom:8px">'
+               f'Self-delete is a multi-step process. You will be logged out and must return within {ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES} minutes.'
+               '</div>' if viewer['username'] != SUPER_USER else
+               '<div style="font-size:0.82rem;color:var(--muted);margin-bottom:8px">'
+               'Super account cannot self-delete.</div>')
+            + ('' if viewer['username'] == SUPER_USER else
+               '<form method="POST" action="/manage/account/delete/start" '
+               'onsubmit="return confirm(\'Final warning: this starts account deletion and logs you out. Continue?\')" '
+               'style="display:flex;flex-direction:column;gap:8px">'
+               '<label style="font-size:0.8rem;color:var(--muted)">Type DELETE MY ACCOUNT</label>'
+               '<input type="text" name="delete_phrase" autocomplete="off" required '
+               'placeholder="DELETE MY ACCOUNT" '
+               'style="padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;'
+               'color:var(--text);font-family:var(--mono);font-size:0.82rem">'
+               '<div><button type="submit" class="btn btn-sm btn-danger">Delete My Account</button></div>'
+               '</form>')
+            + '</div>'
+            + '</div></div>'
             + _invite_html
             + _points_top
             + '</div>'
@@ -14133,6 +14482,12 @@ def main():
                     REGISTRATION_DB.expire_bounties()
                 except Exception as _e:
                     log.warning('expire_bounties failed (non-fatal): %s', _e)
+                try:
+                    expired = REGISTRATION_DB.expire_account_delete_challenges()
+                    if expired:
+                        log.info('account delete reconcile: expired %d challenge(s)', expired)
+                except Exception as _e:
+                    log.warning('expire_account_delete_challenges failed (non-fatal): %s', _e)
                 try:
                     stale = REGISTRATION_DB.reconcile_stale_topup_orders()
                     if stale:
