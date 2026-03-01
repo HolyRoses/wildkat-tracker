@@ -11518,14 +11518,54 @@ def _render_invite_invalid() -> str:
 
 def _render_login(msg: str = '', msg_type: str = 'error') -> str:
     webauthn_on = _webauthn_login_enabled()
+    passkey_sitewide = bool(
+        webauthn_on and REGISTRATION_DB
+        and REGISTRATION_DB.get_setting('webauthn_enforce_sitewide', '0') == '1'
+    )
+    passkey_primary_btn = ''
+    sign_in_btn_cls = 'btn btn-primary'
+    sign_in_btn_style = 'width:100%;margin-top:8px'
+    sign_in_btn_id = ''
+    if passkey_sitewide:
+        passkey_primary_btn = (
+            '<button type="button" class="btn btn-primary" style="width:100%;margin-top:8px" '
+            'onclick="startPasskeyLogin()">Sign in with Passkey</button>'
+        )
+        sign_in_btn_cls = 'btn'
+        sign_in_btn_style = 'width:100%;margin-top:8px;background:#000;color:#fff;border-color:var(--border)'
+        sign_in_btn_id = ' id="sitewide-password-signin"'
+    sitewide_hover_script = ''
+    if passkey_sitewide:
+        sitewide_hover_script = (
+            '<script>'
+            '(function(){'
+            'var b=document.getElementById("sitewide-password-signin");'
+            'if(!b)return;'
+            'b.addEventListener("mouseenter",function(){b.style.borderColor="var(--accent)";b.style.color="var(--accent)";});'
+            'b.addEventListener("mouseleave",function(){b.style.borderColor="var(--border)";b.style.color="#fff";});'
+            '})();'
+            '</script>'
+        )
     passkey_block = ''
     if webauthn_on:
-        passkey_block = (
-            '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
-            '<button type="button" class="btn btn-sm" style="width:100%" onclick="startPasskeyLogin()">Sign in with Passkey</button>'
+        passkey_controls = (
             '<div id="passkey-login-msg" style="margin-top:8px;color:var(--muted);font-size:0.82rem"></div>'
             '<button type="button" id="passkey-try-all" class="btn btn-sm" style="display:none;width:100%;margin-top:8px" onclick="startPasskeyLogin(true)">Try a different passkey</button>'
-            '</div>'
+        )
+        if passkey_sitewide:
+            passkey_block = (
+                '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
+                + passkey_controls +
+                '</div>'
+            )
+        else:
+            passkey_block = (
+                '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
+                '<button type="button" class="btn btn-sm" style="width:100%" onclick="startPasskeyLogin()">Sign in with Passkey</button>'
+                + passkey_controls +
+                '</div>'
+            )
+        passkey_block += (
             '<script>'
             '(function(){'
             'window.startPasskeyLogin = async function(allCreds,autoRetried){'
@@ -11601,9 +11641,11 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
           <label for="login-password">Password</label>
           <input id="login-password" type="password" name="password" autocomplete="current-password" required>
         </div>
-        <button type="submit" class="btn btn-primary" style="width:100%;margin-top:8px">Sign In</button>
+        ''' + passkey_primary_btn + '''
+        <button type="submit"''' + sign_in_btn_id + ''' class="''' + sign_in_btn_cls + '''" style="''' + sign_in_btn_style + '''">Sign In</button>
       </form>
       ''' + passkey_block + '''
+      ''' + sitewide_hover_script + '''
     </div>
   </div>'''
     return _manage_page('Login', body, msg=msg, msg_type=msg_type)
