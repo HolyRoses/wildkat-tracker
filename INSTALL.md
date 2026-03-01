@@ -23,14 +23,16 @@ useradd --system --no-create-home --shell /sbin/nologin tracker
 
 ---
 
-## 2. Deploy the Script
+## 2. Deploy Server Files
 
 ```bash
 mkdir -p /opt/tracker
 cp tracker_server.py /opt/tracker/
+cp tracker_query.py /opt/tracker/
 chown -R tracker:tracker /opt/tracker
 chmod 750 /opt/tracker
 chmod 750 /opt/tracker/tracker_server.py
+chmod 750 /opt/tracker/tracker_query.py
 ```
 
 ---
