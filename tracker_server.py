@@ -4472,6 +4472,7 @@ class RegistrationDB:
 
         c = self._conn()
         refunded_total = 0
+        refunded_by_user: dict[str, int] = {}
         try:
             c.execute('BEGIN IMMEDIATE')
             contribs = c.execute(
@@ -4491,6 +4492,7 @@ class RegistrationDB:
                     'bounty_refund_admin', str(bounty_id)
                 )
                 refunded_total += amount
+                refunded_by_user[row['username']] = refunded_by_user.get(row['username'], 0) + amount
             c.execute(
                 "UPDATE bounties SET status='removed', claimed_infohash=NULL, claimed_by=NULL, claimed_at=NULL "
                 "WHERE id=?",
@@ -4508,6 +4510,21 @@ class RegistrationDB:
         if reason:
             detail += f' reason={reason[:180]}'
         self._log(actor, 'bounty_remove_admin', str(bounty_id), detail)
+
+        impacted = set(self._get_bounty_contributor_usernames(bounty_id))
+        impacted.add(str(b['created_by'] or ''))
+        if b['status'] == 'pending' and b['claimed_by']:
+            impacted.add(str(b['claimed_by']))
+        impacted.discard('')
+        reason_text = reason.strip() or 'No reason provided.'
+        notice_desc = f'{b["description"]} — reason: {reason_text}'
+        for uname in impacted:
+            self._notify_bounty(uname, 'bounty_removed', actor, bounty_id, notice_desc[:120], 0)
+        for uname, amount in refunded_by_user.items():
+            if amount > 0:
+                refund_desc = f'{b["description"]} — refunded {amount} pts'
+                self._notify_bounty(uname, 'bounty_refund_admin', actor, bounty_id, refund_desc[:120], amount)
+
         return True, f'Bounty removed. Refunded {refunded_total} pts to contributors.'
 
     def _fulfill_bounty(self, bounty_id: int, refund_requestor: bool) -> tuple[bool, str]:
@@ -11770,15 +11787,21 @@ class ManageHandler(BaseHTTPRequestHandler):
                     'bounty_mention':         ('@',  'mentioned you in bounty'),
                     'bounty_claimed':         ('🎯', 'claimed your bounty'),
                     'bounty_rejected':        ('✗',  'rejected your claim on'),
-                    'bounty_fulfilled':       ('✅', 'has accepted your bounty for'),
+                    'bounty_fulfilled':       ('✅', 'has accepted your claim for bounty'),
                     'bounty_contribution':    ('➕', 'added points to your bounty'),
                     'bounty_expired':         ('⏰', 'bounty expired:'),
                     'bounty_uploader_payout': ('💰', 'fulfilled a bounty using your upload:'),
+                    'bounty_removed':         ('🛡️', 'removed a bounty:'),
+                    'bounty_refund_admin':    ('💸', 'refunded points from removed bounty:'),
                     'followed_bounty_fulfilled': ('✅', 'fulfilled a bounty:'),
                 }
                 icon, label = icons.get(ntype, ('🔔', 'bounty update on'))
-                anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
-                url = f'/manage/bounty/{bid}{anchor}'
+                if ntype in ('bounty_removed', 'bounty_refund_admin'):
+                    anchor = ''
+                    url = '/manage/bounty'
+                else:
+                    anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
+                    url = f'/manage/bounty/{bid}{anchor}'
             elif is_topup:
                 oid = str(n['info_hash']).split(':', 1)[1]
                 oid_disp = oid
@@ -13323,20 +13346,26 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     'bounty_mention':          ('@',  'mentioned you in bounty'),
                     'bounty_claimed':          ('🎯', 'claimed your bounty'),
                     'bounty_rejected':         ('✗',  'rejected your claim on'),
-                    'bounty_fulfilled':        ('✅', 'has accepted your bounty for'),
+                    'bounty_fulfilled':        ('✅', 'has accepted your claim for bounty'),
                     'bounty_contribution':     ('➕', 'added points to your bounty'),
                     'bounty_expired':          ('⏰', 'bounty expired:'),
                     'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
+                    'bounty_removed':          ('🛡️', 'removed a bounty:'),
+                    'bounty_refund_admin':     ('💸', 'refunded points from removed bounty:'),
                     'followed_bounty_fulfilled': ('✅', 'fulfilled a bounty:'),
                 }.get(ntype, ('🔔', 'bounty update on'))
                 tname_h = _h(n['torrent_name'][:40] + ('…' if len(n['torrent_name']) > 40 else ''))
                 from_h  = _h(n['from_username'])
                 ts_h    = _h((n['created_at'] or '')[:16].replace('T', ' '))
                 n_id    = n['id']
-                anchor  = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
+                if ntype in ('bounty_removed', 'bounty_refund_admin'):
+                    target = '/manage/bounty'
+                else:
+                    anchor  = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
+                    target = f'/manage/bounty/{bid}{anchor}'
                 dropdown_items += (
                     f'<button class="notif-item" '
-                    f'onclick="readNotif({n_id},\'/manage/bounty/{bid}{anchor}\')"'
+                    f'onclick="readNotif({n_id},\'{target}\')"'
                     f' aria-label="bounty notification from {from_h}">'
                     f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
                     f'<div class="notif-item-text"><em>{tname_h}</em></div>'
@@ -16052,14 +16081,19 @@ def _render_notifications_page(viewer) -> str:
                 'bounty_mention':          ('@',  'mentioned you in bounty'),
                 'bounty_claimed':          ('🎯', 'claimed your bounty'),
                 'bounty_rejected':         ('✗',  'rejected your claim on'),
-                'bounty_fulfilled':        ('✅', 'has accepted your bounty for'),
+                'bounty_fulfilled':        ('✅', 'has accepted your claim for bounty'),
                 'bounty_contribution':     ('➕', 'added points to your bounty'),
                 'bounty_expired':          ('⏰', 'bounty expired:'),
                 'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
+                'bounty_removed':          ('🛡️', 'removed a bounty:'),
+                'bounty_refund_admin':     ('💸', 'refunded points from removed bounty:'),
                 'followed_bounty_fulfilled': ('✅', 'fulfilled a bounty:'),
             }.get(ntype, ('🔔', 'bounty update on'))
-            anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
-            url = f'/manage/bounty/{bid}{anchor}'
+            if ntype in ('bounty_removed', 'bounty_refund_admin'):
+                url = '/manage/bounty'
+            else:
+                anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
+                url = f'/manage/bounty/{bid}{anchor}'
             read_js = f"readNotif({n_id},'{url}')"
             rows += (
                 f'<div class="notif-page-item{unread_cls}">'
