@@ -1196,7 +1196,7 @@ def _build_tfa_fernet():
     if not raw:
         return None
     try:
-        key_bytes = raw.encode('ascii')
+        raw.encode('ascii')
         key = b''
         # If already base64-decodable, require exact Fernet key material length.
         try:
@@ -4131,7 +4131,7 @@ class RegistrationDB:
     def award_upload_points(self, user_id: int, torrent_name: str, info_hash: str) -> int:
         """Award points for a new torrent upload. Returns points awarded."""
         pts = int(self.get_setting('points_upload', '25'))
-        bal = self.award_points(user_id, pts, f'upload: {torrent_name}', 'torrent', info_hash)
+        self.award_points(user_id, pts, f'upload: {torrent_name}', 'torrent', info_hash)
         self.check_auto_promote(user_id)
         return pts
 
@@ -4374,9 +4374,6 @@ class RegistrationDB:
         expiry_dt = datetime.datetime.fromisoformat(b['expires_at'] + 'T23:59:59')
         if now > expiry_dt:
             return False, 'This bounty has expired.'
-        pending_until = (now + datetime.timedelta(
-            hours=int(self.get_setting('bounty_pending_hours', '48'))
-        )).isoformat()
         c = self._conn()
         c.execute(
             'UPDATE bounties SET status=?,claimed_infohash=?,claimed_by=?,claimed_at=? WHERE id=?',
@@ -4865,7 +4862,9 @@ class RegistrationDB:
 
     def backup_to_bytes(self) -> bytes:
         """Return a gzip-compressed snapshot of the live DB as raw bytes."""
-        import io, gzip, tempfile, os
+        import gzip
+        import tempfile
+        import os
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tf:
             tmp_path = tf.name
         try:
@@ -4883,7 +4882,10 @@ class RegistrationDB:
 
     def restore_from_bytes(self, gz_data: bytes, actor: str) -> None:
         """Replace the live DB with a gzip-compressed SQLite backup."""
-        import gzip, tempfile, os, shutil
+        import gzip
+        import tempfile
+        import os
+        import shutil
         try:
             raw = gzip.decompress(gz_data)
         except Exception:
@@ -6598,7 +6600,6 @@ def generate_stats_html(snap: dict, web_config: dict, show_manage: bool = False)
     else:
         manage_btn = ''
     announce_urls = web_config.get('announce_urls', [])
-    domain        = web_config.get('domain', '')
 
     # Build announce URL rows
     url_rows = ''
@@ -13200,7 +13201,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                f'{nav_avatar}<span class="nav-username">{_h(user["username"])}</span> '
                f'<span class="badge badge-{role}">{role_label}</span></a>'
                + mail_html + bell_html +
-               f'<a href="/manage/logout" class="btn btn-sm">Logout</a>')
+               '<a href="/manage/logout" class="btn btn-sm">Logout</a>')
         center_nav = (
             '<a href="/manage/dashboard" class="nav-btn">🖥 Dashboard</a>'
             '<a href="/manage/search" class="nav-btn">🔍 Search</a>'
@@ -13208,7 +13209,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             + ('' if role == 'basic' else
                '<a href="/manage/bounty" class="nav-btn">🎯 Bounties</a>'
                '<a href="/manage/leaderboard" class="nav-btn">🏆 Leaderboard</a>')
-            + (f'<a href="/manage/topups" class="nav-btn">💳 Top-ups</a>'
+            + ('<a href="/manage/topups" class="nav-btn">💳 Top-ups</a>'
                if REGISTRATION_DB and REGISTRATION_DB.topup_enabled_for_user(user) else '')
         )
     else:
@@ -13948,7 +13949,6 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     stats_persist_enabled = settings.get('stats_persist_enabled', '0') == '1'
     stats_persist_interval = settings.get('stats_persist_interval_sec', '300')
     robots_txt_val = settings.get('robots_txt', 'User-agent: *\nDisallow: /')
-    ap_enabled = settings.get('auto_promote_enabled', '0') == '1'
     settings_html = f'''
     <div class="two-col">
       <div class="card">
@@ -14183,8 +14183,8 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             status = '<span style="color:var(--green)">Pending</span>'
             actions = (
                 f'<button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(invite_url)})">&#128279; Copy URL</button>'
-                + f'<form method="POST" action="/manage/admin/delete-invite" style="display:inline"'
-                + f' data-confirm="Delete this invite code?">'
+                + '<form method="POST" action="/manage/admin/delete-invite" style="display:inline"'
+                + ' data-confirm="Delete this invite code?">'
                 + f'<input type="hidden" name="code" value="{code_h}">'
                 + '<button class="btn btn-sm btn-danger">Delete</button></form>'
             )
@@ -14657,7 +14657,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     </div>'''
 
     # ── Auto-promote + Danger HTML ───────────────────────────
-    danger_html = f'''
+    danger_html = '''
     <div class="two-col">
       <div class="card" style="border-color:rgba(224,91,48,0.3)">
         <div class="card-title" style="color:var(--accent2)">Delete All Users</div>
@@ -15292,12 +15292,12 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
 
     if locked:
         add_form = (
-            f'<div class="card" style="border-color:rgba(224,91,48,0.3)">'
-            f'<div role="status" aria-live="polite"'
-            f' style="display:flex;align-items:center;gap:10px;color:var(--muted);'
-            f'font-family:var(--mono);font-size:0.82rem">'
-            f'&#x1F512; Comments are locked for this torrent.'
-            f'</div></div>'
+            '<div class="card" style="border-color:rgba(224,91,48,0.3)">'
+            '<div role="status" aria-live="polite"'
+            ' style="display:flex;align-items:center;gap:10px;color:var(--muted);'
+            'font-family:var(--mono);font-size:0.82rem">'
+            '&#x1F512; Comments are locked for this torrent.'
+            '</div></div>'
         )
     else:
         add_form = (
@@ -15460,27 +15460,27 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
     broadcast_html = ''
     if is_super:
         broadcast_html = (
-            f'<div style="max-width:600px">'
-            f'<div style="background:var(--accent)22;border:1px solid var(--accent);border-radius:6px;'
-            f'padding:12px;margin-bottom:16px;font-size:0.85rem;color:var(--accent)">'
-            f'&#x1F4E2; Broadcast sends to ALL non-disabled users. No point cost.</div>'
-            f'<form method="POST" action="/manage/messages/broadcast">'
+            '<div style="max-width:600px">'
+            '<div style="background:var(--accent)22;border:1px solid var(--accent);border-radius:6px;'
+            'padding:12px;margin-bottom:16px;font-size:0.85rem;color:var(--accent)">'
+            '&#x1F4E2; Broadcast sends to ALL non-disabled users. No point cost.</div>'
+            '<form method="POST" action="/manage/messages/broadcast">'
             
-            f'<div style="margin-bottom:12px">'
-            f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Subject</label>'
-            f'<input type="text" name="subject" required maxlength="200" style="width:100%;background:var(--card2);'
-            f'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;box-sizing:border-box">'
-            f'</div>'
-            f'<div style="margin-bottom:12px">'
-            f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Message</label>'
-            f'<textarea name="body" required rows="6" maxlength="5000" style="width:100%;background:var(--card2);'
-            f'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;'
-            f'box-sizing:border-box;resize:vertical"></textarea>'
-            f'</div>'
-            f'<button type="submit" class="btn" style="background:var(--accent)22;border-color:var(--accent);'
-            f'color:var(--accent)" onclick="return confirm(\'Send broadcast DM to all users?\')">'
-            f'&#x1F4E2; Send Broadcast</button>'
-            f'</form></div>')
+            '<div style="margin-bottom:12px">'
+            '<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Subject</label>'
+            '<input type="text" name="subject" required maxlength="200" style="width:100%;background:var(--card2);'
+            'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;box-sizing:border-box">'
+            '</div>'
+            '<div style="margin-bottom:12px">'
+            '<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Message</label>'
+            '<textarea name="body" required rows="6" maxlength="5000" style="width:100%;background:var(--card2);'
+            'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;'
+            'box-sizing:border-box;resize:vertical"></textarea>'
+            '</div>'
+            '<button type="submit" class="btn" style="background:var(--accent)22;border-color:var(--accent);'
+            'color:var(--accent)" onclick="return confirm(\'Send broadcast DM to all users?\')">'
+            '&#x1F4E2; Send Broadcast</button>'
+            '</form></div>')
 
     tabs = [('inbox',   f'&#x1F4E5; Inbox{" (" + str(unread_count) + ")" if unread_count else ""}'),
             ('sent',    '&#x1F4E4; Sent'),
@@ -15514,9 +15514,9 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
 
     mark_all = ''
     if unread_count:
-        mark_all = (f'<form method="POST" action="/manage/messages/mark-read" style="display:inline;margin-top:4px">'
+        mark_all = ('<form method="POST" action="/manage/messages/mark-read" style="display:inline;margin-top:4px">'
                     
-                    f'<button class="btn btn-sm">&#x2713; Mark all read</button></form>')
+                    '<button class="btn btn-sm">&#x2713; Mark all read</button></form>')
 
     body = (
         f'<div class="page-title">📬 Messages</div>'
@@ -15533,7 +15533,6 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
 
 def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
     uname = viewer['username']
-    role  = _user_role(viewer)
     other_party = None
     for m in thread:
         if m['sender'] != uname:
@@ -15591,7 +15590,6 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
     # ── Compute presence now so profile_link dot renders correctly on first load ──
     other_user_row  = REGISTRATION_DB.get_user(other_party) if (other_party and REGISTRATION_DB) else None
     presence_status = _online_status(other_user_row)
-    presence_dot    = _online_dot_html(presence_status)
     if other_party:
         other_user = REGISTRATION_DB.get_user(other_party) if REGISTRATION_DB else None
         other_role = _user_role(other_user) if other_user else 'basic'
@@ -15618,9 +15616,6 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
     profile_link = ''
     if other_party:
         opu = _h(other_party)
-        dot_html = (f'<span id="dm-presence-dot" title="{{}}" '
-                    f'style="display:inline-block;width:8px;height:8px;border-radius:50%;'
-                    f'background:{{}};vertical-align:middle;margin-right:4px"></span>')
         # Set initial color based on current presence
         init_color = {'online':'var(--green)','recent':'var(--accent)','offline':'var(--border)','hidden':''}.get(presence_status, 'var(--border)')
         init_tip   = {'online':'Online now','recent':'Recently active','offline':'Offline','hidden':''}.get(presence_status, '')
@@ -15923,9 +15918,9 @@ def _render_notifications_page(viewer) -> str:
     mark_all = ''
     if unread_count:
         mark_all = (
-            f'<form method="POST" action="/manage/notifications/read-all" style="display:inline">'
-            f'<button class="btn btn-sm">✓ Mark all read</button>'
-            f'</form>'
+            '<form method="POST" action="/manage/notifications/read-all" style="display:inline">'
+            '<button class="btn btn-sm">✓ Mark all read</button>'
+            '</form>'
         )
 
     body = (
@@ -16182,7 +16177,6 @@ def _render_public_profile(viewer, target_user, torrents: list,
     uname_h   = _h(uname)
     vrole     = _user_role(viewer)
     trole     = _user_role(target_user)
-    is_super  = viewer['username'] == SUPER_USER
     is_own    = viewer['id'] == target_user['id']
 
     # If viewer is admin/super, link back to admin view
@@ -16334,7 +16328,6 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '</tr>'
         )
 
-    credits_val = target_user['credits'] if 'credits' in target_user.keys() else 0
     pts_val     = target_user['points']  if 'points'  in target_user.keys() else 0
     streak_val  = target_user['login_streak'] if 'login_streak' in target_user.keys() else 0
     followers_count, following_count = REGISTRATION_DB.get_follow_counts(target_user['id']) if REGISTRATION_DB else (0, 0)
@@ -17253,7 +17246,6 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
 
     role  = _user_role(target_user)
     pts   = target_user['points'] if 'points' in target_user.keys() else 0
-    uname = target_user['username']
     out   = ''
 
     # Basic sandbox teaser
@@ -17265,9 +17257,9 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
         if ap_enabled:
             pct = min(100, int(pts / threshold * 100)) if threshold > 0 else 0
             out += (
-                f'''<div class="card" style="border:1px solid var(--accent)">'''
-                + f'<div class="card-title" style="color:var(--accent)">🔒 Basic Member — Unlock More Features</div>'
-                + f'<p style="color:var(--muted);font-size:0.88rem;margin-bottom:12px">'
+                '''<div class="card" style="border:1px solid var(--accent)">'''
+                + '<div class="card-title" style="color:var(--accent)">🔒 Basic Member — Unlock More Features</div>'
+                + '<p style="color:var(--muted);font-size:0.88rem;margin-bottom:12px">'
                 + f'Reach <strong>{threshold} points</strong> to unlock <strong>Standard</strong> membership:</p>'
                 + '<ul style="color:var(--muted);font-size:0.88rem;margin:0 0 16px 20px;line-height:1.8">'
                 + '<li>🎯 <strong>Bounty Board</strong> — post requests, claim rewards</li>'
@@ -17275,7 +17267,7 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
                 + '<li>👥 <strong>Public Profiles</strong> — view other members</li>'
                 + '<li>💸 <strong>Point Transfers</strong> — send points to friends</li>'
                 + '<li>✅ <strong>Bounty Voting</strong> — vote on fulfillment claims</li></ul>'
-                + f'<div style="background:var(--card2);border-radius:8px;overflow:hidden;height:12px;margin-bottom:8px">'
+                + '<div style="background:var(--card2);border-radius:8px;overflow:hidden;height:12px;margin-bottom:8px">'
                 + f'<div style="background:var(--accent);height:100%;width:{pct}%;transition:width 0.3s"></div></div>'
                 + f'<div style="font-size:0.82rem;color:var(--muted)">{pts} / {threshold} points ({pct}%)'
                 + ' — earn by logging in daily, uploading torrents, and commenting</div></div>'
@@ -17287,7 +17279,7 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
     out += (
         '<div class="card">'
         + '<div class="card-title">💸 Send Points</div>'
-        + f'<p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px">'
+        + '<p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px">'
         + f'Transfer points. A <strong>{fee_pct}%</strong> fee is destroyed. Balance: <strong>{pts} pts</strong></p>'
         + '<form method="POST" action="/manage/points/transfer">'
         + '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">'
@@ -17403,7 +17395,7 @@ def _render_invite_section(viewer, target_user, is_own_profile: bool, db) -> str
             + f'<td class="hash" style="font-size:0.78rem">{code_h[:20]}...</td>'
             + f'<td class="hash">{_h((c["created_at"] or "")[:10])}</td>'
             + '<td><span style="color:var(--green)">Pending</span></td>'
-            + f'<td><div class="actions">'
+            + '<td><div class="actions">'
             + f'<button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(invite_path)})">&#128279; Copy URL</button>'
             + '</div></td>'
             + '</tr>'
@@ -17991,9 +17983,7 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
                 f'<div class="card-title">{icon} {title}</div>'
                 f'<p style="color:var(--muted);font-size:0.82rem;margin-bottom:12px">{desc}</p>'
                 + _lb_table(rows, cols) +
-                f'</div>')
-
-    uname = viewer['username']
+                '</div>')
 
     card_holders   = _card("Top Holders",      "💰", data["holders"],        cols_holders,
                            "Who's sitting on the most points right now.")
