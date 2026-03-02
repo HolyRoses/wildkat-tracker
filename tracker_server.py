@@ -545,6 +545,7 @@ AUTH_BREAK_GLASS_UNTIL_TS = 0.0
 
 _AUTH_RATE_LIMIT_LOCK = threading.Lock()
 _AUTH_RATE_LIMIT_HITS: dict[str, deque[float]] = {}
+_TFA_FERNET_INIT_ERROR = ''
 
 # ─────────────────────────────────────────────────────────────
 # Bencode decoder  (for .torrent parsing)
@@ -684,7 +685,7 @@ def _totp_verify(secret_b32: str, code: str, period: int = 30, digits: int = 6,
 
 
 def _totp_verify_counter(secret_b32: str, code: str, period: int = 30, digits: int = 6,
-                         skew_steps: int = 1, ts: int | None = None) -> int | None:
+                         skew_steps: int = 1, ts: int | None = None) -> tuple[int, int] | None:
     cand = re.sub(r'\s+', '', (code or '').strip())
     if not cand.isdigit():
         return None
@@ -694,7 +695,7 @@ def _totp_verify_counter(secret_b32: str, code: str, period: int = 30, digits: i
     now_counter = now // step
     for i in range(-skew, skew + 1):
         if hmac.compare_digest(_totp_code(secret_b32, ts=now + (i * step), period=step, digits=digits), cand):
-            return now_counter + i
+            return now_counter + i, i
     return None
 
 
@@ -993,6 +994,12 @@ def _auth_break_glass_active() -> bool:
     if AUTH_BREAK_GLASS_UNTIL_TS > 0 and time.time() >= AUTH_BREAK_GLASS_UNTIL_TS:
         AUTH_BREAK_GLASS = False
         log.warning('AUTH BREAK-GLASS expired automatically.')
+        if REGISTRATION_DB:
+            try:
+                REGISTRATION_DB._log('system', 'break_glass_expired', '',
+                                     f'ttl_expired_at={datetime.datetime.now().isoformat(timespec="seconds")}')
+            except Exception:
+                pass
         return False
     return True
 
@@ -1016,21 +1023,36 @@ def _auth_rate_limit_allow(bucket: str, ip: str, limit: int = AUTH_IP_RATE_MAX_R
 
 
 def _build_tfa_fernet():
+    global _TFA_FERNET_INIT_ERROR
+    _TFA_FERNET_INIT_ERROR = ''
     if not _TFA_FERNET_AVAILABLE:
+        _TFA_FERNET_INIT_ERROR = 'cryptography.fernet backend unavailable'
         return None
     raw = (os.getenv('WK_TFA_SECRET_KEY', '') or '').strip()
     if not raw:
         return None
     try:
-        key = raw.encode('ascii')
-        # If not already a valid Fernet key, derive one from provided secret material.
+        key_bytes = raw.encode('ascii')
+        key = b''
+        # If already base64-decodable, require exact Fernet key material length.
         try:
-            base64.urlsafe_b64decode(key)
+            padding = '=' * ((4 - (len(raw) % 4)) % 4)
+            decoded = base64.urlsafe_b64decode((raw + padding).encode('ascii'))
+            if len(decoded) != 32:
+                _TFA_FERNET_INIT_ERROR = (
+                    f'WK_TFA_SECRET_KEY decoded length invalid ({len(decoded)} bytes; expected 32)'
+                )
+                log.error(_TFA_FERNET_INIT_ERROR)
+                return None
+            key = base64.urlsafe_b64encode(decoded)
         except Exception:
+            # Non-base64 input is treated as passphrase material and derived to 32 bytes.
             digest = hashlib.sha256(raw.encode('utf-8')).digest()
             key = base64.urlsafe_b64encode(digest)
         return Fernet(key)
-    except Exception:
+    except Exception as e:
+        _TFA_FERNET_INIT_ERROR = f'WK_TFA_SECRET_KEY initialization failed: {e}'
+        log.error(_TFA_FERNET_INIT_ERROR)
         return None
 
 
@@ -1150,6 +1172,9 @@ class RegistrationDB:
         self._restore_lock = threading.Lock()
         self._restore_gen  = 0   # incremented on every restore; forces conn reopen
         self._tfa_fernet = _build_tfa_fernet()
+        if (os.getenv('WK_TFA_SECRET_KEY', '') or '').strip() and not self._tfa_fernet:
+            err = _TFA_FERNET_INIT_ERROR or 'WK_TFA_SECRET_KEY is set but invalid'
+            log.error('TFA encryption key invalid: %s', err)
         self._init_schema()
 
     def _conn(self) -> sqlite3.Connection:
@@ -5125,6 +5150,47 @@ class RegistrationDB:
         )
         self._conn().commit()
 
+    def reserve_user_tfa_totp_counter(self, user_id: int, counter: int) -> bool:
+        """Atomically reserve a strictly newer TOTP counter for this user."""
+        cur = self._conn().execute(
+            '''UPDATE users
+               SET tfa_last_verified_at=?, tfa_last_counter=?
+               WHERE id=? AND COALESCE(tfa_last_counter, -1) < ?''',
+            (self._ts(), int(counter), user_id, int(counter))
+        )
+        self._conn().commit()
+        return bool(cur.rowcount)
+
+    def migrate_legacy_tfa_secrets(self, actor: str = 'system') -> tuple[int, int]:
+        """Re-encrypt legacy plain/base64 TFA secrets into enc:v2 format."""
+        if not self._tfa_fernet:
+            return 0, 0
+        c = self._conn()
+        rows = c.execute(
+            "SELECT id,tfa_secret_enc FROM users WHERE tfa_secret_enc IS NOT NULL AND TRIM(tfa_secret_enc)<>''"
+        ).fetchall()
+        migrated = 0
+        for row in rows:
+            raw = (row['tfa_secret_enc'] or '').strip()
+            if not raw or raw.startswith('enc:v2:'):
+                continue
+            secret = self._decode_tfa_secret(raw)
+            if not re.fullmatch(r'[A-Z2-7]{16,128}', secret or ''):
+                continue
+            new_val = self._encode_tfa_secret(secret)
+            if not new_val.startswith('enc:v2:'):
+                continue
+            c.execute('UPDATE users SET tfa_secret_enc=?, tfa_secret_ver=2 WHERE id=?',
+                      (new_val, int(row['id'])))
+            migrated += 1
+        c.commit()
+        remaining = int(c.execute(
+            "SELECT COUNT(*) FROM users WHERE tfa_secret_enc IS NOT NULL AND TRIM(tfa_secret_enc)<>'' AND tfa_secret_enc NOT LIKE 'enc:v2:%'"
+        ).fetchone()[0])
+        if migrated > 0:
+            self._log(actor, 'tfa_secret_migration', '', f'migrated={migrated} remaining={remaining}')
+        return migrated, remaining
+
     def get_user_tfa_secret(self, user_id: int) -> str:
         row = self._conn().execute(
             'SELECT tfa_secret_enc FROM users WHERE id=?',
@@ -8261,8 +8327,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         skew = int(REGISTRATION_DB.get_setting('tfa_totp_skew_steps', '1') or 1)
         if not re.fullmatch(r'[A-Z2-7]{16,128}', secret):
             return self._send_html(_render_tfa_setup_page(user, msg='Invalid TOTP secret payload.', msg_type='error'))
-        setup_counter = _totp_verify_counter(secret, code, period=period, digits=digits, skew_steps=skew)
-        if setup_counter is None:
+        setup_match = _totp_verify_counter(secret, code, period=period, digits=digits, skew_steps=skew)
+        if setup_match is None:
             return self._send_html(_render_tfa_setup_page(user, msg='Invalid authenticator code. Try again.', msg_type='error'))
         if not REGISTRATION_DB._tfa_fernet:
             return self._send_html(_render_tfa_setup_page(
@@ -8270,10 +8336,14 @@ class ManageHandler(BaseHTTPRequestHandler):
                 msg='TFA secret encryption key is not configured on this server.',
                 msg_type='error'
             ))
+        setup_counter, setup_offset = setup_match
+        # Avoid writing a future-window counter as "used" so next-period auth
+        # is not rejected after a +1 skew enrollment code.
+        persist_counter = int(setup_counter if setup_offset <= 0 else (setup_counter - 1))
         backup_count = int(REGISTRATION_DB.get_setting('tfa_backup_codes_count', '10') or 10)
         backup_codes = _tfa_generate_backup_codes(backup_count)
         REGISTRATION_DB.set_user_tfa_enrollment(int(user['id']), secret, backup_codes, method='totp')
-        REGISTRATION_DB.mark_user_tfa_totp_success(int(user['id']), int(setup_counter))
+        REGISTRATION_DB.reserve_user_tfa_totp_counter(int(user['id']), persist_counter)
         token = self._current_valid_session_token()
         if token:
             REGISTRATION_DB.set_session_tfa_enroll(token, False)
@@ -8318,16 +8388,19 @@ class ManageHandler(BaseHTTPRequestHandler):
         ok = False
         used_backup = False
         used_counter = None
+        used_offset = 0
         if secret:
-            used_counter = _totp_verify_counter(secret, code, period=period, digits=digits, skew_steps=skew)
-            if used_counter is not None:
-                last_counter = REGISTRATION_DB.get_user_tfa_last_counter(int(user['id']))
-                if last_counter >= 0 and used_counter <= last_counter:
-                    log.warning('TFA challenge replay blocked user=%s challenge_id=%s counter=%s last_counter=%s',
-                                user['username'], challenge['id'], used_counter, last_counter)
-                    used_counter = None
-                else:
+            used_match = _totp_verify_counter(secret, code, period=period, digits=digits, skew_steps=skew)
+            if used_match is not None:
+                used_counter, used_offset = used_match
+                # Persist at most the current period for +1 skew matches to avoid
+                # blocking the next natural time-step login.
+                persist_counter = int(used_counter if used_offset <= 0 else (used_counter - 1))
+                if REGISTRATION_DB.reserve_user_tfa_totp_counter(int(user['id']), persist_counter):
                     ok = True
+                else:
+                    log.warning('TFA challenge replay blocked user=%s challenge_id=%s counter=%s',
+                                user['username'], challenge['id'], used_counter)
         if (not ok) and REGISTRATION_DB.verify_and_consume_tfa_backup_code(int(user['id']), code):
             ok = True
             used_backup = True
@@ -8349,8 +8422,6 @@ class ManageHandler(BaseHTTPRequestHandler):
         REGISTRATION_DB.mark_session_tfa_verified(token)
         if used_backup:
             REGISTRATION_DB.touch_user_tfa_verified(int(user['id']))
-        elif used_counter is not None:
-            REGISTRATION_DB.mark_user_tfa_totp_success(int(user['id']), int(used_counter))
         REGISTRATION_DB._log(user['username'], 'tfa_challenge_success', user['username'],
                              'backup=1' if used_backup else 'backup=0')
         if self._session_requires_passkey_enroll():
@@ -17105,8 +17176,19 @@ def main():
             REWARD_THRESHOLD = 200
         log.info('Registration mode enabled  db=%s  super=%s  open_tracker=%s  reward=%s/%s',
                  args.db, args.super_user, OPEN_TRACKER, REWARD_ENABLED, REWARD_THRESHOLD)
-        if REGISTRATION_DB.get_setting('tfa_login_enabled', '0') == '1' and not REGISTRATION_DB._tfa_fernet:
+        if REGISTRATION_DB._tfa_fernet:
+            migrated, remaining = REGISTRATION_DB.migrate_legacy_tfa_secrets(actor='system')
+            if migrated or remaining:
+                log.warning('TFA legacy secret migration status: migrated=%s remaining=%s', migrated, remaining)
+        elif REGISTRATION_DB.get_setting('tfa_login_enabled', '0') == '1':
             log.warning('TFA secret encryption key is not configured (WK_TFA_SECRET_KEY). Existing secrets remain stored with legacy encoding.')
+        if AUTH_BREAK_GLASS:
+            ttl_detail = ('none' if AUTH_BREAK_GLASS_UNTIL_TS <= 0
+                          else datetime.datetime.fromtimestamp(AUTH_BREAK_GLASS_UNTIL_TS).isoformat(timespec='seconds'))
+            try:
+                REGISTRATION_DB._log('system', 'break_glass_activated', '', f'ttl_until={ttl_detail}')
+            except Exception:
+                pass
 
     # ── Super-user password reset (run offline, exits) ───────────
     if args.super_user_password:
