@@ -11748,6 +11748,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not (viewer['is_admin'] or is_super): return self._redirect('/manage/dashboard')
         target = REGISTRATION_DB.get_user(username)
         if not target: return self._redirect('/manage/admin')
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
         per_page = int(REGISTRATION_DB.get_setting('torrents_per_page', '50'))
         page     = _get_page_param(self.path)
         total    = REGISTRATION_DB.count_torrents(user_id=target['id'])
@@ -11762,7 +11765,8 @@ class ManageHandler(BaseHTTPRequestHandler):
                                             allowlist=allowlist,
                                             page=page, total_pages=total_pages,
                                             total=total, base_url=base_url,
-                                            topup_orders=topup_orders))
+                                            topup_orders=topup_orders,
+                                            msg=msg, msg_type=msg_type))
 
     def _get_signup(self):
         if REGISTRATION_DB is None or REGISTRATION_DB.get_setting('free_signup') != '1':
