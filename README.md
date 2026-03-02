@@ -29,6 +29,7 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Upload safety limits** — request-size, file-count, and per-file caps with partial-success batch handling
 - **Profile and privacy controls** — DM opt-in, online status visibility, bounty alerts, torrent activity linking, optional Gravatar
 - **Passkey authentication (WebAuthn)** — optional passkey login with Touch ID / Face ID / security-key support, profile enrollment, and policy enforcement controls
+- **TFA (TOTP) authentication** — optional Google Authenticator-compatible second factor with backup codes and admin enforcement/reset controls
 - **Self-service account deletion** — multi-step forced logout + fresh login + final phrase/password confirmation flow
 - **Followers system** — follow/unfollow members, follower activity notifications, and Most Followed leaderboard category
 - **Torrent peer snapshots** — manual Seeds/Peers refresh from torrent detail pages (3-hour cooldown) plus optional auto-queued refresh after upload with configurable cap
@@ -191,6 +192,7 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 | `--super-user` | — | Superuser username (required with `--registration`) |
 | `--super-user-password` | — | Set or reset the superuser password (process exits after setting) |
 | `--super-user-reset-passkeys` | off | Reset superuser passkeys and passkey-required flags, then exit |
+| `--super-user-reset-tfa` | off | Reset superuser TFA secret/backup codes and TFA-required flag, then exit |
 | `--auth-break-glass` | off | Temporary startup override that bypasses passkey enforcement gates |
 | `--db` | `/opt/tracker/tracker.db` | Path to SQLite database |
 | `--manage-port` | same as `--web-https-port` | Management interface HTTPS port if different from stats port |
@@ -199,4 +201,7 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 ## Requirements
 
 - Python 3.10+
-- No external packages required for core tracker features (optional passkey support requires `python3-fido2`)
+- No external packages required for core tracker features
+- Optional auth packages:
+  - Passkeys (WebAuthn): `python3-fido2`
+  - TFA QR rendering on setup page: `python3-qrcode`

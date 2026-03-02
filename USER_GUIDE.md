@@ -250,10 +250,12 @@ The Actions card contains:
   - Gravatar email or MD5 hash input (stores only the hash)
   - Passkey settings:
     - Enable passkey sign-in
-    - Prefer passkey on this account
     - Require passkey (password-only login blocked)
     - Add passkey
     - Rename/remove passkeys
+  - TFA (TOTP) settings:
+    - TFA setup page (`/manage/tfa/setup`) for Google Authenticator compatible enrollment
+    - Backup codes generated during setup (save once)
 
 ### Passkey Device Switching at Login
 
@@ -278,7 +280,7 @@ If your browser shows an Apple Touch ID/Face ID prompt but you want to use a dif
 3. Wait for the Apple prompt to appear again.
 4. Press the button on your physical security key.
 
-When authentication succeeds with that device, it becomes your preferred (primary) passkey for future sign-ins.
+When authentication succeeds with that device, it becomes your primary passkey for future sign-ins.
 
 If you are prompted for a physical security key (for example, Titan Key) and want to switch back to Apple Touch ID/Face ID:
 
@@ -301,6 +303,8 @@ Your profile Actions card includes a **Danger Zone** self-delete flow.
 - If successful, the account is removed, sessions are revoked, and a goodbye page is shown.
 - If the challenge expires, or too many failed confirmation attempts occur, you must restart from your profile.
 - The Super account cannot self-delete.
+- While a delete challenge is active, normal navigation is restricted and you are routed back to the delete confirmation flow until you complete or cancel it.
+- If policy requires TFA/passkey enrollment during this flow, complete setup first, save any backup codes shown, then continue deletion from the provided action button.
 
 ### Points and Invite Generation
 
@@ -781,6 +785,48 @@ sudo -u tracker /opt/tracker/tracker_server.py \
 ```
 
 If your deployment uses a separate management TLS configuration, include the same TLS flags used by your service startup command.
+
+### TFA (TOTP) Settings and Super Recovery
+
+TFA login can be enabled and enforced from Settings.
+
+Available settings:
+
+- **Enable TFA login** — enables TOTP second-factor login
+- **Enforce TFA for Admin + Super accounts** — requires TFA for admin/super roles
+- **Enforce TFA site-wide** — requires TFA for all users
+- TOTP tuning values:
+  - period (seconds)
+  - digits
+  - allowed clock skew steps
+  - challenge TTL
+  - backup code count
+
+Enforcement behavior:
+
+- If enforcement applies and a user has not enrolled TFA, they are routed to `/manage/tfa/setup` after primary login.
+- If enforcement applies and a user has enrolled TFA, they are routed to `/manage/tfa/challenge` after primary login.
+- Failed TFA challenge attempts are rate-limited with temporary backoff before retry.
+- Admin user actions include:
+  - **Enforce TFA / TFA Optional**
+  - **Reset TFA** (clears TOTP secret and backup codes for account recovery)
+
+Superuser TFA recovery command:
+
+```bash
+sudo -u tracker /opt/tracker/tracker_server.py \
+  --registration \
+  --db /opt/tracker/tracker.db \
+  --super-user super \
+  --manage-port 443 \
+  --super-user-reset-tfa
+```
+
+What this does:
+
+- Clears TFA secret and backup codes for the super account
+- Clears active sessions for that account
+- Allows fresh password login and TFA re-enrollment
 
 ---
 

@@ -58,7 +58,6 @@ import sys
 import threading
 import time
 import queue
-import pickle
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -111,6 +110,10 @@ DEFAULT_MIN_INTERVAL = 60
 PEER_SCRAPE_MIN_INTERVAL_SECONDS = 3 * 60 * 60
 ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES = 5
 WEBAUTHN_CHALLENGE_TTL_SECONDS = 300
+TFA_CHALLENGE_TTL_SECONDS = 300
+TFA_CHALLENGE_MAX_ATTEMPTS = 8
+TFA_CHALLENGE_BACKOFF_BASE_SECONDS = 2
+TFA_CHALLENGE_BACKOFF_MAX_SECONDS = 60
 PEER_TTL            = 3600   # seconds before a peer is purged
 MAX_PEERS_PER_REPLY  = 200
 MAX_SCRAPE_HASHES    = 5      # max info_hashes per scrape request
@@ -140,6 +143,14 @@ except Exception:
     AuthenticatorData = None
     CollectedClientData = None
     _WEBAUTHN_LIB_AVAILABLE = False
+
+try:
+    import qrcode
+    import qrcode.image.svg
+    _TFA_QR_LIB_AVAILABLE = True
+except Exception:
+    qrcode = None
+    _TFA_QR_LIB_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────
 # Bencode encoder  (decoder not needed – server only sends)
@@ -629,6 +640,74 @@ def _verify_password(password: str, stored_hash: str, salt: str) -> bool:
     return hmac.compare_digest(dk.hex(), stored_hash)
 
 
+def _totp_secret_generate(num_bytes: int = 20) -> str:
+    """Generate Base32 TOTP secret compatible with Google Authenticator."""
+    n = max(10, min(64, int(num_bytes)))
+    return base64.b32encode(secrets.token_bytes(n)).decode('ascii').rstrip('=')
+
+
+def _totp_code(secret_b32: str, ts: int | None = None, period: int = 30, digits: int = 6) -> str:
+    sec = re.sub(r'\s+', '', (secret_b32 or '').strip().upper())
+    if not sec:
+        return ''
+    pad = '=' * ((8 - (len(sec) % 8)) % 8)
+    key = base64.b32decode(sec + pad, casefold=True)
+    now = int(ts if ts is not None else time.time())
+    p = max(15, min(120, int(period)))
+    d = max(6, min(8, int(digits)))
+    counter = now // p
+    msg = struct.pack('>Q', counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+    code_int = struct.unpack('>I', digest[off:off + 4])[0] & 0x7FFFFFFF
+    return str(code_int % (10 ** d)).zfill(d)
+
+
+def _totp_verify(secret_b32: str, code: str, period: int = 30, digits: int = 6,
+                 skew_steps: int = 1, ts: int | None = None) -> bool:
+    cand = re.sub(r'\s+', '', (code or '').strip())
+    if not cand.isdigit():
+        return False
+    now = int(ts if ts is not None else time.time())
+    skew = max(0, min(5, int(skew_steps)))
+    step = max(15, min(120, int(period)))
+    for i in range(-skew, skew + 1):
+        if hmac.compare_digest(_totp_code(secret_b32, ts=now + (i * step), period=step, digits=digits), cand):
+            return True
+    return False
+
+
+def _tfa_generate_backup_codes(count: int = 10) -> list[str]:
+    n = max(3, min(20, int(count)))
+    out = []
+    for _ in range(n):
+        # 4 x 4 human-readable code blocks
+        blocks = [''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(4)) for _ in range(4)]
+        out.append('-'.join(blocks))
+    return out
+
+
+def _tfa_hash_backup_code(code: str) -> str:
+    norm = re.sub(r'[^A-Za-z0-9]', '', (code or '')).upper()
+    if not norm:
+        return ''
+    return hashlib.sha256(norm.encode('utf-8')).hexdigest()
+
+
+def _tfa_qr_data_uri(otpauth_uri: str) -> str:
+    """Return inline SVG QR as data URI; empty string if QR backend unavailable."""
+    if not _TFA_QR_LIB_AVAILABLE:
+        return ''
+    try:
+        factory = qrcode.image.svg.SvgPathImage
+        img = qrcode.make(otpauth_uri, image_factory=factory, box_size=6, border=2)
+        svg = img.to_string().decode('utf-8')
+        b64 = base64.b64encode(svg.encode('utf-8')).decode('ascii')
+        return f'data:image/svg+xml;base64,{b64}'
+    except Exception:
+        return ''
+
+
 # ── Security helpers ────────────────────────────────────
 # CSRF secret is loaded from the DB on startup so server restarts
 # do not invalidate existing browser CSRF cookies.
@@ -795,6 +874,93 @@ def _json_safe_obj(value: Any):
     if isinstance(value, (list, tuple)):
         return [_json_safe_obj(v) for v in value]
     return value
+
+
+def _typed_json_encode(value: Any):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return {'__wk_type': 'bytes', 'b64': _b64url_encode(bytes(value))}
+    if isinstance(value, tuple):
+        return {'__wk_type': 'tuple', 'items': [_typed_json_encode(v) for v in value]}
+    if isinstance(value, list):
+        return {'__wk_type': 'list', 'items': [_typed_json_encode(v) for v in value]}
+    if isinstance(value, dict):
+        return {
+            '__wk_type': 'dict',
+            'items': [[_typed_json_encode(k), _typed_json_encode(v)] for k, v in value.items()],
+        }
+    raise TypeError(f'Unsupported type in typed JSON encode: {type(value)!r}')
+
+
+def _typed_json_decode(value: Any):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [_typed_json_decode(v) for v in value]
+    if not isinstance(value, dict):
+        raise ValueError('Invalid typed JSON value')
+    t = value.get('__wk_type')
+    if not t:
+        return {str(k): _typed_json_decode(v) for k, v in value.items()}
+    if t == 'bytes':
+        return _b64url_decode(str(value.get('b64', '')))
+    if t == 'tuple':
+        return tuple(_typed_json_decode(v) for v in (value.get('items') or []))
+    if t == 'list':
+        return [_typed_json_decode(v) for v in (value.get('items') or [])]
+    if t == 'dict':
+        out = {}
+        for kv in (value.get('items') or []):
+            if not isinstance(kv, list) or len(kv) != 2:
+                raise ValueError('Invalid typed JSON dict entry')
+            out[_typed_json_decode(kv[0])] = _typed_json_decode(kv[1])
+        return out
+    raise ValueError('Unknown typed JSON marker')
+
+
+def _webauthn_state_pack(state: Any) -> str:
+    payload = _typed_json_encode(state)
+    signed = {'v': 1, 'payload': payload}
+    canon = json.dumps(signed, sort_keys=True, separators=(',', ':'))
+    key = _CSRF_SECRET or b'webauthn-state-fallback'
+    sig = hmac.new(key, canon.encode('utf-8'), hashlib.sha256).hexdigest()
+    return json.dumps({'v': 1, 'payload': payload, 'sig': sig}, separators=(',', ':'))
+
+
+def _webauthn_state_unpack(state_json: str):
+    try:
+        blob = json.loads(state_json or '{}')
+    except Exception:
+        return None
+    if not isinstance(blob, dict):
+        return None
+    v = int(blob.get('v', 0))
+    payload = blob.get('payload')
+    sig = str(blob.get('sig', '')).strip().lower()
+    if v != 1 or payload is None or not re.fullmatch(r'[a-f0-9]{64}', sig):
+        return None
+    signed = {'v': v, 'payload': payload}
+    canon = json.dumps(signed, sort_keys=True, separators=(',', ':'))
+    key = _CSRF_SECRET or b'webauthn-state-fallback'
+    expected = hmac.new(key, canon.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        return _typed_json_decode(payload)
+    except Exception:
+        return None
+
+
+def _seconds_until_iso(ts: str) -> int:
+    try:
+        dt = datetime.datetime.fromisoformat((ts or '').strip())
+    except Exception:
+        return 0
+    left = (dt - datetime.datetime.now()).total_seconds()
+    if left <= 0:
+        return 0
+    return int(left + 0.999)
 
 
 def _nested_get(obj, path: list[str], default=''):
@@ -1083,6 +1249,37 @@ class RegistrationDB:
               ON webauthn_challenges(flow_type, expires_at);
             CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_user_flow
               ON webauthn_challenges(user_id, flow_type, id DESC);
+            CREATE TABLE IF NOT EXISTS tfa_challenges (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                flow_type       TEXT    NOT NULL,
+                challenge_token TEXT    NOT NULL UNIQUE,
+                auth_attempts   INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                blocked_until   TEXT,
+                created_at      TEXT    NOT NULL,
+                expires_at      TEXT    NOT NULL,
+                used_at         TEXT,
+                client_ip       TEXT    NOT NULL DEFAULT '',
+                user_agent      TEXT    NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_tfa_challenges_flow_exp
+              ON tfa_challenges(flow_type, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_tfa_challenges_user_flow
+              ON tfa_challenges(user_id, flow_type, id DESC);
+            CREATE TABLE IF NOT EXISTS tfa_recovery_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                actor       TEXT    NOT NULL,
+                action      TEXT    NOT NULL,
+                detail      TEXT    NOT NULL DEFAULT '',
+                ip          TEXT    NOT NULL DEFAULT '',
+                created_at  TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tfa_recovery_user_created
+              ON tfa_recovery_events(user_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_tfa_recovery_action_created
+              ON tfa_recovery_events(action, id DESC);
         ''')
         # ── Migrations ────────────────────────────────────────
         cols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
@@ -1414,11 +1611,6 @@ class RegistrationDB:
         except Exception:
             pass  # column already exists
         try:
-            self._conn().execute('ALTER TABLE users ADD COLUMN webauthn_preferred INTEGER NOT NULL DEFAULT 0')
-            self._conn().commit()
-        except Exception:
-            pass  # column already exists
-        try:
             self._conn().execute('ALTER TABLE users ADD COLUMN webauthn_required INTEGER NOT NULL DEFAULT 0')
             self._conn().commit()
         except Exception:
@@ -1439,6 +1631,11 @@ class RegistrationDB:
         except Exception:
             pass  # column already exists
         try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_required_admin INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
             self._conn().execute('ALTER TABLE users ADD COLUMN tfa_method TEXT NOT NULL DEFAULT ""')
             self._conn().commit()
         except Exception:
@@ -1448,13 +1645,65 @@ class RegistrationDB:
             self._conn().commit()
         except Exception:
             pass  # column already exists
+        try:
+            self._conn().execute("ALTER TABLE users ADD COLUMN tfa_secret_enc TEXT NOT NULL DEFAULT ''")
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_secret_ver INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute("ALTER TABLE users ADD COLUMN tfa_backup_codes_hash TEXT NOT NULL DEFAULT ''")
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_backup_codes_remaining INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_last_verified_at TEXT')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_recovery_locked INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
         scols = [r[1] for r in c.execute('PRAGMA table_info(sessions)').fetchall()]
         if 'must_enroll_passkey' not in scols:
             c.execute('ALTER TABLE sessions ADD COLUMN must_enroll_passkey INTEGER NOT NULL DEFAULT 0')
             c.commit()
+        if 'primary_auth_ok' not in scols:
+            c.execute('ALTER TABLE sessions ADD COLUMN primary_auth_ok INTEGER NOT NULL DEFAULT 1')
+            c.commit()
+        if 'tfa_verified_at' not in scols:
+            c.execute('ALTER TABLE sessions ADD COLUMN tfa_verified_at TEXT')
+            c.commit()
+        if 'must_enroll_tfa' not in scols:
+            c.execute('ALTER TABLE sessions ADD COLUMN must_enroll_tfa INTEGER NOT NULL DEFAULT 0')
+            c.commit()
+        if 'pending_tfa_challenge_id' not in scols:
+            c.execute('ALTER TABLE sessions ADD COLUMN pending_tfa_challenge_id INTEGER')
+            c.commit()
         wcols = [r[1] for r in c.execute('PRAGMA table_info(webauthn_credentials)').fetchall()]
         if 'is_primary' not in wcols:
             c.execute('ALTER TABLE webauthn_credentials ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0')
+            c.commit()
+        tfa_ch_cols = [r[1] for r in c.execute('PRAGMA table_info(tfa_challenges)').fetchall()]
+        if 'auth_attempts' not in tfa_ch_cols:
+            c.execute('ALTER TABLE tfa_challenges ADD COLUMN auth_attempts INTEGER NOT NULL DEFAULT 0')
+            c.commit()
+        if 'last_attempt_at' not in tfa_ch_cols:
+            c.execute('ALTER TABLE tfa_challenges ADD COLUMN last_attempt_at TEXT')
+            c.commit()
+        if 'blocked_until' not in tfa_ch_cols:
+            c.execute('ALTER TABLE tfa_challenges ADD COLUMN blocked_until TEXT')
             c.commit()
 
     def _init_defaults(self, announce_urls: list):
@@ -1555,6 +1804,11 @@ class RegistrationDB:
             'tfa_login_enabled':            '0',
             'tfa_enforce_sitewide':         '0',
             'tfa_enforce_admins':           '0',
+            'tfa_totp_period_sec':          '30',
+            'tfa_totp_digits':              '6',
+            'tfa_totp_skew_steps':          '1',
+            'tfa_challenge_ttl_sec':        '300',
+            'tfa_backup_codes_count':       '10',
         }
         for k, v in defaults.items():
             c.execute('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)', (k, v))
@@ -4174,6 +4428,8 @@ class RegistrationDB:
         c.execute('DELETE FROM user_follows')
         c.execute('DELETE FROM account_delete_challenges')
         c.execute('DELETE FROM webauthn_challenges')
+        c.execute('DELETE FROM tfa_challenges')
+        c.execute('DELETE FROM tfa_recovery_events')
         c.execute('DELETE FROM topup_reconciliation_actions')
         c.execute('DELETE FROM topup_webhook_events')
         c.execute('DELETE FROM topup_orders')
@@ -4228,13 +4484,21 @@ class RegistrationDB:
 
     # ── Sessions ───────────────────────────────────────────────
 
-    def create_session(self, user_id: int, must_enroll_passkey: bool = False) -> str:
+    def create_session(self, user_id: int, must_enroll_passkey: bool = False,
+                       primary_auth_ok: bool = True, must_enroll_tfa: bool = False,
+                       pending_tfa_challenge_id: int | None = None) -> str:
         token      = secrets.token_hex(32)
         now        = datetime.datetime.now()
         expires_at = (now + datetime.timedelta(hours=48)).isoformat(timespec='seconds')
         self._conn().execute(
-            'INSERT INTO sessions (user_id,token,created_at,expires_at,must_enroll_passkey) VALUES (?,?,?,?,?)',
-            (user_id, token, now.isoformat(timespec='seconds'), expires_at, 1 if must_enroll_passkey else 0)
+            '''INSERT INTO sessions
+               (user_id,token,created_at,expires_at,must_enroll_passkey,primary_auth_ok,must_enroll_tfa,pending_tfa_challenge_id)
+               VALUES (?,?,?,?,?,?,?,?)''',
+            (user_id, token, now.isoformat(timespec='seconds'), expires_at,
+             1 if must_enroll_passkey else 0,
+             1 if primary_auth_ok else 0,
+             1 if must_enroll_tfa else 0,
+             pending_tfa_challenge_id)
         )
         self._conn().commit()
         return token
@@ -4286,6 +4550,59 @@ class RegistrationDB:
         self._conn().execute(
             'UPDATE sessions SET must_enroll_passkey=? WHERE token=?',
             (1 if required else 0, token)
+        )
+        self._conn().commit()
+
+    def session_requires_tfa_enroll(self, token: str) -> bool:
+        now = datetime.datetime.now().isoformat(timespec='seconds')
+        row = self._conn().execute(
+            'SELECT must_enroll_tfa FROM sessions WHERE token=? AND expires_at>?',
+            (token, now)
+        ).fetchone()
+        return bool(row and int(row['must_enroll_tfa'] or 0) == 1)
+
+    def set_session_tfa_enroll(self, token: str, required: bool):
+        self._conn().execute(
+            'UPDATE sessions SET must_enroll_tfa=? WHERE token=?',
+            (1 if required else 0, token)
+        )
+        self._conn().commit()
+
+    def get_session_pending_tfa_challenge_id(self, token: str) -> int:
+        now = datetime.datetime.now().isoformat(timespec='seconds')
+        row = self._conn().execute(
+            'SELECT pending_tfa_challenge_id FROM sessions WHERE token=? AND expires_at>?',
+            (token, now)
+        ).fetchone()
+        if not row or row['pending_tfa_challenge_id'] is None:
+            return 0
+        try:
+            return int(row['pending_tfa_challenge_id'])
+        except Exception:
+            return 0
+
+    def set_session_pending_tfa_challenge(self, token: str, challenge_id: int | None):
+        self._conn().execute(
+            'UPDATE sessions SET pending_tfa_challenge_id=? WHERE token=?',
+            (challenge_id, token)
+        )
+        self._conn().commit()
+
+    def session_primary_auth_ok(self, token: str) -> bool:
+        now = datetime.datetime.now().isoformat(timespec='seconds')
+        row = self._conn().execute(
+            'SELECT primary_auth_ok FROM sessions WHERE token=? AND expires_at>?',
+            (token, now)
+        ).fetchone()
+        return bool(row and int(row['primary_auth_ok'] or 0) == 1)
+
+    def mark_session_tfa_verified(self, token: str):
+        now = self._ts()
+        self._conn().execute(
+            '''UPDATE sessions
+               SET primary_auth_ok=1, pending_tfa_challenge_id=NULL, tfa_verified_at=?, must_enroll_tfa=0
+               WHERE token=?''',
+            (now, token)
         )
         self._conn().commit()
 
@@ -4415,11 +4732,34 @@ class RegistrationDB:
 
     # ── WebAuthn / Passkeys ──────────────────────────────────
 
-    def set_user_webauthn_preferences(self, user_id: int, enabled: bool,
-                                      preferred: bool, required: bool):
+    def set_user_webauthn_preferences(self, user_id: int, enabled: bool, required: bool):
         self._conn().execute(
-            'UPDATE users SET webauthn_enabled=?, webauthn_preferred=?, webauthn_required=? WHERE id=?',
-            (1 if enabled else 0, 1 if preferred else 0, 1 if required else 0, user_id)
+            'UPDATE users SET webauthn_enabled=?, webauthn_required=? WHERE id=?',
+            (1 if enabled else 0, 1 if required else 0, user_id)
+        )
+        self._conn().commit()
+
+    def set_user_tfa_preferences(self, user_id: int, enabled: bool, required: bool):
+        c = self._conn()
+        c.execute(
+            'UPDATE users SET tfa_enabled=?, tfa_required=? WHERE id=?',
+            (1 if enabled else 0, 1 if required else 0, user_id)
+        )
+        if not enabled:
+            c.execute(
+                '''UPDATE users
+                   SET tfa_method='', tfa_enrolled_at=NULL, tfa_secret_enc='', tfa_secret_ver=0,
+                       tfa_backup_codes_hash='', tfa_backup_codes_remaining=0, tfa_last_verified_at=NULL
+                   WHERE id=?''',
+                (user_id,)
+            )
+            c.execute('DELETE FROM tfa_challenges WHERE user_id=?', (user_id,))
+        c.commit()
+
+    def set_user_tfa_required(self, user_id: int, required: bool):
+        self._conn().execute(
+            'UPDATE users SET tfa_required=? WHERE id=?',
+            (1 if required else 0, user_id)
         )
         self._conn().commit()
 
@@ -4553,7 +4893,7 @@ class RegistrationDB:
             (user_id,),
         ).rowcount
         c.execute(
-            'UPDATE users SET webauthn_enabled=0, webauthn_preferred=0, webauthn_required=0, webauthn_required_admin=0 WHERE id=?',
+            'UPDATE users SET webauthn_enabled=0, webauthn_required=0, webauthn_required_admin=0 WHERE id=?',
             (user_id,),
         )
         c.execute('DELETE FROM webauthn_challenges WHERE user_id=?', (user_id,))
@@ -4578,6 +4918,28 @@ class RegistrationDB:
         c.commit()
         self._log(actor, 'admin_set_webauthn_required', username, f'admin_required={1 if required else 0}')
         return True
+
+    def admin_set_user_tfa_required(self, username: str, required: bool, actor: str) -> bool:
+        user = self.get_user(username)
+        if user is None:
+            return False
+        c = self._conn()
+        if required:
+            c.execute(
+                'UPDATE users SET tfa_required_admin=1, tfa_enabled=1 WHERE id=?',
+                (user['id'],)
+            )
+        else:
+            c.execute(
+                'UPDATE users SET tfa_required_admin=0 WHERE id=?',
+                (user['id'],)
+            )
+        c.commit()
+        self._log(actor, 'admin_set_tfa_required', username, f'admin_required={1 if required else 0}')
+        return True
+
+    def reset_user_tfa(self, user_id: int, actor: str = 'system') -> None:
+        self.clear_user_tfa(user_id, actor=actor, detail='admin_reset')
 
     def create_webauthn_challenge(self, user_id: int | None, flow_type: str,
                                   challenge_b64: str, state_json: str,
@@ -4615,6 +4977,184 @@ class RegistrationDB:
     def expire_webauthn_challenges(self) -> int:
         cur = self._conn().execute(
             "DELETE FROM webauthn_challenges WHERE (used_at IS NOT NULL) OR expires_at<=?",
+            (self._ts(),)
+        )
+        self._conn().commit()
+        return int(cur.rowcount or 0)
+
+    # ── TFA / TOTP ───────────────────────────────────────────
+
+    def _encode_tfa_secret(self, secret_b32: str) -> str:
+        text = (secret_b32 or '').strip()
+        if not text:
+            return ''
+        return base64.urlsafe_b64encode(text.encode('utf-8')).decode('ascii')
+
+    def _decode_tfa_secret(self, encoded: str) -> str:
+        raw = (encoded or '').strip()
+        if not raw:
+            return ''
+        try:
+            return base64.urlsafe_b64decode(raw.encode('ascii')).decode('utf-8')
+        except Exception:
+            return ''
+
+    def get_user_tfa_secret(self, user_id: int) -> str:
+        row = self._conn().execute(
+            'SELECT tfa_secret_enc FROM users WHERE id=?',
+            (user_id,)
+        ).fetchone()
+        return self._decode_tfa_secret(row['tfa_secret_enc']) if row else ''
+
+    def set_user_tfa_enrollment(self, user_id: int, secret_b32: str,
+                                backup_codes_plain: list[str], method: str = 'totp') -> bool:
+        secret_enc = self._encode_tfa_secret(secret_b32)
+        if not secret_enc:
+            return False
+        code_hashes = [_tfa_hash_backup_code(c) for c in (backup_codes_plain or []) if _tfa_hash_backup_code(c)]
+        now = self._ts()
+        self._conn().execute(
+            '''UPDATE users
+               SET tfa_enabled=1, tfa_method=?, tfa_enrolled_at=?, tfa_secret_enc=?, tfa_secret_ver=1,
+                   tfa_backup_codes_hash=?, tfa_backup_codes_remaining=?, tfa_last_verified_at=?, tfa_recovery_locked=0
+               WHERE id=?''',
+            (method[:20], now, secret_enc, json.dumps(code_hashes), len(code_hashes), now, user_id)
+        )
+        self._conn().commit()
+        self.record_tfa_recovery_event(user_id, 'system', 'enroll_finish', f'method={method}', '')
+        return True
+
+    def touch_user_tfa_verified(self, user_id: int):
+        self._conn().execute(
+            'UPDATE users SET tfa_last_verified_at=? WHERE id=?',
+            (self._ts(), user_id)
+        )
+        self._conn().commit()
+
+    def clear_user_tfa(self, user_id: int, actor: str = 'system', detail: str = ''):
+        c = self._conn()
+        c.execute(
+            '''UPDATE users
+               SET tfa_enabled=0, tfa_method='', tfa_enrolled_at=NULL, tfa_secret_enc='', tfa_secret_ver=0,
+                   tfa_backup_codes_hash='', tfa_backup_codes_remaining=0, tfa_last_verified_at=NULL, tfa_recovery_locked=0
+               WHERE id=?''',
+            (user_id,)
+        )
+        c.execute('DELETE FROM tfa_challenges WHERE user_id=?', (user_id,))
+        c.commit()
+        self.record_tfa_recovery_event(user_id, actor, 'admin_reset', detail[:255], '')
+
+    def verify_and_consume_tfa_backup_code(self, user_id: int, code: str) -> bool:
+        code_hash = _tfa_hash_backup_code(code)
+        if not code_hash:
+            return False
+        c = self._conn()
+        row = c.execute(
+            'SELECT tfa_backup_codes_hash,tfa_backup_codes_remaining FROM users WHERE id=?',
+            (user_id,)
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            hashes = json.loads(row['tfa_backup_codes_hash'] or '[]')
+        except Exception:
+            hashes = []
+        if code_hash not in hashes:
+            return False
+        hashes = [h for h in hashes if h != code_hash]
+        c.execute(
+            'UPDATE users SET tfa_backup_codes_hash=?, tfa_backup_codes_remaining=?, tfa_last_verified_at=? WHERE id=?',
+            (json.dumps(hashes), len(hashes), self._ts(), user_id)
+        )
+        c.commit()
+        self.record_tfa_recovery_event(user_id, 'self', 'backup_code_used', '', '')
+        return True
+
+    def record_tfa_recovery_event(self, user_id: int, actor: str, action: str,
+                                  detail: str = '', ip: str = ''):
+        self._conn().execute(
+            'INSERT INTO tfa_recovery_events (user_id,actor,action,detail,ip,created_at) VALUES (?,?,?,?,?,?)',
+            (user_id, (actor or 'system')[:64], (action or 'event')[:48], (detail or '')[:255], (ip or '')[:64], self._ts())
+        )
+        self._conn().commit()
+
+    def create_tfa_challenge(self, user_id: int, flow_type: str = 'login',
+                             ttl_seconds: int = TFA_CHALLENGE_TTL_SECONDS,
+                             client_ip: str = '', user_agent: str = '') -> tuple[int, str]:
+        token = secrets.token_urlsafe(24)
+        now_dt = datetime.datetime.now()
+        now = now_dt.isoformat(timespec='seconds')
+        ttl = max(60, min(1800, int(ttl_seconds)))
+        exp = (now_dt + datetime.timedelta(seconds=ttl)).isoformat(timespec='seconds')
+        cur = self._conn().execute(
+            '''INSERT INTO tfa_challenges
+               (user_id,flow_type,challenge_token,created_at,expires_at,client_ip,user_agent)
+               VALUES (?,?,?,?,?,?,?)''',
+            (user_id, flow_type[:20], token, now, exp, client_ip[:64], user_agent[:255])
+        )
+        self._conn().commit()
+        return int(cur.lastrowid), token
+
+    def get_tfa_challenge_wait_seconds(self, challenge_id: int) -> int:
+        row = self._conn().execute(
+            'SELECT blocked_until FROM tfa_challenges WHERE id=? AND used_at IS NULL',
+            (challenge_id,)
+        ).fetchone()
+        if not row:
+            return 0
+        return _seconds_until_iso(row['blocked_until'] or '')
+
+    def register_tfa_challenge_failure(self, challenge_id: int) -> tuple[int, int]:
+        c = self._conn()
+        row = c.execute(
+            'SELECT auth_attempts FROM tfa_challenges WHERE id=? AND used_at IS NULL',
+            (challenge_id,)
+        ).fetchone()
+        if not row:
+            return 0, 0
+        attempts = int(row['auth_attempts'] or 0) + 1
+        wait = min(TFA_CHALLENGE_BACKOFF_MAX_SECONDS,
+                   TFA_CHALLENGE_BACKOFF_BASE_SECONDS * (2 ** max(0, attempts - 1)))
+        blocked_until = (datetime.datetime.now() + datetime.timedelta(seconds=wait)).isoformat(timespec='seconds')
+        c.execute(
+            'UPDATE tfa_challenges SET auth_attempts=?, last_attempt_at=?, blocked_until=? WHERE id=?',
+            (attempts, self._ts(), blocked_until, challenge_id)
+        )
+        c.commit()
+        return attempts, wait
+
+    def clear_tfa_challenge_failures(self, challenge_id: int):
+        self._conn().execute(
+            'UPDATE tfa_challenges SET auth_attempts=0, last_attempt_at=NULL, blocked_until=NULL WHERE id=?',
+            (challenge_id,)
+        )
+        self._conn().commit()
+
+    def get_tfa_challenge_by_token(self, token: str, flow_type: str = 'login'):
+        return self._conn().execute(
+            '''SELECT * FROM tfa_challenges
+               WHERE challenge_token=? AND flow_type=? AND used_at IS NULL AND expires_at>?''',
+            ((token or '')[:255], flow_type[:20], self._ts())
+        ).fetchone()
+
+    def get_tfa_challenge_by_id(self, challenge_id: int, flow_type: str = 'login'):
+        return self._conn().execute(
+            '''SELECT * FROM tfa_challenges
+               WHERE id=? AND flow_type=? AND used_at IS NULL AND expires_at>?''',
+            (challenge_id, flow_type[:20], self._ts())
+        ).fetchone()
+
+    def consume_tfa_challenge(self, challenge_id: int) -> bool:
+        cur = self._conn().execute(
+            'UPDATE tfa_challenges SET used_at=? WHERE id=? AND used_at IS NULL',
+            (self._ts(), challenge_id)
+        )
+        self._conn().commit()
+        return bool(cur.rowcount)
+
+    def expire_tfa_challenges(self) -> int:
+        cur = self._conn().execute(
+            "DELETE FROM tfa_challenges WHERE (used_at IS NOT NULL) OR expires_at<=?",
             (self._ts(),)
         )
         self._conn().commit()
@@ -6313,8 +6853,28 @@ def _webauthn_login_enabled() -> bool:
     return REGISTRATION_DB.get_setting('webauthn_login_enabled', '0') == '1'
 
 
+def _tfa_login_enabled() -> bool:
+    if not REGISTRATION_DB:
+        return False
+    return REGISTRATION_DB.get_setting('tfa_login_enabled', '0') == '1'
+
+
+def _flag_true(val) -> bool:
+    """Normalize DB/UI flags stored as int/bool/string."""
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    if isinstance(val, (int, float)):
+        try:
+            return int(val) != 0
+        except Exception:
+            return False
+    return str(val).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 def _auth_factor_policy_for_user(user) -> dict:
-    """Centralized auth-factor policy resolver (passkey now, TFA scaffolded for future)."""
+    """Centralized auth-factor policy resolver for passkey + TFA requirements."""
     out = {
         'break_glass': bool(AUTH_BREAK_GLASS),
         'passkey_required': False,
@@ -6323,9 +6883,14 @@ def _auth_factor_policy_for_user(user) -> dict:
         'passkey_admin_scope': False,
         'must_enroll_passkey': False,
         'password_blocked': False,
-        # TFA scaffolding only (not active enforcement in this rollout)
         'tfa_login_enabled': False,
         'tfa_required': False,
+        'tfa_user_required': False,
+        'tfa_admin_user_required': False,
+        'tfa_sitewide': False,
+        'tfa_admin_scope': False,
+        'must_enroll_tfa': False,
+        'tfa_challenge_required': False,
     }
     if not user or not REGISTRATION_DB or AUTH_BREAK_GLASS:
         return out
@@ -6333,8 +6898,8 @@ def _auth_factor_policy_for_user(user) -> dict:
     sitewide = (REGISTRATION_DB.get_setting('webauthn_enforce_sitewide', '0') == '1')
     admin_scope = ((REGISTRATION_DB.get_setting('webauthn_enforce_admins', '0') == '1')
                    and role in ('admin', 'super'))
-    user_required = bool('webauthn_required' in user.keys() and user['webauthn_required'])
-    admin_required = bool('webauthn_required_admin' in user.keys() and user['webauthn_required_admin'])
+    user_required = _flag_true(user['webauthn_required']) if ('webauthn_required' in user.keys()) else False
+    admin_required = _flag_true(user['webauthn_required_admin']) if ('webauthn_required_admin' in user.keys()) else False
     passkey_required = bool(sitewide or admin_scope or admin_required or user_required)
     has_passkey = REGISTRATION_DB.count_webauthn_credentials(int(user['id'])) > 0
     out.update({
@@ -6346,6 +6911,26 @@ def _auth_factor_policy_for_user(user) -> dict:
         'must_enroll_passkey': (passkey_required and not has_passkey),
         'password_blocked': (passkey_required and has_passkey),
         'tfa_login_enabled': (REGISTRATION_DB.get_setting('tfa_login_enabled', '0') == '1'),
+    })
+    tfa_login_enabled = out['tfa_login_enabled']
+    tfa_sitewide = tfa_login_enabled and (REGISTRATION_DB.get_setting('tfa_enforce_sitewide', '0') == '1')
+    tfa_admin_scope = (tfa_login_enabled and
+                       (REGISTRATION_DB.get_setting('tfa_enforce_admins', '0') == '1') and
+                       role in ('admin', 'super'))
+    tfa_user_required = _flag_true(user['tfa_required']) if ('tfa_required' in user.keys()) else False
+    tfa_admin_user_required = _flag_true(user['tfa_required_admin']) if ('tfa_required_admin' in user.keys()) else False
+    tfa_required = bool(tfa_sitewide or tfa_admin_scope or tfa_admin_user_required or tfa_user_required)
+    tfa_enabled = _flag_true(user['tfa_enabled']) if ('tfa_enabled' in user.keys()) else False
+    has_tfa_secret = bool('tfa_secret_enc' in user.keys() and (user['tfa_secret_enc'] or '').strip())
+    tfa_enrolled = bool(tfa_enabled and has_tfa_secret)
+    out.update({
+        'tfa_required': tfa_required,
+        'tfa_user_required': tfa_user_required,
+        'tfa_admin_user_required': tfa_admin_user_required,
+        'tfa_sitewide': tfa_sitewide,
+        'tfa_admin_scope': tfa_admin_scope,
+        'must_enroll_tfa': bool(tfa_required and not tfa_enrolled),
+        'tfa_challenge_required': bool(tfa_required and tfa_enrolled),
     })
     return out
 
@@ -6756,6 +7341,64 @@ class ManageHandler(BaseHTTPRequestHandler):
             return False
         return REGISTRATION_DB.session_requires_passkey_enroll(token)
 
+    def _session_requires_tfa_enroll(self) -> bool:
+        if AUTH_BREAK_GLASS:
+            return False
+        if not REGISTRATION_DB:
+            return False
+        token = self._current_valid_session_token()
+        if not token:
+            return False
+        return REGISTRATION_DB.session_requires_tfa_enroll(token)
+
+    def _session_requires_tfa_challenge(self) -> bool:
+        if AUTH_BREAK_GLASS:
+            return False
+        if not REGISTRATION_DB:
+            return False
+        token = self._current_valid_session_token()
+        if not token:
+            return False
+        challenge_id = REGISTRATION_DB.get_session_pending_tfa_challenge_id(token)
+        if challenge_id <= 0:
+            return False
+        ch = REGISTRATION_DB.get_tfa_challenge_by_id(challenge_id, 'login')
+        if not ch:
+            REGISTRATION_DB.set_session_pending_tfa_challenge(token, None)
+            return False
+        return True
+
+    def _session_has_active_delete_challenge(self) -> bool:
+        if AUTH_BREAK_GLASS:
+            return False
+        if not REGISTRATION_DB:
+            return False
+        user = self._get_session_user()
+        if not user:
+            return False
+        return bool(REGISTRATION_DB.get_active_account_delete_challenge(int(user['id'])))
+
+    def _resolve_post_auth_redirect(self, user, token: str, policy: dict,
+                                    client_ip: str = '', user_agent: str = '') -> str:
+        if policy.get('must_enroll_passkey'):
+            return '/manage/passkey-enroll'
+        if policy.get('tfa_challenge_required'):
+            ttl_sec = int(REGISTRATION_DB.get_setting('tfa_challenge_ttl_sec', str(TFA_CHALLENGE_TTL_SECONDS)) or TFA_CHALLENGE_TTL_SECONDS)
+            challenge_id, _ = REGISTRATION_DB.create_tfa_challenge(
+                int(user['id']),
+                flow_type='login',
+                ttl_seconds=ttl_sec,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
+            REGISTRATION_DB.set_session_pending_tfa_challenge(token, challenge_id)
+            return '/manage/tfa/challenge'
+        if policy.get('must_enroll_tfa'):
+            REGISTRATION_DB.set_session_tfa_enroll(token, True)
+            return '/manage/tfa/setup'
+        delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
+        return '/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard'
+
     def _refresh_csrf_cookie(self) -> None:
         """Re-set the wkcsrf cookie from the currently validated session token.
         Called on every authenticated GET so the cookie is always present and
@@ -6883,12 +7526,20 @@ class ManageHandler(BaseHTTPRequestHandler):
         # enrollment and logout endpoints until a passkey is successfully enrolled.
         gate_allow = (
             '/manage', '/manage/logout', '/manage/passkey-enroll',
+            '/manage/tfa/setup', '/manage/tfa/challenge',
+            '/manage/account/delete/confirm',
             '/manage/poll', '/manage/notifications/preview',
         )
         if path not in gate_allow:
             user = self._get_session_user()
+            if user and self._session_requires_tfa_challenge():
+                return self._redirect('/manage/tfa/challenge')
             if user and self._session_requires_passkey_enroll():
                 return self._redirect('/manage/passkey-enroll')
+            if user and self._session_requires_tfa_enroll():
+                return self._redirect('/manage/tfa/setup')
+            if user and self._session_has_active_delete_challenge():
+                return self._redirect('/manage/account/delete/confirm')
 
         if path in ('/manage', ''):
             user = self._get_session_user()
@@ -6896,8 +7547,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             msg = urllib.parse.unquote(qs.get('msg', [''])[0])
             msg_type = qs.get('msg_type', ['error'])[0]
             if user:
-                if self._session_requires_passkey_enroll():
+                if self._session_requires_tfa_challenge():
+                    self._redirect('/manage/tfa/challenge')
+                elif self._session_requires_passkey_enroll():
                     self._redirect('/manage/passkey-enroll')
+                elif self._session_requires_tfa_enroll():
+                    self._redirect('/manage/tfa/setup')
                 else:
                     self._redirect('/manage/dashboard')
             else:
@@ -6929,6 +7584,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_profile()
         elif path == '/manage/passkey-enroll':
             self._get_passkey_enroll()
+        elif path == '/manage/tfa/setup':
+            self._get_tfa_setup()
+        elif path == '/manage/tfa/challenge':
+            self._get_tfa_challenge()
         elif path == '/manage/account/delete/confirm':
             self._get_account_delete_confirm()
         elif path == '/manage/goodbye':
@@ -7052,11 +7711,29 @@ class ManageHandler(BaseHTTPRequestHandler):
                     self._redirect('/manage?msg=csrf')
                     return
 
-        # Session-scoped passkey enrollment gate for POST requests.
-        if path not in ('/manage/logout', '/manage/webauthn/register/start', '/manage/webauthn/register/finish'):
+        # Session-scoped auth-factor gates for POST requests.
+        if path not in ('/manage/logout', '/manage/webauthn/register/start', '/manage/webauthn/register/finish',
+                        '/manage/tfa/challenge'):
             user = self._get_session_user()
+            if user and self._session_requires_tfa_challenge():
+                return self._redirect('/manage/tfa/challenge')
             if user and self._session_requires_passkey_enroll():
                 return self._redirect('/manage/passkey-enroll')
+            if user and self._session_requires_tfa_enroll() and path not in ('/manage/tfa/setup/start', '/manage/tfa/setup/verify'):
+                return self._redirect('/manage/tfa/setup')
+            if user and self._session_has_active_delete_challenge():
+                delete_allowed = (
+                    '/manage/logout',
+                    '/manage/webauthn/register/start',
+                    '/manage/webauthn/register/finish',
+                    '/manage/tfa/challenge',
+                    '/manage/tfa/setup/start',
+                    '/manage/tfa/setup/verify',
+                    '/manage/account/delete/confirm',
+                    '/manage/account/delete/cancel',
+                )
+                if path not in delete_allowed:
+                    return self._redirect('/manage/account/delete/confirm')
 
         if path == '/manage/login':
             self._post_login()
@@ -7074,6 +7751,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_webauthn_credential_rename()
         elif path == '/manage/webauthn/credential/delete':
             self._post_webauthn_credential_delete()
+        elif path == '/manage/tfa/setup/start':
+            self._post_tfa_setup_start()
+        elif path == '/manage/tfa/setup/verify':
+            self._post_tfa_setup_verify()
+        elif path == '/manage/tfa/preferences':
+            self._post_tfa_preferences()
+        elif path == '/manage/tfa/disable':
+            self._post_tfa_disable()
+        elif path == '/manage/tfa/challenge':
+            self._post_tfa_challenge()
         elif path == '/manage/account/delete/start':
             self._post_account_delete_start()
         elif path == '/manage/account/delete/confirm':
@@ -7110,6 +7797,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_admin_set_user_passkey_required()
         elif path == '/manage/admin/reset-webauthn':
             self._post_admin_reset_webauthn()
+        elif path == '/manage/admin/set-user-tfa-required':
+            self._post_admin_set_user_tfa_required()
+        elif path == '/manage/admin/reset-tfa':
+            self._post_admin_reset_tfa()
         elif path == '/manage/admin/set-admin':
             self._post_set_admin()
         elif path == '/manage/admin/set-standard':
@@ -7303,6 +7994,45 @@ class ManageHandler(BaseHTTPRequestHandler):
             pass
         self._send_html(_render_passkey_enroll_page(user, msg=msg, msg_type=msg_type))
 
+    def _get_tfa_setup(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if not _tfa_login_enabled():
+            return self._redirect('/manage/dashboard')
+        msg = ''
+        msg_type = 'error'
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+            msg_type = qs.get('msg_type', ['error'])[0]
+        except Exception:
+            pass
+        self._send_html(_render_tfa_setup_page(user, msg=msg, msg_type=msg_type))
+
+    def _get_tfa_challenge(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if not _tfa_login_enabled():
+            return self._redirect('/manage/dashboard')
+        token = self._current_valid_session_token()
+        pending_id = REGISTRATION_DB.get_session_pending_tfa_challenge_id(token) if token else 0
+        ch = REGISTRATION_DB.get_tfa_challenge_by_id(pending_id, 'login') if pending_id else None
+        if not ch:
+            if token:
+                REGISTRATION_DB.set_session_pending_tfa_challenge(token, None)
+            return self._redirect('/manage/dashboard')
+        msg = ''
+        msg_type = 'error'
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+            msg_type = qs.get('msg_type', ['error'])[0]
+        except Exception:
+            pass
+        self._send_html(_render_tfa_challenge_page(user, msg=msg, msg_type=msg_type))
+
     def _do_logout(self):
         cookie_hdr = self.headers.get('Cookie', '')
         # Identify who is logging out before we delete the session
@@ -7321,6 +8051,131 @@ class ManageHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # ── POST handlers ────────────────────────────────────────
+
+    def _post_tfa_setup_start(self):
+        # Present setup page (secret/URI are generated at render time).
+        self._redirect('/manage/tfa/setup')
+
+    def _post_tfa_setup_verify(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if not _tfa_login_enabled():
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        secret = re.sub(r'\s+', '', fields.get('secret', '').strip().upper())
+        code = fields.get('code', '').strip()
+        period = int(REGISTRATION_DB.get_setting('tfa_totp_period_sec', '30') or 30)
+        digits = int(REGISTRATION_DB.get_setting('tfa_totp_digits', '6') or 6)
+        skew = int(REGISTRATION_DB.get_setting('tfa_totp_skew_steps', '1') or 1)
+        if not re.fullmatch(r'[A-Z2-7]{16,128}', secret):
+            return self._send_html(_render_tfa_setup_page(user, msg='Invalid TOTP secret payload.', msg_type='error'))
+        if not _totp_verify(secret, code, period=period, digits=digits, skew_steps=skew):
+            return self._send_html(_render_tfa_setup_page(user, msg='Invalid authenticator code. Try again.', msg_type='error'))
+        backup_count = int(REGISTRATION_DB.get_setting('tfa_backup_codes_count', '10') or 10)
+        backup_codes = _tfa_generate_backup_codes(backup_count)
+        REGISTRATION_DB.set_user_tfa_enrollment(int(user['id']), secret, backup_codes, method='totp')
+        token = self._current_valid_session_token()
+        if token:
+            REGISTRATION_DB.set_session_tfa_enroll(token, False)
+        REGISTRATION_DB._log(user['username'], 'tfa_enroll_finish', user['username'], f'backup_codes={len(backup_codes)}')
+        delete_flow_active = bool(REGISTRATION_DB.get_active_account_delete_challenge(int(user['id'])))
+        self._send_html(_render_tfa_setup_page(
+            REGISTRATION_DB.get_user_by_id(int(user['id'])) or user,
+            msg='TFA is now enabled. Save your backup codes.',
+            msg_type='success',
+            backup_codes=backup_codes,
+            delete_flow_active=delete_flow_active
+        ))
+
+    def _post_tfa_challenge(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        token = self._current_valid_session_token()
+        if not token:
+            return self._redirect('/manage')
+        pending_id = REGISTRATION_DB.get_session_pending_tfa_challenge_id(token)
+        challenge = REGISTRATION_DB.get_tfa_challenge_by_id(pending_id, 'login') if pending_id else None
+        if not challenge:
+            REGISTRATION_DB.set_session_pending_tfa_challenge(token, None)
+            return self._redirect('/manage/dashboard')
+        wait_left = REGISTRATION_DB.get_tfa_challenge_wait_seconds(int(challenge['id']))
+        if wait_left > 0:
+            q = urllib.parse.quote(f'Too many attempts. Wait {wait_left}s and try again.')
+            return self._redirect(f'/manage/tfa/challenge?msg={q}&msg_type=error')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        code = fields.get('code', '').strip()
+        period = int(REGISTRATION_DB.get_setting('tfa_totp_period_sec', '30') or 30)
+        digits = int(REGISTRATION_DB.get_setting('tfa_totp_digits', '6') or 6)
+        skew = int(REGISTRATION_DB.get_setting('tfa_totp_skew_steps', '1') or 1)
+        secret = REGISTRATION_DB.get_user_tfa_secret(int(user['id']))
+        ok = False
+        used_backup = False
+        if secret and _totp_verify(secret, code, period=period, digits=digits, skew_steps=skew):
+            ok = True
+        elif REGISTRATION_DB.verify_and_consume_tfa_backup_code(int(user['id']), code):
+            ok = True
+            used_backup = True
+        if not ok:
+            attempts, wait = REGISTRATION_DB.register_tfa_challenge_failure(int(challenge['id']))
+            log.warning('TFA challenge failed user=%s challenge_id=%s attempts=%s backoff_sec=%s',
+                        user['username'], challenge['id'], attempts, wait)
+            q = urllib.parse.quote(f'Invalid authenticator or backup code. Try again in {wait}s.')
+            return self._redirect(f'/manage/tfa/challenge?msg={q}&msg_type=error')
+        REGISTRATION_DB.clear_tfa_challenge_failures(int(challenge['id']))
+        REGISTRATION_DB.consume_tfa_challenge(int(challenge['id']))
+        REGISTRATION_DB.mark_session_tfa_verified(token)
+        REGISTRATION_DB.touch_user_tfa_verified(int(user['id']))
+        REGISTRATION_DB._log(user['username'], 'tfa_challenge_success', user['username'],
+                             'backup=1' if used_backup else 'backup=0')
+        if self._session_requires_passkey_enroll():
+            return self._redirect('/manage/passkey-enroll')
+        if self._session_requires_tfa_enroll():
+            return self._redirect('/manage/tfa/setup')
+        delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
+        return self._redirect('/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard')
+
+    def _post_tfa_preferences(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if not _tfa_login_enabled():
+            return self._redirect('/manage/profile?msg=Operator+must+enable+TFA+login+before+changing+TFA+preferences.&msg_type=error')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        required = fields.get('tfa_required') == '1'
+        policy = _auth_factor_policy_for_user(user)
+        admin_required = bool(policy.get('tfa_admin_user_required'))
+        server_required = bool(policy.get('tfa_sitewide') or policy.get('tfa_admin_scope'))
+        if admin_required or server_required:
+            required = True
+        REGISTRATION_DB.set_user_tfa_required(int(user['id']), required)
+        REGISTRATION_DB._log(
+            user['username'],
+            'tfa_preferences',
+            user['username'],
+            f'required={1 if required else 0} admin_required={1 if admin_required else 0} server_required={1 if server_required else 0}'
+        )
+        if admin_required or server_required:
+            return self._redirect('/manage/profile?msg=TFA+is+required+by+policy+for+this+account.&msg_type=error')
+        return self._redirect('/manage/profile?msg=TFA+settings+saved.&msg_type=success')
+
+    def _post_tfa_disable(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        policy = _auth_factor_policy_for_user(user)
+        if policy.get('tfa_sitewide') or policy.get('tfa_admin_scope') or policy.get('tfa_admin_user_required'):
+            q = urllib.parse.quote('TFA cannot be disabled while policy enforcement is active.')
+            return self._redirect(f'/manage/profile?msg={q}&msg_type=error')
+        REGISTRATION_DB.set_user_tfa_preferences(int(user['id']), enabled=False, required=False)
+        REGISTRATION_DB.record_tfa_recovery_event(int(user['id']), user['username'], 'self_disable', 'via_profile', self.client_address[0] if self.client_address else '')
+        REGISTRATION_DB._log(user['username'], 'tfa_disabled', user['username'], 'self_disable=1')
+        q = urllib.parse.quote('Two-factor authentication disabled.')
+        return self._redirect(f'/manage/profile?msg={q}&msg_type=success')
 
     def _post_login(self):
         body   = self._read_body()
@@ -7351,15 +8206,21 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._send_html(_render_login('Invalid credentials.'))
             return
         policy = _auth_factor_policy_for_user(user)
-        token = REGISTRATION_DB.create_session(user['id'], must_enroll_passkey=bool(policy.get('must_enroll_passkey')))
+        needs_tfa_challenge = bool(policy.get('tfa_challenge_required'))
+        token = REGISTRATION_DB.create_session(
+            user['id'],
+            must_enroll_passkey=bool(policy.get('must_enroll_passkey')),
+            primary_auth_ok=not needs_tfa_challenge,
+            must_enroll_tfa=bool(policy.get('must_enroll_tfa')),
+        )
         REGISTRATION_DB.record_login_ip(user['id'], client_ip)
         REGISTRATION_DB.daily_login_check(user['id'])
         REGISTRATION_DB._log(username, 'login', client_ip)
-        if policy.get('must_enroll_passkey'):
-            login_redirect = '/manage/passkey-enroll'
-        else:
-            delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
-            login_redirect = '/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard'
+        login_redirect = self._resolve_post_auth_redirect(
+            user, token, policy,
+            client_ip=client_ip,
+            user_agent=self.headers.get('User-Agent', '')
+        )
         log.debug('LOGIN success user=%r token=%s...', username, token[:8])
         self.send_response(303)
         try:
@@ -7403,14 +8264,22 @@ class ManageHandler(BaseHTTPRequestHandler):
         all_credentials = bool(payload.get('all_credentials'))
         if not username:
             return self._send_json({'ok': False, 'error': 'Username is required.'}, 400)
+        generic_fail = {'ok': False, 'error': 'Invalid credentials.'}
         user = REGISTRATION_DB.get_user(username)
         if not user or user['is_disabled'] or user['is_locked']:
-            return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 403)
-        if 'webauthn_enabled' in user.keys() and not user['webauthn_enabled']:
-            return self._send_json({'ok': False, 'error': 'Passkey sign-in is not enabled for this account.'}, 400)
+            return self._send_json(generic_fail, 403)
+        policy = _auth_factor_policy_for_user(user)
+        user_enabled = _flag_true(user['webauthn_enabled']) if ('webauthn_enabled' in user.keys()) else False
+        if not user_enabled and not policy.get('passkey_required'):
+            log.warning('WEBAUTHN auth start denied user=%s reason=account_passkey_disabled', username)
+            return self._send_json(generic_fail, 403)
+        if not user_enabled and policy.get('passkey_required'):
+            log.debug('WEBAUTHN auth start user flag disabled; proceeding due to policy user=%s policy_required=1',
+                      username)
         rows = REGISTRATION_DB.list_webauthn_credentials(user['id'])
         if not rows:
-            return self._send_json({'ok': False, 'error': 'No registered passkeys for this account.'}, 400)
+            log.warning('WEBAUTHN auth start denied user=%s reason=no_registered_passkeys', username)
+            return self._send_json(generic_fail, 403)
         server = self._webauthn_server()
         if not server:
             return self._send_json({'ok': False, 'error': 'Unable to initialize WebAuthn server.'}, 500)
@@ -7451,7 +8320,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         try:
             auth_data, state = server.authenticate_begin(creds, user_verification='preferred')
             options = auth_data.get('publicKey', auth_data)
-            state_blob = base64.b64encode(pickle.dumps(state)).decode('ascii')
+            state_blob = _webauthn_state_pack(state)
             challenge = options.get('challenge')
             challenge_b64 = _b64url_encode(challenge if isinstance(challenge, (bytes, bytearray)) else bytes(challenge))
             challenge_id = REGISTRATION_DB.create_webauthn_challenge(
@@ -7498,6 +8367,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         user = REGISTRATION_DB.get_user_by_id(int(ch['user_id'])) if ch['user_id'] else None
         if not user:
             return self._send_json({'ok': False, 'error': 'Account not found.'}, 404)
+        if user['is_disabled'] or user['is_locked']:
+            return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 403)
         client_ip = self.client_address[0] if self.client_address else ''
         if not REGISTRATION_DB.is_ip_allowed(user['id'], client_ip):
             log.warning('WEBAUTHN auth blocked by IP allowlist user=%r ip=%s', user['username'], client_ip)
@@ -7514,7 +8385,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             except Exception:
                 continue
         try:
-            state = pickle.loads(base64.b64decode(ch['state_json']))
+            state = _webauthn_state_unpack(ch['state_json'])
+            if state is None:
+                log.warning('WEBAUTHN auth finish invalid challenge state challenge_id=%s', challenge_id)
+                return self._send_json({'ok': False, 'error': 'Authentication challenge expired or invalid.'}, 400)
             cred_id_b64 = str(cred.get('id', '')).strip()
             resp = cred.get('response', {}) if isinstance(cred.get('response'), dict) else {}
             client_data = CollectedClientData(_b64url_decode(str(resp.get('clientDataJSON', ''))))
@@ -7528,19 +8402,22 @@ class ManageHandler(BaseHTTPRequestHandler):
                 REGISTRATION_DB.touch_webauthn_credential(int(row['id']), int(auth_data.counter))
                 REGISTRATION_DB.set_webauthn_primary_credential(int(user['id']), int(row['id']))
             policy = _auth_factor_policy_for_user(user)
+            needs_tfa_challenge = bool(policy.get('tfa_challenge_required'))
             token = REGISTRATION_DB.create_session(
                 user['id'],
-                must_enroll_passkey=bool(policy.get('must_enroll_passkey'))
+                must_enroll_passkey=bool(policy.get('must_enroll_passkey')),
+                primary_auth_ok=not needs_tfa_challenge,
+                must_enroll_tfa=bool(policy.get('must_enroll_tfa')),
             )
             REGISTRATION_DB.record_login_ip(user['id'], client_ip)
             REGISTRATION_DB.daily_login_check(user['id'])
             REGISTRATION_DB._log(user['username'], 'webauthn_auth_success', user['username'],
                                  f'challenge_id={challenge_id}')
-            if policy.get('must_enroll_passkey'):
-                redirect = '/manage/passkey-enroll'
-            else:
-                delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
-                redirect = '/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard'
+            redirect = self._resolve_post_auth_redirect(
+                user, token, policy,
+                client_ip=client_ip,
+                user_agent=self.headers.get('User-Agent', '')
+            )
             self.send_response(200)
             self._set_session_cookie(token)
             if row and str(row['credential_id'] or '').strip():
@@ -7597,7 +8474,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             options = reg_data.get('publicKey', reg_data)
             challenge = options.get('challenge')
             challenge_b64 = _b64url_encode(challenge if isinstance(challenge, (bytes, bytearray)) else bytes(challenge))
-            state_blob = base64.b64encode(pickle.dumps(state)).decode('ascii')
+            state_blob = _webauthn_state_pack(state)
             challenge_id = REGISTRATION_DB.create_webauthn_challenge(
                 user['id'],
                 'register',
@@ -7636,7 +8513,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not server:
             return self._send_json({'ok': False, 'error': 'Unable to initialize WebAuthn server.'}, 500)
         try:
-            state = pickle.loads(base64.b64decode(ch['state_json']))
+            state = _webauthn_state_unpack(ch['state_json'])
+            if state is None:
+                log.warning('WEBAUTHN register finish invalid challenge state challenge_id=%s', challenge_id)
+                return self._send_json({'ok': False, 'error': 'Registration challenge expired or invalid.'}, 400)
             resp = cred.get('response', {}) if isinstance(cred.get('response'), dict) else {}
             client_data = CollectedClientData(_b64url_decode(str(resp.get('clientDataJSON', ''))))
             att_obj = AttestationObject(_b64url_decode(str(resp.get('attestationObject', ''))))
@@ -7661,7 +8541,6 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.set_user_webauthn_preferences(
                 user['id'],
                 enabled=True,
-                preferred=bool(user['webauthn_preferred']) if 'webauthn_preferred' in user.keys() else False,
                 required=bool(user['webauthn_required']) if 'webauthn_required' in user.keys() else False,
             )
             tok = self._current_valid_session_token()
@@ -7670,11 +8549,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB._log(user['username'], 'webauthn_register_finish', user['username'],
                                  f'challenge_id={challenge_id} cred={cred_id_b64[:14]}...')
             policy = _auth_factor_policy_for_user(REGISTRATION_DB.get_user_by_id(user['id']) or user)
-            if policy.get('must_enroll_passkey'):
-                redirect = '/manage/passkey-enroll'
-            else:
-                delete_challenge = REGISTRATION_DB.get_active_account_delete_challenge(user['id'])
-                redirect = '/manage/account/delete/confirm' if delete_challenge else '/manage/dashboard'
+            redirect = '/manage/tfa/setup' if policy.get('must_enroll_tfa') else (
+                '/manage/passkey-enroll' if policy.get('must_enroll_passkey') else
+                ('/manage/account/delete/confirm' if REGISTRATION_DB.get_active_account_delete_challenge(user['id']) else '/manage/dashboard')
+            )
             return self._send_json({'ok': True, 'message': 'Passkey registered.', 'redirect': redirect})
         except Exception as e:
             log.warning('WEBAUTHN register finish failed user=%s challenge_id=%s err=%s',
@@ -7687,28 +8565,39 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
-        admin_required = bool('webauthn_required_admin' in user.keys() and user['webauthn_required_admin'])
-        enabled = fields.get('webauthn_enabled') == '1'
-        preferred = fields.get('webauthn_preferred') == '1'
+        policy = _auth_factor_policy_for_user(user)
+        admin_required = _flag_true(user['webauthn_required_admin']) if ('webauthn_required_admin' in user.keys()) else False
+        server_policy_required = bool(policy.get('passkey_sitewide') or policy.get('passkey_admin_scope'))
+        enforced_policy_required = bool(server_policy_required or admin_required)
+        enabled_current = _flag_true(user['webauthn_enabled']) if ('webauthn_enabled' in user.keys()) else False
+        user_account_required = _flag_true(user['webauthn_required']) if ('webauthn_required' in user.keys()) else False
+        # Unchecked checkboxes are omitted from multipart payloads.
+        # Preserve current enabled state only when that control is effectively locked.
+        enabled_locked = bool(enforced_policy_required)
+        enabled = (fields.get('webauthn_enabled') == '1') if ('webauthn_enabled' in fields) else (enabled_current if enabled_locked else False)
         required = fields.get('webauthn_required') == '1'
         if required and not _webauthn_login_enabled():
             return self._redirect('/manage/profile?msg=Operator+must+enable+WebAuthn+login+before+requiring+passkeys.&msg_type=error')
-        if admin_required and not _webauthn_login_enabled():
-            return self._redirect('/manage/profile?msg=Admin-enforced+passkey+policy+requires+WebAuthn+login+to+remain+enabled.&msg_type=error')
-        if admin_required:
+        if enforced_policy_required and not _webauthn_login_enabled():
+            return self._redirect('/manage/profile?msg=Passkey+policy+requires+WebAuthn+login+to+remain+enabled.&msg_type=error')
+        if enforced_policy_required:
             enabled = True
+        if admin_required:
             required = True
         if required and not enabled:
-            required = False
-        REGISTRATION_DB.set_user_webauthn_preferences(user['id'], enabled, preferred, required)
+            return self._redirect('/manage/profile?msg=Enable+passkey+sign-in+before+requiring+passkey+login.&msg_type=error')
+        REGISTRATION_DB.set_user_webauthn_preferences(user['id'], enabled, required)
         REGISTRATION_DB._log(
             user['username'],
             'webauthn_preferences',
             user['username'],
-            f'enabled={int(enabled)} preferred={int(preferred)} required={int(required)} admin_required={1 if admin_required else 0}'
+            f'enabled={int(enabled)} required={int(required)} admin_required={1 if admin_required else 0} server_policy_required={1 if server_policy_required else 0} user_account_required={1 if user_account_required else 0}'
         )
         if admin_required:
             self._redirect('/manage/profile?msg=Passkey+preferences+saved.+Admin+policy+keeps+passkey+requirement+enabled.&msg_type=success')
+            return
+        if server_policy_required:
+            self._redirect('/manage/profile?msg=Passkey+preferences+saved.+Server+policy+keeps+passkey+sign-in+enabled.&msg_type=success')
             return
         self._redirect('/manage/profile?msg=Passkey+preferences+saved&msg_type=success')
 
@@ -8442,6 +9331,48 @@ class ManageHandler(BaseHTTPRequestHandler):
             back = '/manage/admin'
         self._redirect(back)
 
+    def _post_admin_set_user_tfa_required(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        is_super = user['username'] == SUPER_USER
+        if not (user['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
+        if not _tfa_login_enabled():
+            return self._redirect('/manage/admin?tab=settings&msg=Enable+TFA+login+before+enforcing+TFA.&msg_type=error')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target = fields.get('username', '').strip()
+        required = fields.get('required', '0') == '1'
+        if target and target != SUPER_USER:
+            REGISTRATION_DB.admin_set_user_tfa_required(target, required, user['username'])
+        ref = self.headers.get('Referer', '')
+        back = urllib.parse.urlparse(ref).path or '/manage/admin'
+        if not back.startswith('/manage'):
+            back = '/manage/admin'
+        self._redirect(back)
+
+    def _post_admin_reset_tfa(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        is_super = user['username'] == SUPER_USER
+        if not (user['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target_username = fields.get('username', '').strip()
+        target = REGISTRATION_DB.get_user(target_username) if target_username else None
+        if target and target['username'] != SUPER_USER:
+            REGISTRATION_DB.reset_user_tfa(int(target['id']), actor=user['username'])
+            REGISTRATION_DB._log(user['username'], 'admin_reset_tfa', target_username, 'totp_state_cleared=1')
+            log.warning('ADMIN reset tfa actor=%s target=%s', user['username'], target_username)
+        ref = self.headers.get('Referer', '')
+        back = urllib.parse.urlparse(ref).path or '/manage/admin'
+        if not back.startswith('/manage'):
+            back = '/manage/admin'
+        self._redirect(back)
+
     def _post_set_admin(self):
         user = self._get_session_user()
         if not user:
@@ -9084,6 +10015,27 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.set_setting('webauthn_login_enabled', login_enabled, user['username'])
             REGISTRATION_DB.set_setting('webauthn_enforce_sitewide', enforce_sitewide, user['username'])
             REGISTRATION_DB.set_setting('webauthn_enforce_admins', enforce_admins, user['username'])
+        elif form_id == 'tfa_settings':
+            login_enabled = '1' if fields.get('tfa_login_enabled') == '1' else '0'
+            enforce_sitewide = '1' if fields.get('tfa_enforce_sitewide') == '1' else '0'
+            enforce_admins = '1' if fields.get('tfa_enforce_admins') == '1' else '0'
+            if (enforce_sitewide == '1' or enforce_admins == '1') and login_enabled != '1':
+                return self._redirect('/manage/admin?tab=settings&msg=Enable+TFA+login+before+enabling+TFA+enforcement.&msg_type=error')
+            REGISTRATION_DB.set_setting('tfa_login_enabled', login_enabled, user['username'])
+            REGISTRATION_DB.set_setting('tfa_enforce_sitewide', enforce_sitewide, user['username'])
+            REGISTRATION_DB.set_setting('tfa_enforce_admins', enforce_admins, user['username'])
+            for key, default, lo, hi in [
+                ('tfa_totp_period_sec', '30', 15, 120),
+                ('tfa_totp_digits', '6', 6, 8),
+                ('tfa_totp_skew_steps', '1', 0, 5),
+                ('tfa_challenge_ttl_sec', '300', 60, 1800),
+                ('tfa_backup_codes_count', '10', 3, 20),
+            ]:
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except Exception:
+                    v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
         elif form_id == 'topup_settings':
             # PayPal webhook verification policy:
             # enforce=1 -> fail closed and require active env webhook ID when PayPal enabled
@@ -10317,13 +11269,19 @@ class ManageHandler(BaseHTTPRequestHandler):
         policy = _auth_factor_policy_for_user(user)
         token = REGISTRATION_DB.create_session(
             user['id'],
-            must_enroll_passkey=bool(policy.get('must_enroll_passkey'))
+            must_enroll_passkey=bool(policy.get('must_enroll_passkey')),
+            primary_auth_ok=not bool(policy.get('tfa_challenge_required')),
+            must_enroll_tfa=bool(policy.get('must_enroll_tfa')),
         )
         REGISTRATION_DB.record_login_ip(user['id'], self.client_address[0])
         REGISTRATION_DB._log(username, 'login', self.client_address[0])
         self.send_response(303)
         self._set_session_cookie(token)
-        self.send_header('Location', '/manage/passkey-enroll' if policy.get('must_enroll_passkey') else '/manage/dashboard')
+        self.send_header(
+            'Location',
+            '/manage/passkey-enroll' if policy.get('must_enroll_passkey')
+            else ('/manage/tfa/setup' if policy.get('must_enroll_tfa') else '/manage/dashboard')
+        )
         self.send_header('Content-Length', '0')
         self.end_headers()
 
@@ -10389,13 +11347,19 @@ class ManageHandler(BaseHTTPRequestHandler):
         policy = _auth_factor_policy_for_user(user)
         token = REGISTRATION_DB.create_session(
             user['id'],
-            must_enroll_passkey=bool(policy.get('must_enroll_passkey'))
+            must_enroll_passkey=bool(policy.get('must_enroll_passkey')),
+            primary_auth_ok=not bool(policy.get('tfa_challenge_required')),
+            must_enroll_tfa=bool(policy.get('must_enroll_tfa')),
         )
         REGISTRATION_DB.record_login_ip(user['id'], self.client_address[0])
         REGISTRATION_DB._log(username, 'login', self.client_address[0])
         self.send_response(303)
         self._set_session_cookie(token)
-        self.send_header('Location', '/manage/passkey-enroll' if policy.get('must_enroll_passkey') else '/manage/dashboard')
+        self.send_header(
+            'Location',
+            '/manage/passkey-enroll' if policy.get('must_enroll_passkey')
+            else ('/manage/tfa/setup' if policy.get('must_enroll_tfa') else '/manage/dashboard')
+        )
         self.send_header('Content-Length', '0')
         self.end_headers()
 
@@ -11523,16 +12487,20 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
         and REGISTRATION_DB.get_setting('webauthn_enforce_sitewide', '0') == '1'
     )
     passkey_primary_btn = ''
+    passkey_sitewide_divider = ''
     sign_in_btn_cls = 'btn btn-primary'
     sign_in_btn_style = 'width:100%;margin-top:8px'
     sign_in_btn_id = ''
+    passkey_secondary_btn_id = ''
+    black_btn_style = 'width:100%;margin-top:8px;background:#000;color:#fff;border-color:var(--border)'
     if passkey_sitewide:
         passkey_primary_btn = (
             '<button type="button" class="btn btn-primary" style="width:100%;margin-top:8px" '
             'onclick="startPasskeyLogin()">Sign in with Passkey</button>'
         )
+        passkey_sitewide_divider = '<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border)"></div>'
         sign_in_btn_cls = 'btn'
-        sign_in_btn_style = 'width:100%;margin-top:8px;background:#000;color:#fff;border-color:var(--border)'
+        sign_in_btn_style = black_btn_style
         sign_in_btn_id = ' id="sitewide-password-signin"'
     sitewide_hover_script = ''
     if passkey_sitewide:
@@ -11554,14 +12522,15 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
         )
         if passkey_sitewide:
             passkey_block = (
-                '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
+                '<div style="margin-top:12px">'
                 + passkey_controls +
                 '</div>'
             )
         else:
+            passkey_secondary_btn_id = ' id="passkey-secondary-signin"'
             passkey_block = (
                 '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
-                '<button type="button" class="btn btn-sm" style="width:100%" onclick="startPasskeyLogin()">Sign in with Passkey</button>'
+                f'<button type="button"{passkey_secondary_btn_id} class="btn" style="{black_btn_style}" onclick="startPasskeyLogin()">Sign in with Passkey</button>'
                 + passkey_controls +
                 '</div>'
             )
@@ -11642,10 +12611,19 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
           <input id="login-password" type="password" name="password" autocomplete="current-password" required>
         </div>
         ''' + passkey_primary_btn + '''
+        ''' + passkey_sitewide_divider + '''
         <button type="submit"''' + sign_in_btn_id + ''' class="''' + sign_in_btn_cls + '''" style="''' + sign_in_btn_style + '''">Sign In</button>
       </form>
       ''' + passkey_block + '''
       ''' + sitewide_hover_script + '''
+      <script>
+      (function(){
+        var p=document.getElementById("passkey-secondary-signin");
+        if(!p) return;
+        p.addEventListener("mouseenter",function(){p.style.borderColor="var(--accent)";p.style.color="var(--accent)";});
+        p.addEventListener("mouseleave",function(){p.style.borderColor="var(--border)";p.style.color="#fff";});
+      })();
+      </script>
     </div>
   </div>'''
     return _manage_page('Login', body, msg=msg, msg_type=msg_type)
@@ -11693,6 +12671,116 @@ def _render_passkey_enroll_page(user, msg: str = '', msg_type: str = 'error') ->
         '</div>'
     )
     return _manage_page('Passkey Enrollment Required', body, user=user, msg=msg, msg_type=msg_type)
+
+
+def _render_tfa_setup_page(user, msg: str = '', msg_type: str = 'error',
+                           backup_codes: list[str] | None = None,
+                           delete_flow_active: bool = False) -> str:
+    token = _session_token_for(user)
+    csrf = _csrf_token(token) if token else ''
+    secret = _totp_secret_generate()
+    label = urllib.parse.quote(f'Wildkat:{user["username"]}')
+    issuer = urllib.parse.quote('Wildkat')
+    otpauth_uri = f'otpauth://totp/{label}?secret={secret}&issuer={issuer}&algorithm=SHA1&digits=6&period=30'
+    qr_uri = _tfa_qr_data_uri(otpauth_uri)
+    already_enabled = bool(
+        ('tfa_enabled' in user.keys()) and user['tfa_enabled']
+        and ('tfa_secret_enc' in user.keys()) and (user['tfa_secret_enc'] or '').strip()
+    )
+    qr_block = ''
+    if qr_uri:
+        qr_block = (
+            '<div style="display:flex;justify-content:center;margin:8px 0 12px">'
+            f'<img src="{qr_uri}" alt="TOTP QR code for authenticator setup" '
+            'style="background:#fff;padding:8px;border-radius:8px;max-width:220px;max-height:220px">'
+            '</div>'
+        )
+    else:
+        qr_block = (
+            '<div style="font-size:0.8rem;color:var(--muted);margin:8px 0 12px">'
+            'QR rendering backend is unavailable on this server. Use the manual secret below.'
+            '</div>'
+        )
+    backup_block = ''
+    if backup_codes:
+        lines = ''.join(f'<li style="font-family:var(--mono)">{_h(c)}</li>' for c in backup_codes)
+        backup_block = (
+            '<div class="card" style="margin-top:14px;border-color:var(--accent)">'
+            '<div style="font-family:var(--mono);font-size:0.72rem;color:var(--accent);letter-spacing:0.08em;text-transform:uppercase;margin-bottom:10px">'
+            'Backup Codes (save now)</div>'
+            '<p style="margin:0 0 10px;color:var(--muted);font-size:0.86rem">Each code can be used once if your authenticator is unavailable.</p>'
+            f'<ul style="margin:0;padding-left:18px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 18px">{lines}</ul>'
+            '</div>'
+        )
+        if delete_flow_active:
+            backup_block += (
+                '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
+                '<a href="/manage/account/delete/confirm" class="btn btn-danger">Continue Deletion</a>'
+                '<a href="/manage/account/delete/cancel" class="btn btn-sm">Cancel Deletion</a>'
+                '</div>'
+            )
+    body = (
+        '<div style="max-width:700px;margin:40px auto">'
+        '<div class="page-title">Set Up Two-Factor Authentication</div>'
+        '<div class="page-sub">Google Authenticator compatible TOTP</div>'
+        '<div class="card">'
+        + ('<div style="padding:10px 12px;background:var(--accent)22;border:1px solid var(--accent);'
+           'border-radius:8px;color:var(--accent);margin-bottom:12px;font-size:0.88rem">'
+           'TFA is already configured on this account. Verifying and enabling again will replace your current authenticator setup.'
+           '</div>' if already_enabled else '')
+        +
+        '<p style="color:var(--muted);font-size:0.9rem">'
+        'Add this account in your authenticator app, then enter the 6-digit code to finish enrollment.'
+        '</p>'
+        + qr_block +
+        '<div style="display:grid;gap:10px;margin:12px 0">'
+        f'<div><strong>Account:</strong> {_h(user["username"])}</div>'
+        f'<div><strong>Secret:</strong> <span style="font-family:var(--mono)">{_h(secret)}</span></div>'
+        f'<div><strong>otpauth URI:</strong> <span style="font-family:var(--mono);font-size:0.8rem;word-break:break-all">{_h(otpauth_uri)}</span></div>'
+        '</div>'
+        '<form method="POST" action="/manage/tfa/setup/verify" style="display:flex;flex-direction:column;gap:10px">'
+        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+        f'<input type="hidden" name="secret" value="{_h(secret)}">'
+        '<div class="form-group">'
+        '<label>Authenticator code</label>'
+        '<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required>'
+        '</div>'
+        '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+        '<button class="btn btn-primary" type="submit">Verify and Enable TFA</button>'
+        '<a href="/manage/profile" class="btn btn-sm">Back to Profile</a>'
+        '</div>'
+        '</form>'
+        '</div>'
+        + backup_block +
+        '</div>'
+    )
+    return _manage_page('TFA Setup', body, user=user, msg=msg, msg_type=msg_type)
+
+
+def _render_tfa_challenge_page(user, msg: str = '', msg_type: str = 'error') -> str:
+    token = _session_token_for(user)
+    csrf = _csrf_token(token) if token else ''
+    body = (
+        '<div style="max-width:520px;margin:50px auto">'
+        '<div class="page-title">Two-Factor Verification</div>'
+        '<div class="page-sub">Enter your authenticator code to continue</div>'
+        '<div class="card">'
+        '<form method="POST" action="/manage/tfa/challenge" style="display:flex;flex-direction:column;gap:10px">'
+        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+        '<div class="form-group">'
+        '<label>Authenticator or backup code</label>'
+        '<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" '
+        'placeholder="123456 or backup code" autofocus required>'
+        '</div>'
+        '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+        '<button class="btn btn-primary" type="submit">Verify</button>'
+        '<a href="/manage/logout" class="btn btn-sm">Logout</a>'
+        '</div>'
+        '</form>'
+        '</div>'
+        '</div>'
+    )
+    return _manage_page('TFA Verify', body, user=user, msg=msg, msg_type=msg_type)
 
 
 def _render_account_delete_confirm_page(user, remaining_sec: int,
@@ -12202,8 +13290,36 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
             <input type="checkbox" name="webauthn_enforce_sitewide" value="1" {'checked' if settings.get('webauthn_enforce_sitewide','0')=='1' else ''}> Enforce passkey site-wide
           </label>
-          <div style="font-size:0.8rem;color:var(--muted);margin-bottom:16px">
-            TFA scaffold is enabled in backend architecture for future Google Authenticator rollout, but TFA login is not active yet.
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">Two-Factor Authentication (TOTP)</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Enable Google Authenticator compatible TOTP as a second factor.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="tfa_settings">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+            <input type="checkbox" name="tfa_login_enabled" value="1" {'checked' if settings.get('tfa_login_enabled','0')=='1' else ''}> Enable TFA login
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="tfa_enforce_admins" value="1" {'checked' if settings.get('tfa_enforce_admins','0')=='1' else ''}> Enforce TFA for Admin + Super accounts
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
+            <input type="checkbox" name="tfa_enforce_sitewide" value="1" {'checked' if settings.get('tfa_enforce_sitewide','0')=='1' else ''}> Enforce TFA site-wide
+          </label>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px">
+            <div class="form-group"><label>Period (sec)</label>
+              <input type="number" name="tfa_totp_period_sec" value="{settings.get('tfa_totp_period_sec','30')}" min="15" max="120"></div>
+            <div class="form-group"><label>Digits</label>
+              <input type="number" name="tfa_totp_digits" value="{settings.get('tfa_totp_digits','6')}" min="6" max="8"></div>
+            <div class="form-group"><label>Clock skew steps</label>
+              <input type="number" name="tfa_totp_skew_steps" value="{settings.get('tfa_totp_skew_steps','1')}" min="0" max="5"></div>
+            <div class="form-group"><label>Challenge TTL (sec)</label>
+              <input type="number" name="tfa_challenge_ttl_sec" value="{settings.get('tfa_challenge_ttl_sec','300')}" min="60" max="1800"></div>
+            <div class="form-group"><label>Backup codes</label>
+              <input type="number" name="tfa_backup_codes_count" value="{settings.get('tfa_backup_codes_count','10')}" min="3" max="20"></div>
           </div>
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
@@ -14643,18 +15759,24 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                 )
         if not _webauthn_rows:
             _webauthn_rows = '<tr><td colspan="4" class="empty">No passkeys registered</td></tr>'
-        _webauthn_enabled = ('webauthn_enabled' in viewer.keys() and viewer['webauthn_enabled'])
-        _webauthn_preferred = ('webauthn_preferred' in viewer.keys() and viewer['webauthn_preferred'])
-        _webauthn_required = ('webauthn_required' in viewer.keys() and viewer['webauthn_required'])
-        _webauthn_required_admin = ('webauthn_required_admin' in viewer.keys() and viewer['webauthn_required_admin'])
+        _webauthn_enabled = _flag_true(viewer['webauthn_enabled']) if ('webauthn_enabled' in viewer.keys()) else False
+        _webauthn_required = _flag_true(viewer['webauthn_required']) if ('webauthn_required' in viewer.keys()) else False
+        _webauthn_required_admin = _flag_true(viewer['webauthn_required_admin']) if ('webauthn_required_admin' in viewer.keys()) else False
         _webauthn_login_enabled = (REGISTRATION_DB.get_setting('webauthn_login_enabled', '0') == '1') if REGISTRATION_DB else False
+        _tfa_login_enabled = (REGISTRATION_DB.get_setting('tfa_login_enabled', '0') == '1') if REGISTRATION_DB else False
+        _tfa_enabled = _flag_true(viewer['tfa_enabled']) if ('tfa_enabled' in viewer.keys()) else False
+        _tfa_required = _flag_true(viewer['tfa_required']) if ('tfa_required' in viewer.keys()) else False
+        _tfa_required_admin = _flag_true(viewer['tfa_required_admin']) if ('tfa_required_admin' in viewer.keys()) else False
+        _tfa_has_secret = bool(('tfa_secret_enc' in viewer.keys()) and (viewer['tfa_secret_enc'] or '').strip())
+        _tfa_method = (viewer['tfa_method'] or '').strip().upper() if ('tfa_method' in viewer.keys()) else ''
         _sitewide_enforced = (REGISTRATION_DB.get_setting('webauthn_enforce_sitewide', '0') == '1') if REGISTRATION_DB else False
         _admin_scope_enforced = (
             REGISTRATION_DB.get_setting('webauthn_enforce_admins', '0') == '1'
             and _user_role(viewer) in ('admin', 'super')
         ) if REGISTRATION_DB else False
         _server_policy_enforced = bool(_sitewide_enforced or _admin_scope_enforced)
-        _effective_required = bool(_webauthn_required or _webauthn_required_admin)
+        _effective_required = bool(_webauthn_required or _webauthn_required_admin or _server_policy_enforced)
+        _enabled_disabled_attr = 'disabled' if (_webauthn_required_admin or _server_policy_enforced) else ''
         _required_disabled_attr = 'disabled' if (_webauthn_required_admin or _server_policy_enforced) else ''
         if _server_policy_enforced:
             _required_note = '<div class="muted" style="font-size:0.78rem;margin-top:4px">Server policy is enforcing passkey requirements.</div>'
@@ -14667,9 +15789,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<div style="font-size:0.85rem;color:var(--muted);margin-bottom:8px">Passkeys &amp; Security Keys</div>'
             + '<form method="POST" action="/manage/webauthn/preferences" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">'
             '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
-            f'<input type="checkbox" name="webauthn_enabled" value="1" {"checked" if _webauthn_enabled else ""}> Enable passkey sign-in</label>'
-            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
-            f'<input type="checkbox" name="webauthn_preferred" value="1" {"checked" if _webauthn_preferred else ""}> Prefer passkey on this account</label>'
+            f'<input type="checkbox" name="webauthn_enabled" value="1" {"checked" if _webauthn_enabled else ""} {_enabled_disabled_attr}> Enable passkey sign-in</label>'
             '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
             f'<input type="checkbox" name="webauthn_required" value="1" {"checked" if _effective_required else ""} {_required_disabled_attr}> Require passkey (password-only login blocked)</label>'
             + _required_note +
@@ -14709,13 +15829,57 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '</table></div>'
             '</div>'
         )
+        _tfa_policy_site = (_tfa_login_enabled and REGISTRATION_DB.get_setting('tfa_enforce_sitewide', '0') == '1') if REGISTRATION_DB else False
+        _tfa_policy_admin = (_tfa_login_enabled and REGISTRATION_DB.get_setting('tfa_enforce_admins', '0') == '1'
+                             and _user_role(viewer) in ('admin', 'super')) if REGISTRATION_DB else False
+        _tfa_server_policy = bool(_tfa_policy_site or _tfa_policy_admin)
+        _tfa_effective_required = bool(_tfa_required or _tfa_required_admin or _tfa_server_policy)
+        _tfa_required_disabled_attr = 'disabled' if (_tfa_required_admin or _tfa_server_policy) else ''
+        _tfa_policy_note = ''
+        if _tfa_policy_site:
+            _tfa_policy_note = '<div class="muted" style="font-size:0.78rem;margin-top:4px">Server policy is enforcing TFA requirements.</div>'
+        elif _tfa_policy_admin or _tfa_required_admin:
+            _tfa_policy_note = '<div class="muted" style="font-size:0.78rem;margin-top:4px">Account policy requires TFA for this user.</div>'
+        _tfa_status = 'Configured' if _tfa_has_secret else ('Enabled' if _tfa_enabled else 'Disabled')
+        if _tfa_enabled and _tfa_method:
+            _tfa_status += f' ({_h(_tfa_method)})'
+        _tfa_disable_form = ''
+        if _tfa_enabled:
+            _tfa_disable_form = (
+                '<form method="POST" action="/manage/tfa/disable" style="display:inline-block;margin-top:8px" '
+                'data-confirm="Remove TFA for this account? This will delete current authenticator setup and backup codes.">'
+                '<button class="btn btn-sm btn-danger" type="submit" style="height:30px;line-height:1;padding:0 12px;display:inline-flex;align-items:center">'
+                'Remove TFA</button>'
+                '</form>'
+            )
+        _tfa_setup_btn = (
+            '<a href="/manage/tfa/setup" class="btn btn-sm btn-green" '
+            'style="margin-top:8px;height:30px;line-height:1;padding:0 12px;display:inline-flex;align-items:center">Set Up TFA</a>'
+            if _tfa_login_enabled else ''
+        )
+        _tfa_card = (
+            '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
+            '<div style="font-size:0.85rem;color:var(--muted);margin-bottom:8px">Two-Factor Authentication (TOTP)</div>'
+            + ('<div style="font-size:0.82rem;color:var(--danger);margin-bottom:8px">TFA login is currently disabled by operator settings.</div>'
+               if not _tfa_login_enabled else '')
+            + f'<div style="font-size:0.86rem;color:var(--text);margin-bottom:8px">Status: <strong>{_h(_tfa_status)}</strong></div>'
+            + ('<form method="POST" action="/manage/tfa/preferences" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">'
+               '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+               f'<input type="checkbox" name="tfa_required" value="1" {"checked" if _tfa_effective_required else ""} {_tfa_required_disabled_attr}> Require TFA for this account</label>'
+               + _tfa_policy_note +
+               '<div><button type="submit" class="btn btn-sm">Save TFA Settings</button></div>'
+               '</form>' if _tfa_login_enabled else '')
+            + _tfa_setup_btn
+            + ('<span style="display:inline-block;width:8px"></span>' + _tfa_disable_form if _tfa_disable_form else '')
+            + '</div>'
+        )
         actions_card = (
             '<div style="display:flex;flex-direction:column;gap:24px">'
             '<div class="card"><div class="card-title">Actions</div>'
             '<div style="display:flex;flex-direction:column;gap:14px">'
-            '<div>'
-            '<a href="/manage/password" class="btn btn-primary">Change Password</a>'
-            '&nbsp; <a href="/manage/following" class="btn btn-sm">Followers</a>'
+            '<div style="display:flex;gap:8px;align-items:stretch;flex-wrap:wrap">'
+            '<a href="/manage/password" class="btn btn-primary" style="display:inline-flex;align-items:center;min-height:34px">Change Password</a>'
+            '<a href="/manage/following" class="btn btn-sm btn-green" style="display:inline-flex;align-items:center;min-height:34px">Followers</a>'
             '</div>'
             '</div>'
             '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
@@ -14766,6 +15930,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                '</form>')
             + '</div>'
             + _webauthn_card
+            + _tfa_card
             + '</div></div>'
             + _invite_html
             + _points_top
@@ -14828,6 +15993,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                 + hi + '<button class="btn btn-sm btn-danger">Delete User</button></form>'
             )
         _target_passkey_required = bool('webauthn_required_admin' in target_user.keys() and target_user['webauthn_required_admin'])
+        _target_tfa_required = bool('tfa_required_admin' in target_user.keys() and target_user['tfa_required_admin'])
         passkey_req_btn = ''
         if not t_is_super and viewer_role in ('admin', 'super'):
             if _target_passkey_required:
@@ -14844,12 +16010,35 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                     + hi + '<input type="hidden" name="required" value="1">'
                     + '<button class="btn btn-sm btn-green">Enforce Passkey</button></form>'
                 )
+        tfa_req_btn = ''
+        if not t_is_super and viewer_role in ('admin', 'super'):
+            if _target_tfa_required:
+                tfa_req_btn = (
+                    f'<form method="POST" action="/manage/admin/set-user-tfa-required" style="display:inline" '
+                    f'data-confirm="Make TFA optional for {uname_h}?">'
+                    + hi + '<input type="hidden" name="required" value="0">'
+                    + '<button class="btn btn-sm">TFA Optional</button></form>'
+                )
+            else:
+                tfa_req_btn = (
+                    f'<form method="POST" action="/manage/admin/set-user-tfa-required" style="display:inline" '
+                    f'data-confirm="Enforce TFA for {uname_h}?">'
+                    + hi + '<input type="hidden" name="required" value="1">'
+                    + '<button class="btn btn-sm btn-green">Enforce TFA</button></form>'
+                )
         webauthn_reset_btn = ''
         if not t_is_super and (is_super or viewer_role in ('admin', 'super')):
             webauthn_reset_btn = (
                 f'<form method="POST" action="/manage/admin/reset-webauthn" style="display:inline" '
                 f'data-confirm="Reset all passkeys for {uname_h} and allow password login recovery?">'
                 + hi + '<button class="btn btn-sm btn-danger">Reset Passkeys</button></form>'
+            )
+        tfa_reset_btn = ''
+        if not t_is_super and (is_super or viewer_role in ('admin', 'super')):
+            tfa_reset_btn = (
+                f'<form method="POST" action="/manage/admin/reset-tfa" style="display:inline" '
+                f'data-confirm="Reset TFA for {uname_h} and clear backup codes?">'
+                + hi + '<button class="btn btn-sm btn-danger">Reset TFA</button></form>'
             )
         hi_referer = '/manage/profile' if is_own_profile else '/manage/admin/user/' + uname_h
         max_grant  = int(REGISTRATION_DB.get_setting('admin_max_point_grant', '1000')) if REGISTRATION_DB else 1000
@@ -14884,7 +16073,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<div class="card"><div class="card-title">Actions</div>'
             + '<div style="display:flex;flex-direction:column;gap:14px">'
             + (('<div>' + pw_form + '</div>') if pw_form else '')
-            + (('<div style="display:flex;flex-wrap:wrap;gap:8px">' + unlock_btn + dis_btn + role_btns + passkey_req_btn + webauthn_reset_btn + del_btn + '</div>') if any([unlock_btn, dis_btn, role_btns, passkey_req_btn, webauthn_reset_btn, del_btn]) else '')
+            + (('<div style="display:flex;flex-wrap:wrap;gap:8px">' + unlock_btn + dis_btn + role_btns + passkey_req_btn + tfa_req_btn + webauthn_reset_btn + tfa_reset_btn + del_btn + '</div>') if any([unlock_btn, dis_btn, role_btns, passkey_req_btn, tfa_req_btn, webauthn_reset_btn, tfa_reset_btn, del_btn]) else '')
             + '<div style="display:flex;flex-wrap:wrap;gap:8px">'
             + credit_btns
             + '</div>'
@@ -15593,6 +16782,8 @@ def main():
                         help='Set/reset superuser password (service must be stopped)')
     parser.add_argument('--super-user-reset-passkeys', action='store_true',
                         help='Reset super-user passkeys and passkey-required flags, then exit')
+    parser.add_argument('--super-user-reset-tfa', action='store_true',
+                        help='Reset super-user TFA secret/backup-codes and TFA-required flag, then exit')
     parser.add_argument('--auth-break-glass', action='store_true',
                         help='Temporary startup override to bypass passkey enforcement gates')
     parser.add_argument('--manage-port', type=int, default=0,
@@ -15669,6 +16860,21 @@ def main():
         removed = db.reset_user_webauthn(int(u['id']))
         db.delete_sessions_for_user(int(u['id']))
         print(f'Superuser {args.super_user!r} passkeys reset. Removed credentials: {removed}. Sessions cleared.')
+        sys.exit(0)
+
+    # ── Super-user TFA reset (run offline, exits) ─────────
+    if args.super_user_reset_tfa:
+        if not args.super_user:
+            print('Error: --super-user-reset-tfa requires --super-user', file=sys.stderr)
+            sys.exit(1)
+        db = RegistrationDB(args.db)
+        u = db.get_user(args.super_user)
+        if not u:
+            print(f'Error: super user {args.super_user!r} not found in {args.db}', file=sys.stderr)
+            sys.exit(1)
+        db.reset_user_tfa(int(u['id']), actor='cli')
+        db.delete_sessions_for_user(int(u['id']))
+        print(f"Superuser {args.super_user!r} TFA reset. Sessions cleared.")
         sys.exit(0)
 
     # ── TLS / HTTPS ──────────────────────────────────────────
@@ -15812,6 +17018,10 @@ def main():
                     REGISTRATION_DB.expire_webauthn_challenges()
                 except Exception as _e:
                     log.warning('expire_webauthn_challenges failed (non-fatal): %s', _e)
+                try:
+                    REGISTRATION_DB.expire_tfa_challenges()
+                except Exception as _e:
+                    log.warning('expire_tfa_challenges failed (non-fatal): %s', _e)
             hashes = REGISTRY.all_hashes()
             total_peers = sum(
                 len(REGISTRY._torrents.get(h, {})) for h in hashes
