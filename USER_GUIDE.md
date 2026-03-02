@@ -730,6 +730,22 @@ The content returned at `/robots.txt`. By default, search engine crawlers are in
 | Upload max files | 1000 | Maximum files accepted in one upload batch |
 | Upload max per-file size | 10 MB | Maximum size for an individual `.torrent` file |
 
+### Stats Persistence
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Enable stats persistence | off | When enabled, tracker stats are periodically saved to SQLite and restored at startup |
+| Flush interval (seconds) | 300 | Persistence write interval. Allowed range: 30 to 3600 seconds |
+
+Behavior notes:
+
+- Stats persistence runs only in registration mode and only when this setting is enabled.
+- Restored daily data is date-aware:
+  - only today's row is loaded into **Today**
+  - only yesterday's row is loaded into **Yesterday**
+  - older rows are kept as historical daily totals
+- The **All Time** unique IP metric is a high-water value (highest unique IP count observed in a single day), not a stored all-time deduplicated IP identity set.
+
 ### Gravatar Integration
 
 | Setting | Default | Description |
