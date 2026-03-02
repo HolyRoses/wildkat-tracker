@@ -254,6 +254,9 @@ The Actions card contains:
     - Require passkey (password-only login blocked)
     - Add passkey
     - Rename/remove passkeys
+  - TFA (TOTP) settings:
+    - TFA setup page (`/manage/tfa/setup`) for Google Authenticator compatible enrollment
+    - Backup codes generated during setup (save once)
 
 ### Passkey Device Switching at Login
 
@@ -781,6 +784,47 @@ sudo -u tracker /opt/tracker/tracker_server.py \
 ```
 
 If your deployment uses a separate management TLS configuration, include the same TLS flags used by your service startup command.
+
+### TFA (TOTP) Settings and Super Recovery
+
+TFA login can be enabled and enforced from Settings.
+
+Available settings:
+
+- **Enable TFA login** — enables TOTP second-factor login
+- **Enforce TFA for Admin + Super accounts** — requires TFA for admin/super roles
+- **Enforce TFA site-wide** — requires TFA for all users
+- TOTP tuning values:
+  - period (seconds)
+  - digits
+  - allowed clock skew steps
+  - challenge TTL
+  - backup code count
+
+Enforcement behavior:
+
+- If enforcement applies and a user has not enrolled TFA, they are routed to `/manage/tfa/setup` after primary login.
+- If enforcement applies and a user has enrolled TFA, they are routed to `/manage/tfa/challenge` after primary login.
+- Admin user actions include:
+  - **Enforce TFA / TFA Optional**
+  - **Reset TFA** (clears TOTP secret and backup codes for account recovery)
+
+Superuser TFA recovery command:
+
+```bash
+sudo -u tracker /opt/tracker/tracker_server.py \
+  --registration \
+  --db /opt/tracker/tracker.db \
+  --super-user super \
+  --manage-port 443 \
+  --super-user-reset-tfa
+```
+
+What this does:
+
+- Clears TFA secret and backup codes for the super account
+- Clears active sessions for that account
+- Allows fresh password login and TFA re-enrollment
 
 ---
 
