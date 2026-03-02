@@ -61,6 +61,7 @@ import queue
 import urllib.parse
 import urllib.request
 import urllib.error
+from collections import deque
 from typing import Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -114,6 +115,8 @@ TFA_CHALLENGE_TTL_SECONDS = 300
 TFA_CHALLENGE_MAX_ATTEMPTS = 8
 TFA_CHALLENGE_BACKOFF_BASE_SECONDS = 2
 TFA_CHALLENGE_BACKOFF_MAX_SECONDS = 60
+AUTH_IP_RATE_WINDOW_SECONDS = 60
+AUTH_IP_RATE_MAX_REQUESTS = 30
 PEER_TTL            = 3600   # seconds before a peer is purged
 MAX_PEERS_PER_REPLY  = 200
 MAX_SCRAPE_HASHES    = 5      # max info_hashes per scrape request
@@ -151,6 +154,14 @@ try:
 except Exception:
     qrcode = None
     _TFA_QR_LIB_AVAILABLE = False
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    _TFA_FERNET_AVAILABLE = True
+except Exception:
+    Fernet = None
+    InvalidToken = Exception
+    _TFA_FERNET_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────
 # Bencode encoder  (decoder not needed – server only sends)
@@ -530,6 +541,11 @@ SUPER_USER         = ''
 _MANAGE_HTTPS_PORT = 0      # set in main() so /manage routes know the HTTPS port
 PEER_UPDATE_QUEUE  = None   # background queue for async peer snapshot refresh
 AUTH_BREAK_GLASS   = False  # startup override to bypass auth-factor enforcement gates
+AUTH_BREAK_GLASS_UNTIL_TS = 0.0
+
+_AUTH_RATE_LIMIT_LOCK = threading.Lock()
+_AUTH_RATE_LIMIT_HITS: dict[str, deque[float]] = {}
+_TFA_FERNET_INIT_ERROR = ''
 
 # ─────────────────────────────────────────────────────────────
 # Bencode decoder  (for .torrent parsing)
@@ -665,16 +681,22 @@ def _totp_code(secret_b32: str, ts: int | None = None, period: int = 30, digits:
 
 def _totp_verify(secret_b32: str, code: str, period: int = 30, digits: int = 6,
                  skew_steps: int = 1, ts: int | None = None) -> bool:
+    return _totp_verify_counter(secret_b32, code, period=period, digits=digits, skew_steps=skew_steps, ts=ts) is not None
+
+
+def _totp_verify_counter(secret_b32: str, code: str, period: int = 30, digits: int = 6,
+                         skew_steps: int = 1, ts: int | None = None) -> tuple[int, int] | None:
     cand = re.sub(r'\s+', '', (code or '').strip())
     if not cand.isdigit():
-        return False
+        return None
     now = int(ts if ts is not None else time.time())
     skew = max(0, min(5, int(skew_steps)))
     step = max(15, min(120, int(period)))
+    now_counter = now // step
     for i in range(-skew, skew + 1):
         if hmac.compare_digest(_totp_code(secret_b32, ts=now + (i * step), period=step, digits=digits), cand):
-            return True
-    return False
+            return now_counter + i, i
+    return None
 
 
 def _tfa_generate_backup_codes(count: int = 10) -> list[str]:
@@ -687,11 +709,13 @@ def _tfa_generate_backup_codes(count: int = 10) -> list[str]:
     return out
 
 
-def _tfa_hash_backup_code(code: str) -> str:
+def _tfa_hash_backup_code(code: str, salt: str = '') -> str:
     norm = re.sub(r'[^A-Za-z0-9]', '', (code or '')).upper()
     if not norm:
         return ''
-    return hashlib.sha256(norm.encode('utf-8')).hexdigest()
+    if not salt:
+        return hashlib.sha256(norm.encode('utf-8')).hexdigest()
+    return hashlib.sha256(f'{salt.strip()}:{norm}'.encode('utf-8')).hexdigest()
 
 
 def _tfa_qr_data_uri(otpauth_uri: str) -> str:
@@ -963,6 +987,75 @@ def _seconds_until_iso(ts: str) -> int:
     return int(left + 0.999)
 
 
+def _auth_break_glass_active() -> bool:
+    global AUTH_BREAK_GLASS
+    if not AUTH_BREAK_GLASS:
+        return False
+    if AUTH_BREAK_GLASS_UNTIL_TS > 0 and time.time() >= AUTH_BREAK_GLASS_UNTIL_TS:
+        AUTH_BREAK_GLASS = False
+        log.warning('AUTH BREAK-GLASS expired automatically.')
+        if REGISTRATION_DB:
+            try:
+                REGISTRATION_DB._log('system', 'break_glass_expired', '',
+                                     f'ttl_expired_at={datetime.datetime.now().isoformat(timespec="seconds")}')
+            except Exception:
+                pass
+        return False
+    return True
+
+
+def _auth_rate_limit_allow(bucket: str, ip: str, limit: int = AUTH_IP_RATE_MAX_REQUESTS,
+                           window_sec: int = AUTH_IP_RATE_WINDOW_SECONDS) -> bool:
+    key = f'{bucket}:{(ip or "-").strip()}'
+    now = time.time()
+    cutoff = now - max(1, int(window_sec))
+    with _AUTH_RATE_LIMIT_LOCK:
+        dq = _AUTH_RATE_LIMIT_HITS.get(key)
+        if dq is None:
+            dq = deque()
+            _AUTH_RATE_LIMIT_HITS[key] = dq
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= max(1, int(limit)):
+            return False
+        dq.append(now)
+    return True
+
+
+def _build_tfa_fernet():
+    global _TFA_FERNET_INIT_ERROR
+    _TFA_FERNET_INIT_ERROR = ''
+    if not _TFA_FERNET_AVAILABLE:
+        _TFA_FERNET_INIT_ERROR = 'cryptography.fernet backend unavailable'
+        return None
+    raw = (os.getenv('WK_TFA_SECRET_KEY', '') or '').strip()
+    if not raw:
+        return None
+    try:
+        key_bytes = raw.encode('ascii')
+        key = b''
+        # If already base64-decodable, require exact Fernet key material length.
+        try:
+            padding = '=' * ((4 - (len(raw) % 4)) % 4)
+            decoded = base64.urlsafe_b64decode((raw + padding).encode('ascii'))
+            if len(decoded) != 32:
+                _TFA_FERNET_INIT_ERROR = (
+                    f'WK_TFA_SECRET_KEY decoded length invalid ({len(decoded)} bytes; expected 32)'
+                )
+                log.error(_TFA_FERNET_INIT_ERROR)
+                return None
+            key = base64.urlsafe_b64encode(decoded)
+        except Exception:
+            # Non-base64 input is treated as passphrase material and derived to 32 bytes.
+            digest = hashlib.sha256(raw.encode('utf-8')).digest()
+            key = base64.urlsafe_b64encode(digest)
+        return Fernet(key)
+    except Exception as e:
+        _TFA_FERNET_INIT_ERROR = f'WK_TFA_SECRET_KEY initialization failed: {e}'
+        log.error(_TFA_FERNET_INIT_ERROR)
+        return None
+
+
 def _nested_get(obj, path: list[str], default=''):
     cur = obj
     for p in path:
@@ -1078,6 +1171,10 @@ class RegistrationDB:
         self._local = threading.local()
         self._restore_lock = threading.Lock()
         self._restore_gen  = 0   # incremented on every restore; forces conn reopen
+        self._tfa_fernet = _build_tfa_fernet()
+        if (os.getenv('WK_TFA_SECRET_KEY', '') or '').strip() and not self._tfa_fernet:
+            err = _TFA_FERNET_INIT_ERROR or 'WK_TFA_SECRET_KEY is set but invalid'
+            log.error('TFA encryption key invalid: %s', err)
         self._init_schema()
 
     def _conn(self) -> sqlite3.Connection:
@@ -1671,6 +1768,11 @@ class RegistrationDB:
         except Exception:
             pass  # column already exists
         try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN tfa_last_counter INTEGER NOT NULL DEFAULT -1')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
             self._conn().execute('ALTER TABLE users ADD COLUMN tfa_recovery_locked INTEGER NOT NULL DEFAULT 0')
             self._conn().commit()
         except Exception:
@@ -1800,6 +1902,7 @@ class RegistrationDB:
             'webauthn_login_enabled':       '0',
             'webauthn_enforce_sitewide':    '0',
             'webauthn_enforce_admins':      '0',
+            'webauthn_rp_id':               '',
             # TFA scaffolding (future Google Authenticator rollout)
             'tfa_login_enabled':            '0',
             'tfa_enforce_sitewide':         '0',
@@ -4507,7 +4610,7 @@ class RegistrationDB:
         """Return user row if session token is valid and not expired."""
         now = datetime.datetime.now().isoformat(timespec='seconds')
         row = self._conn().execute(
-            'SELECT user_id FROM sessions WHERE token=? AND expires_at>?',
+            'SELECT user_id,created_at FROM sessions WHERE token=? AND expires_at>?',
             (token, now)
         ).fetchone()
         if row is None:
@@ -4519,6 +4622,19 @@ class RegistrationDB:
         if user['is_disabled'] or user['is_locked']:
             self.delete_session(token)
             return None
+        # Sessions created before TFA enrollment should not remain valid once
+        # TFA is required+configured (prevents stale pre-MFA sessions).
+        if not _auth_break_glass_active():
+            try:
+                tfa_required = bool(
+                    _flag_true(user['tfa_required']) or _flag_true(user['tfa_required_admin'])
+                )
+                enrolled_at = (user['tfa_enrolled_at'] or '').strip() if 'tfa_enrolled_at' in user.keys() else ''
+                if tfa_required and enrolled_at and (row['created_at'] or '') < enrolled_at:
+                    self.delete_session(token)
+                    return None
+            except Exception:
+                pass
         return user
 
     def has_active_session(self, user_id: int) -> bool:
@@ -4749,7 +4865,7 @@ class RegistrationDB:
             c.execute(
                 '''UPDATE users
                    SET tfa_method='', tfa_enrolled_at=NULL, tfa_secret_enc='', tfa_secret_ver=0,
-                       tfa_backup_codes_hash='', tfa_backup_codes_remaining=0, tfa_last_verified_at=NULL
+                       tfa_backup_codes_hash='', tfa_backup_codes_remaining=0, tfa_last_verified_at=NULL, tfa_last_counter=-1
                    WHERE id=?''',
                 (user_id,)
             )
@@ -4988,16 +5104,85 @@ class RegistrationDB:
         text = (secret_b32 or '').strip()
         if not text:
             return ''
-        return base64.urlsafe_b64encode(text.encode('utf-8')).decode('ascii')
+        if self._tfa_fernet:
+            try:
+                token = self._tfa_fernet.encrypt(text.encode('utf-8')).decode('ascii')
+                return f'enc:v2:{token}'
+            except Exception:
+                pass
+        # Backward-compatible fallback when encryption backend/key is unavailable.
+        return 'plain:v1:' + base64.urlsafe_b64encode(text.encode('utf-8')).decode('ascii')
 
     def _decode_tfa_secret(self, encoded: str) -> str:
         raw = (encoded or '').strip()
         if not raw:
             return ''
+        if raw.startswith('enc:v2:'):
+            if not self._tfa_fernet:
+                return ''
+            try:
+                return self._tfa_fernet.decrypt(raw[len('enc:v2:'):].encode('ascii')).decode('utf-8')
+            except (InvalidToken, Exception):
+                return ''
+        if raw.startswith('plain:v1:'):
+            raw = raw[len('plain:v1:'):]
         try:
             return base64.urlsafe_b64decode(raw.encode('ascii')).decode('utf-8')
         except Exception:
             return ''
+
+    def get_user_tfa_last_counter(self, user_id: int) -> int:
+        row = self._conn().execute(
+            'SELECT tfa_last_counter FROM users WHERE id=?',
+            (user_id,)
+        ).fetchone()
+        if not row:
+            return -1
+        try:
+            return int(row['tfa_last_counter'])
+        except Exception:
+            return -1
+
+    def reserve_user_tfa_totp_counter(self, user_id: int, counter: int) -> bool:
+        """Atomically reserve a strictly newer TOTP counter for this user."""
+        cur = self._conn().execute(
+            '''UPDATE users
+               SET tfa_last_verified_at=?, tfa_last_counter=?
+               WHERE id=? AND COALESCE(tfa_last_counter, -1) < ?''',
+            (self._ts(), int(counter), user_id, int(counter))
+        )
+        self._conn().commit()
+        return bool(cur.rowcount)
+
+    def migrate_legacy_tfa_secrets(self, actor: str = 'system') -> tuple[int, int]:
+        """Re-encrypt legacy plain/base64 TFA secrets into enc:v2 format."""
+        if not self._tfa_fernet:
+            return 0, 0
+        c = self._conn()
+        rows = c.execute(
+            "SELECT id,tfa_secret_enc FROM users WHERE tfa_secret_enc IS NOT NULL AND TRIM(tfa_secret_enc)<>''"
+        ).fetchall()
+        migrated = 0
+        for row in rows:
+            raw = (row['tfa_secret_enc'] or '').strip()
+            if not raw or raw.startswith('enc:v2:'):
+                continue
+            secret = self._decode_tfa_secret(raw)
+            if not re.fullmatch(r'[A-Z2-7]{16,128}', secret or ''):
+                continue
+            new_val = self._encode_tfa_secret(secret)
+            if not new_val.startswith('enc:v2:'):
+                continue
+            c.execute('UPDATE users SET tfa_secret_enc=?, tfa_secret_ver=2 WHERE id=?',
+                      (new_val, int(row['id'])))
+            migrated += 1
+        c.commit()
+        remaining = int(c.execute(
+            "SELECT COUNT(*) FROM users WHERE tfa_secret_enc IS NOT NULL AND TRIM(tfa_secret_enc)<>'' AND tfa_secret_enc NOT LIKE 'enc:v2:%'"
+        ).fetchone()[0])
+        if migrated > 0 or remaining > 0:
+            self._log(actor, 'tfa_secret_migration', '', f'migrated={migrated} remaining={remaining}')
+        return migrated, remaining
 
     def get_user_tfa_secret(self, user_id: int) -> str:
         row = self._conn().execute(
@@ -5011,12 +5196,18 @@ class RegistrationDB:
         secret_enc = self._encode_tfa_secret(secret_b32)
         if not secret_enc:
             return False
-        code_hashes = [_tfa_hash_backup_code(c) for c in (backup_codes_plain or []) if _tfa_hash_backup_code(c)]
+        code_hashes = []
+        for code in (backup_codes_plain or []):
+            norm = re.sub(r'[^A-Za-z0-9]', '', (code or '')).upper()
+            if not norm:
+                continue
+            salt = secrets.token_hex(8)
+            code_hashes.append(f'v2${salt}${_tfa_hash_backup_code(norm, salt=salt)}')
         now = self._ts()
         self._conn().execute(
             '''UPDATE users
                SET tfa_enabled=1, tfa_method=?, tfa_enrolled_at=?, tfa_secret_enc=?, tfa_secret_ver=1,
-                   tfa_backup_codes_hash=?, tfa_backup_codes_remaining=?, tfa_last_verified_at=?, tfa_recovery_locked=0
+                   tfa_backup_codes_hash=?, tfa_backup_codes_remaining=?, tfa_last_verified_at=?, tfa_last_counter=-1, tfa_recovery_locked=0
                WHERE id=?''',
             (method[:20], now, secret_enc, json.dumps(code_hashes), len(code_hashes), now, user_id)
         )
@@ -5036,7 +5227,7 @@ class RegistrationDB:
         c.execute(
             '''UPDATE users
                SET tfa_enabled=0, tfa_method='', tfa_enrolled_at=NULL, tfa_secret_enc='', tfa_secret_ver=0,
-                   tfa_backup_codes_hash='', tfa_backup_codes_remaining=0, tfa_last_verified_at=NULL, tfa_recovery_locked=0
+                   tfa_backup_codes_hash='', tfa_backup_codes_remaining=0, tfa_last_verified_at=NULL, tfa_last_counter=-1, tfa_recovery_locked=0
                WHERE id=?''',
             (user_id,)
         )
@@ -5045,8 +5236,8 @@ class RegistrationDB:
         self.record_tfa_recovery_event(user_id, actor, 'admin_reset', detail[:255], '')
 
     def verify_and_consume_tfa_backup_code(self, user_id: int, code: str) -> bool:
-        code_hash = _tfa_hash_backup_code(code)
-        if not code_hash:
+        norm = re.sub(r'[^A-Za-z0-9]', '', (code or '')).upper()
+        if not norm:
             return False
         c = self._conn()
         row = c.execute(
@@ -5059,9 +5250,25 @@ class RegistrationDB:
             hashes = json.loads(row['tfa_backup_codes_hash'] or '[]')
         except Exception:
             hashes = []
-        if code_hash not in hashes:
+        match_index = -1
+        for idx, stored in enumerate(hashes):
+            s = str(stored or '').strip()
+            candidate = ''
+            expected = ''
+            if s.startswith('v2$'):
+                parts = s.split('$', 2)
+                if len(parts) == 3:
+                    salt = parts[1]
+                    expected = parts[2]
+                    candidate = _tfa_hash_backup_code(norm, salt=salt)
+            else:
+                expected = s
+                candidate = _tfa_hash_backup_code(norm)
+            if expected and candidate and hmac.compare_digest(candidate, expected) and match_index < 0:
+                match_index = idx
+        if match_index < 0:
             return False
-        hashes = [h for h in hashes if h != code_hash]
+        hashes = [h for i, h in enumerate(hashes) if i != match_index]
         c.execute(
             'UPDATE users SET tfa_backup_codes_hash=?, tfa_backup_codes_remaining=?, tfa_last_verified_at=? WHERE id=?',
             (json.dumps(hashes), len(hashes), self._ts(), user_id)
@@ -6876,7 +7083,7 @@ def _flag_true(val) -> bool:
 def _auth_factor_policy_for_user(user) -> dict:
     """Centralized auth-factor policy resolver for passkey + TFA requirements."""
     out = {
-        'break_glass': bool(AUTH_BREAK_GLASS),
+        'break_glass': _auth_break_glass_active(),
         'passkey_required': False,
         'passkey_user_required': False,
         'passkey_sitewide': False,
@@ -6892,7 +7099,7 @@ def _auth_factor_policy_for_user(user) -> dict:
         'must_enroll_tfa': False,
         'tfa_challenge_required': False,
     }
-    if not user or not REGISTRATION_DB or AUTH_BREAK_GLASS:
+    if not user or not REGISTRATION_DB or _auth_break_glass_active():
         return out
     role = _user_role(user)
     sitewide = (REGISTRATION_DB.get_setting('webauthn_enforce_sitewide', '0') == '1')
@@ -7332,7 +7539,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         return getattr(self, '_valid_token', '') or self._get_session_token()
 
     def _session_requires_passkey_enroll(self) -> bool:
-        if AUTH_BREAK_GLASS:
+        if _auth_break_glass_active():
             return False
         if not REGISTRATION_DB:
             return False
@@ -7342,7 +7549,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         return REGISTRATION_DB.session_requires_passkey_enroll(token)
 
     def _session_requires_tfa_enroll(self) -> bool:
-        if AUTH_BREAK_GLASS:
+        if _auth_break_glass_active():
             return False
         if not REGISTRATION_DB:
             return False
@@ -7352,24 +7559,52 @@ class ManageHandler(BaseHTTPRequestHandler):
         return REGISTRATION_DB.session_requires_tfa_enroll(token)
 
     def _session_requires_tfa_challenge(self) -> bool:
-        if AUTH_BREAK_GLASS:
+        if _auth_break_glass_active():
             return False
         if not REGISTRATION_DB:
             return False
         token = self._current_valid_session_token()
         if not token:
             return False
+        if REGISTRATION_DB.session_primary_auth_ok(token):
+            return False
         challenge_id = REGISTRATION_DB.get_session_pending_tfa_challenge_id(token)
         if challenge_id <= 0:
-            return False
+            # Missing pending challenge while primary auth is incomplete should never
+            # grant access. Recreate challenge to keep enforcement intact.
+            user = self._get_session_user()
+            if not user:
+                return False
+            ttl_sec = int(REGISTRATION_DB.get_setting('tfa_challenge_ttl_sec', str(TFA_CHALLENGE_TTL_SECONDS)) or TFA_CHALLENGE_TTL_SECONDS)
+            new_ch_id, _ = REGISTRATION_DB.create_tfa_challenge(
+                int(user['id']),
+                flow_type='login',
+                ttl_seconds=ttl_sec,
+                client_ip=self.client_address[0] if self.client_address else '',
+                user_agent=self.headers.get('User-Agent', ''),
+            )
+            REGISTRATION_DB.set_session_pending_tfa_challenge(token, new_ch_id)
+            return True
         ch = REGISTRATION_DB.get_tfa_challenge_by_id(challenge_id, 'login')
         if not ch:
-            REGISTRATION_DB.set_session_pending_tfa_challenge(token, None)
-            return False
+            # Expired challenge: regenerate, never silently drop the gate.
+            user = self._get_session_user()
+            if not user:
+                return False
+            ttl_sec = int(REGISTRATION_DB.get_setting('tfa_challenge_ttl_sec', str(TFA_CHALLENGE_TTL_SECONDS)) or TFA_CHALLENGE_TTL_SECONDS)
+            new_ch_id, _ = REGISTRATION_DB.create_tfa_challenge(
+                int(user['id']),
+                flow_type='login',
+                ttl_seconds=ttl_sec,
+                client_ip=self.client_address[0] if self.client_address else '',
+                user_agent=self.headers.get('User-Agent', ''),
+            )
+            REGISTRATION_DB.set_session_pending_tfa_challenge(token, new_ch_id)
+            return True
         return True
 
     def _session_has_active_delete_challenge(self) -> bool:
-        if AUTH_BREAK_GLASS:
+        if _auth_break_glass_active():
             return False
         if not REGISTRATION_DB:
             return False
@@ -7690,16 +7925,19 @@ class ManageHandler(BaseHTTPRequestHandler):
         # all candidates so the valid one matches regardless of order.
         _no_csrf = ('/manage/login', '/manage/signup', '/manage',
                     '/manage/messages/typing', '/coinbase/webhook', '/paypal/webhook',
-                    '/manage/webauthn/auth/start', '/manage/webauthn/auth/finish',
-                    '/manage/webauthn/register/start', '/manage/webauthn/register/finish')
+                    '/manage/webauthn/auth/start', '/manage/webauthn/auth/finish')
         if path not in _no_csrf:
             raw_cookie = self.headers.get('Cookie', '')
             session_candidates = [p.strip()[10:] for p in raw_cookie.split(';')
                                   if p.strip().startswith('wksession=')]
             if session_candidates:
-                body = self._read_body()
-                fields, _ = _parse_multipart(self.headers, body)
-                submitted = fields.get('_csrf', '')
+                submitted = (self.headers.get('X-CSRF-Token', '') or '').strip()
+                if not submitted:
+                    content_type = (self.headers.get('Content-Type', '') or '').lower()
+                    if 'application/json' not in content_type:
+                        body = self._read_body()
+                        fields, _ = _parse_multipart(self.headers, body)
+                        submitted = fields.get('_csrf', '')
                 # Accept if ANY candidate session produces the right CSRF token
                 csrf_ok = any(
                     hmac.compare_digest(_csrf_token(t), submitted)
@@ -8020,9 +8258,20 @@ class ManageHandler(BaseHTTPRequestHandler):
         pending_id = REGISTRATION_DB.get_session_pending_tfa_challenge_id(token) if token else 0
         ch = REGISTRATION_DB.get_tfa_challenge_by_id(pending_id, 'login') if pending_id else None
         if not ch:
-            if token:
+            if token and REGISTRATION_DB.session_primary_auth_ok(token):
                 REGISTRATION_DB.set_session_pending_tfa_challenge(token, None)
-            return self._redirect('/manage/dashboard')
+                return self._redirect('/manage/dashboard')
+            if token:
+                ttl_sec = int(REGISTRATION_DB.get_setting('tfa_challenge_ttl_sec', str(TFA_CHALLENGE_TTL_SECONDS)) or TFA_CHALLENGE_TTL_SECONDS)
+                new_id, _ = REGISTRATION_DB.create_tfa_challenge(
+                    int(user['id']),
+                    flow_type='login',
+                    ttl_seconds=ttl_sec,
+                    client_ip=self.client_address[0] if self.client_address else '',
+                    user_agent=self.headers.get('User-Agent', '')
+                )
+                REGISTRATION_DB.set_session_pending_tfa_challenge(token, new_id)
+            return self._redirect('/manage/tfa/challenge')
         msg = ''
         msg_type = 'error'
         try:
@@ -8071,11 +8320,24 @@ class ManageHandler(BaseHTTPRequestHandler):
         skew = int(REGISTRATION_DB.get_setting('tfa_totp_skew_steps', '1') or 1)
         if not re.fullmatch(r'[A-Z2-7]{16,128}', secret):
             return self._send_html(_render_tfa_setup_page(user, msg='Invalid TOTP secret payload.', msg_type='error'))
-        if not _totp_verify(secret, code, period=period, digits=digits, skew_steps=skew):
+        setup_match = _totp_verify_counter(secret, code, period=period, digits=digits, skew_steps=skew)
+        if setup_match is None:
             return self._send_html(_render_tfa_setup_page(user, msg='Invalid authenticator code. Try again.', msg_type='error'))
+        if not REGISTRATION_DB._tfa_fernet:
+            return self._send_html(_render_tfa_setup_page(
+                user,
+                msg='TFA secret encryption key is not configured on this server.',
+                msg_type='error'
+            ))
+        setup_counter, setup_offset = setup_match
+        # Persist the current time-step counter (not the raw matched skew window):
+        # - blocks same-window alternate-code reuse after a back-skew match
+        # - avoids next-step lockout after a +1 future-skew match
+        persist_counter = int(setup_counter - setup_offset)
         backup_count = int(REGISTRATION_DB.get_setting('tfa_backup_codes_count', '10') or 10)
         backup_codes = _tfa_generate_backup_codes(backup_count)
         REGISTRATION_DB.set_user_tfa_enrollment(int(user['id']), secret, backup_codes, method='totp')
+        REGISTRATION_DB.reserve_user_tfa_totp_counter(int(user['id']), persist_counter)
         token = self._current_valid_session_token()
         if token:
             REGISTRATION_DB.set_session_tfa_enroll(token, False)
@@ -8093,6 +8355,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         user = self._get_session_user()
         if not user:
             return self._redirect('/manage')
+        client_ip = self.client_address[0] if self.client_address else ''
+        if not _auth_rate_limit_allow('tfa_challenge', client_ip):
+            q = urllib.parse.quote('Too many verification attempts. Please wait and try again.')
+            return self._redirect(f'/manage/tfa/challenge?msg={q}&msg_type=error')
         token = self._current_valid_session_token()
         if not token:
             return self._redirect('/manage')
@@ -8100,7 +8366,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         challenge = REGISTRATION_DB.get_tfa_challenge_by_id(pending_id, 'login') if pending_id else None
         if not challenge:
             REGISTRATION_DB.set_session_pending_tfa_challenge(token, None)
-            return self._redirect('/manage/dashboard')
+            REGISTRATION_DB.delete_session(token)
+            return self._redirect('/manage?msg=session_expired')
         wait_left = REGISTRATION_DB.get_tfa_challenge_wait_seconds(int(challenge['id']))
         if wait_left > 0:
             q = urllib.parse.quote(f'Too many attempts. Wait {wait_left}s and try again.')
@@ -8114,13 +8381,32 @@ class ManageHandler(BaseHTTPRequestHandler):
         secret = REGISTRATION_DB.get_user_tfa_secret(int(user['id']))
         ok = False
         used_backup = False
-        if secret and _totp_verify(secret, code, period=period, digits=digits, skew_steps=skew):
-            ok = True
-        elif REGISTRATION_DB.verify_and_consume_tfa_backup_code(int(user['id']), code):
+        used_counter = None
+        used_offset = 0
+        if secret:
+            used_match = _totp_verify_counter(secret, code, period=period, digits=digits, skew_steps=skew)
+            if used_match is not None:
+                used_counter, used_offset = used_match
+                # Persist current time-step counter (used_counter - offset).
+                # This blocks same-window alternate-code reuse and avoids +1 lockout.
+                persist_counter = int(used_counter - used_offset)
+                if REGISTRATION_DB.reserve_user_tfa_totp_counter(int(user['id']), persist_counter):
+                    ok = True
+                else:
+                    log.warning('TFA challenge replay blocked user=%s challenge_id=%s counter=%s',
+                                user['username'], challenge['id'], used_counter)
+        if (not ok) and REGISTRATION_DB.verify_and_consume_tfa_backup_code(int(user['id']), code):
             ok = True
             used_backup = True
         if not ok:
             attempts, wait = REGISTRATION_DB.register_tfa_challenge_failure(int(challenge['id']))
+            if attempts >= TFA_CHALLENGE_MAX_ATTEMPTS:
+                REGISTRATION_DB.consume_tfa_challenge(int(challenge['id']))
+                REGISTRATION_DB.delete_session(token)
+                log.warning('TFA challenge exhausted user=%s challenge_id=%s attempts=%s',
+                            user['username'], challenge['id'], attempts)
+                q = urllib.parse.quote('Too many invalid codes. Please sign in again.')
+                return self._redirect(f'/manage?msg={q}&msg_type=error')
             log.warning('TFA challenge failed user=%s challenge_id=%s attempts=%s backoff_sec=%s',
                         user['username'], challenge['id'], attempts, wait)
             q = urllib.parse.quote(f'Invalid authenticator or backup code. Try again in {wait}s.')
@@ -8128,7 +8414,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         REGISTRATION_DB.clear_tfa_challenge_failures(int(challenge['id']))
         REGISTRATION_DB.consume_tfa_challenge(int(challenge['id']))
         REGISTRATION_DB.mark_session_tfa_verified(token)
-        REGISTRATION_DB.touch_user_tfa_verified(int(user['id']))
+        if used_backup:
+            REGISTRATION_DB.touch_user_tfa_verified(int(user['id']))
         REGISTRATION_DB._log(user['username'], 'tfa_challenge_success', user['username'],
                              'backup=1' if used_backup else 'backup=0')
         if self._session_requires_passkey_enroll():
@@ -8183,6 +8470,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         username = fields.get('username', '').strip()
         password = fields.get('password', '')
         client_ip = self.client_address[0]
+        if not _auth_rate_limit_allow('login', client_ip):
+            log.warning('LOGIN rate_limited ip=%s user=%r', client_ip, username)
+            self._send_html(_render_login('Too many sign-in attempts. Please wait and try again.'))
+            return
         log.debug('LOGIN attempt user=%r ip=%s', username, client_ip)
         user_probe = REGISTRATION_DB.get_user(username) if username else None
         if user_probe and not user_probe['is_disabled'] and not user_probe['is_locked']:
@@ -8234,15 +8525,34 @@ class ManageHandler(BaseHTTPRequestHandler):
         log.debug('LOGIN 303 sent for user=%r location=%s', username, login_redirect)
 
     def _webauthn_rp_id(self) -> str:
+        configured = ''
+        if REGISTRATION_DB:
+            configured = (REGISTRATION_DB.get_setting('webauthn_rp_id', '') or '').strip().lower()
+        if not configured:
+            configured = (WEB_CONFIG.get('domain', '') or '').strip().split(':')[0].lower()
+        if configured:
+            return configured
         host = (self.headers.get('Host', '') or '').strip().split(':')[0].lower()
-        if not host:
-            return 'localhost'
-        return host
+        return host or 'localhost'
 
     def _webauthn_server(self):
         if not _WEBAUTHN_LIB_AVAILABLE:
             return None
         rp_id = self._webauthn_rp_id()
+        host = (self.headers.get('Host', '') or '').strip().split(':')[0].lower()
+        configured = ''
+        if REGISTRATION_DB:
+            configured = (REGISTRATION_DB.get_setting('webauthn_rp_id', '') or '').strip().lower()
+        if not configured:
+            configured = (WEB_CONFIG.get('domain', '') or '').strip().split(':')[0].lower()
+        if not configured and host not in ('', 'localhost', '127.0.0.1', '::1'):
+            log.warning('WEBAUTHN rp_id is not configured; refusing host-derived rp_id for host=%s', host)
+            return None
+        if host and rp_id:
+            host_ok = (host == rp_id) or host.endswith(f'.{rp_id}')
+            if not host_ok:
+                log.warning('WEBAUTHN host/rp mismatch host=%s rp_id=%s', host, rp_id)
+                return None
         try:
             return Fido2Server({'id': rp_id, 'name': 'Wildkat Tracker'})
         except Exception:
@@ -8259,6 +8569,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         ok, err = self._webauthn_guard()
         if not ok:
             return self._send_json({'ok': False, 'error': err}, 400)
+        client_ip = self.client_address[0] if self.client_address else ''
+        if not _auth_rate_limit_allow('webauthn_auth_start', client_ip):
+            log.warning('WEBAUTHN auth start rate_limited ip=%s', client_ip)
+            return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 429)
         payload = self._read_json_body()
         username = str(payload.get('username', '')).strip()
         all_credentials = bool(payload.get('all_credentials'))
@@ -8350,6 +8664,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         ok, err = self._webauthn_guard()
         if not ok:
             return self._send_json({'ok': False, 'error': err}, 400)
+        client_ip = self.client_address[0] if self.client_address else ''
+        if not _auth_rate_limit_allow('webauthn_auth_finish', client_ip):
+            log.warning('WEBAUTHN auth finish rate_limited ip=%s', client_ip)
+            return self._send_json({'ok': False, 'error': 'Passkey authentication failed.'}, 429)
         payload = self._read_json_body()
         try:
             challenge_id = int(payload.get('challenge_id', 0))
@@ -8399,6 +8717,18 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.consume_webauthn_challenge(challenge_id)
             row = by_cred_id.get(cred_id_b64)
             if row:
+                stored_sign_count = int(row['sign_count'] or 0)
+                new_sign_count = int(auth_data.counter or 0)
+                if stored_sign_count > 0 and new_sign_count <= stored_sign_count:
+                    REGISTRATION_DB._log(
+                        user['username'],
+                        'webauthn_clone_detected',
+                        user['username'],
+                        f'cred_id={cred_id_b64[:14]}... old={stored_sign_count} new={new_sign_count}'
+                    )
+                    log.warning('WEBAUTHN clone suspected user=%s cred=%s old=%s new=%s',
+                                user['username'], cred_id_b64[:14], stored_sign_count, new_sign_count)
+                    return self._send_json({'ok': False, 'error': 'Passkey authentication failed.'}, 403)
                 REGISTRATION_DB.touch_webauthn_credential(int(row['id']), int(auth_data.counter))
                 REGISTRATION_DB.set_webauthn_primary_credential(int(user['id']), int(row['id']))
             policy = _auth_factor_policy_for_user(user)
@@ -10019,6 +10349,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             login_enabled = '1' if fields.get('tfa_login_enabled') == '1' else '0'
             enforce_sitewide = '1' if fields.get('tfa_enforce_sitewide') == '1' else '0'
             enforce_admins = '1' if fields.get('tfa_enforce_admins') == '1' else '0'
+            if login_enabled == '1' and not REGISTRATION_DB._tfa_fernet:
+                return self._redirect('/manage/admin?tab=settings&msg=Cannot+enable+TFA+login+without+WK_TFA_SECRET_KEY+configured+for+encrypted+secret+storage.&msg_type=error')
             if (enforce_sitewide == '1' or enforce_admins == '1') and login_enabled != '1':
                 return self._redirect('/manage/admin?tab=settings&msg=Enable+TFA+login+before+enabling+TFA+enforcement.&msg_type=error')
             REGISTRATION_DB.set_setting('tfa_login_enabled', login_enabled, user['username'])
@@ -12647,10 +12979,11 @@ def _render_passkey_enroll_page(user, msg: str = '', msg_type: str = 'error') ->
         '(function(){'
         'window.wkEnrollRequiredPasskey=async function(){'
         'var m=document.getElementById("wk-enroll-msg");'
+        f'var csrf="{_csrf_token(_session_token_for(user))}";'
         'if(!window.PublicKeyCredential){if(m)m.textContent="Passkeys are not supported in this browser.";return;}'
         'try{'
         'if(m)m.textContent="Starting passkey registration...";'
-        'var s=await fetch("/manage/webauthn/register/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});'
+        'var s=await fetch("/manage/webauthn/register/start",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":csrf},body:JSON.stringify({})});'
         'var sj=await s.json();'
         'if(!sj.ok){if(m)m.textContent=sj.error||"Unable to start registration.";return;}'
         'var b64d=function(v){v=(v||"").replace(/-/g,"+").replace(/_/g,"/");while(v.length%4)v+="=";var b=atob(v);var a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;};'
@@ -12661,7 +12994,7 @@ def _render_passkey_enroll_page(user, msg: str = '', msg_type: str = 'error') ->
         'var cred=await navigator.credentials.create({publicKey:pk});'
         'if(!cred){if(m)m.textContent="No credential created.";return;}'
         'var payload={challenge_id:sj.challenge_id,nickname:"Passkey",credential:{id:cred.id,type:cred.type,rawId:b64e(cred.rawId),response:{clientDataJSON:b64e(cred.response.clientDataJSON),attestationObject:b64e(cred.response.attestationObject)},authenticatorAttachment:cred.authenticatorAttachment||"",transports:[]}};'
-        'var f=await fetch("/manage/webauthn/register/finish",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});'
+        'var f=await fetch("/manage/webauthn/register/finish",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":csrf},body:JSON.stringify(payload)});'
         'var fj=await f.json();'
         'if(!fj.ok){if(m)m.textContent=fj.error||"Registration failed.";return;}'
         'if(m)m.textContent="Passkey registered.";'
@@ -13278,7 +13611,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           '</div>') if not _WEBAUTHN_LIB_AVAILABLE else ''}
         {('<div style="font-size:0.82rem;color:var(--danger);margin-bottom:12px">'
           'Break-glass startup override is active. Passkey enforcement is currently bypassed.'
-          '</div>') if AUTH_BREAK_GLASS else ''}
+          '</div>') if _auth_break_glass_active() else ''}
         <form method="POST" action="/manage/admin/save-settings">
           <input type="hidden" name="form_id" value="webauthn_settings">
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
@@ -15802,10 +16135,11 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                '(function(){'
                'window.wkStartPasskeyEnroll=async function(){'
                'var m=document.getElementById("wk-passkey-msg");'
+               f'var csrf="{_csrf_token(_session_token_for(viewer))}";'
                'if(!window.PublicKeyCredential){if(m)m.textContent="Passkeys are not supported in this browser.";return;}'
                'try{'
                'if(m)m.textContent="Starting passkey registration...";'
-               'var s=await fetch("/manage/webauthn/register/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});'
+               'var s=await fetch("/manage/webauthn/register/start",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":csrf},body:JSON.stringify({})});'
                'var sj=await s.json();'
                'if(!sj.ok){if(m)m.textContent=sj.error||"Unable to start registration.";return;}'
                'var b64d=function(v){v=(v||"").replace(/-/g,"+").replace(/_/g,"/");while(v.length%4)v+="=";var b=atob(v);var a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;};'
@@ -15816,7 +16150,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                'var cred=await navigator.credentials.create({publicKey:pk});'
                'if(!cred){if(m)m.textContent="No credential created.";return;}'
                'var payload={challenge_id:sj.challenge_id,nickname:"Passkey",credential:{id:cred.id,type:cred.type,rawId:b64e(cred.rawId),response:{clientDataJSON:b64e(cred.response.clientDataJSON),attestationObject:b64e(cred.response.attestationObject)},authenticatorAttachment:cred.authenticatorAttachment||"",transports:[]}};'
-               'var f=await fetch("/manage/webauthn/register/finish",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});'
+               'var f=await fetch("/manage/webauthn/register/finish",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":csrf},body:JSON.stringify(payload)});'
                'var fj=await f.json();'
                'if(!fj.ok){if(m)m.textContent=fj.error||"Registration failed.";return;}'
                'if(m)m.textContent="Passkey registered.";'
@@ -16726,7 +17060,7 @@ def main():
            DEFAULT_TRACKER_ID, MAX_SCRAPE_HASHES, ALLOW_FULL_SCRAPE, \
            REGISTRATION_MODE, REGISTRATION_DB, OPEN_TRACKER, \
            REWARD_ENABLED, REWARD_THRESHOLD, SUPER_USER, _MANAGE_HTTPS_PORT, \
-           AUTH_BREAK_GLASS
+           AUTH_BREAK_GLASS, AUTH_BREAK_GLASS_UNTIL_TS
 
     parser = argparse.ArgumentParser(
         description='BitTorrent Tracker Server (HTTP + HTTPS + UDP)',
@@ -16786,6 +17120,8 @@ def main():
                         help='Reset super-user TFA secret/backup-codes and TFA-required flag, then exit')
     parser.add_argument('--auth-break-glass', action='store_true',
                         help='Temporary startup override to bypass passkey enforcement gates')
+    parser.add_argument('--auth-break-glass-ttl-minutes', type=int, default=0,
+                        help='Optional auto-expiry for break-glass mode (0=until restart)')
     parser.add_argument('--manage-port', type=int, default=0,
                         help='Management HTTPS port (default: same as --web-https-port)')
 
@@ -16794,7 +17130,10 @@ def main():
     if args.verbose:
         log.setLevel(logging.DEBUG)
     AUTH_BREAK_GLASS = bool(args.auth_break_glass)
+    AUTH_BREAK_GLASS_UNTIL_TS = 0.0
     if AUTH_BREAK_GLASS:
+        if args.auth_break_glass_ttl_minutes > 0:
+            AUTH_BREAK_GLASS_UNTIL_TS = time.time() + (int(args.auth_break_glass_ttl_minutes) * 60)
         log.warning('AUTH BREAK-GLASS is ACTIVE: passkey enforcement gates are bypassed.')
 
     # Override globals with CLI args
@@ -16819,6 +17158,8 @@ def main():
         REGISTRATION_MODE = True
         SUPER_USER        = args.super_user
         REGISTRATION_DB   = RegistrationDB(args.db)
+        if args.domain and not (REGISTRATION_DB.get_setting('webauthn_rp_id', '') or '').strip():
+            REGISTRATION_DB.set_setting('webauthn_rp_id', args.domain.split(':')[0].strip().lower(), 'system')
         _init_csrf_secret(REGISTRATION_DB)
         _start_peer_update_worker()
         OPEN_TRACKER = REGISTRATION_DB.get_setting('open_tracker') == '1'
@@ -16829,6 +17170,19 @@ def main():
             REWARD_THRESHOLD = 200
         log.info('Registration mode enabled  db=%s  super=%s  open_tracker=%s  reward=%s/%s',
                  args.db, args.super_user, OPEN_TRACKER, REWARD_ENABLED, REWARD_THRESHOLD)
+        if REGISTRATION_DB._tfa_fernet:
+            migrated, remaining = REGISTRATION_DB.migrate_legacy_tfa_secrets(actor='system')
+            if migrated or remaining:
+                log.warning('TFA legacy secret migration status: migrated=%s remaining=%s', migrated, remaining)
+        elif REGISTRATION_DB.get_setting('tfa_login_enabled', '0') == '1':
+            log.warning('TFA secret encryption key is not configured (WK_TFA_SECRET_KEY). Existing secrets remain stored with legacy encoding.')
+        if AUTH_BREAK_GLASS:
+            ttl_detail = ('none' if AUTH_BREAK_GLASS_UNTIL_TS <= 0
+                          else datetime.datetime.fromtimestamp(AUTH_BREAK_GLASS_UNTIL_TS).isoformat(timespec='seconds'))
+            try:
+                REGISTRATION_DB._log('system', 'break_glass_activated', '', f'ttl_until={ttl_detail}')
+            except Exception:
+                pass
 
     # ── Super-user password reset (run offline, exits) ───────────
     if args.super_user_password:
