@@ -7553,6 +7553,28 @@ class ManageHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', '0')
         self.end_headers()
 
+    def _redirect_back_manage(self, default: str = '/manage/admin?tab=users',
+                              msg: str = '', msg_type: str = 'success'):
+        """Redirect to a safe /manage referer while preserving query context."""
+        ref = self.headers.get('Referer', '')
+        parsed = urllib.parse.urlparse(ref)
+        path = parsed.path or ''
+        if not path.startswith('/manage'):
+            target = default
+            if msg:
+                glue = '&' if '?' in target else '?'
+                target = f'{target}{glue}msg={urllib.parse.quote_plus(msg)}&msg_type={urllib.parse.quote_plus(msg_type)}'
+            return self._redirect(target)
+        q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        # When coming from admin without explicit tab, keep the operator on Users tab.
+        if path == '/manage/admin' and 'tab' not in q:
+            q['tab'] = ['users']
+        if msg:
+            q['msg'] = [msg]
+            q['msg_type'] = [msg_type]
+        query = urllib.parse.urlencode(q, doseq=True)
+        return self._redirect(path + (f'?{query}' if query else ''))
+
     def _send_html(self, html: str, code: int = 200):
         body = html.encode('utf-8')
         self.send_response(code)
@@ -9532,15 +9554,15 @@ class ManageHandler(BaseHTTPRequestHandler):
         fields, _ = _parse_multipart(self.headers, body)
         target = fields.get('username', '').strip()
         if not target or target == SUPER_USER:
-            return self._redirect('/manage/admin')
+            return self._redirect('/manage/admin?tab=users&msg=Invalid+target+user.&msg_type=error')
         t_user = REGISTRATION_DB.get_user(target)
         if not t_user:
-            return self._redirect('/manage/admin')
+            return self._redirect('/manage/admin?tab=users&msg=User+not+found.&msg_type=error')
         # Admins can only delete standard users; super can delete anyone except super
         if not is_super and t_user['is_admin']:
-            return self._redirect('/manage/admin')
+            return self._redirect('/manage/admin?tab=users&msg=Admins+cannot+delete+admin+accounts.&msg_type=error')
         REGISTRATION_DB.delete_user(target, user['username'])
-        self._redirect('/manage/admin?tab=users')
+        self._redirect('/manage/admin?tab=users&msg=User+deleted.&msg_type=success')
 
     def _get_db_backup(self):
         user = self._get_session_user()
@@ -9675,10 +9697,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         target = fields.get('username', '').strip()
         if target:
             REGISTRATION_DB.set_locked(target, False, user['username'])
-        ref = self.headers.get('Referer', '')
-        back = urllib.parse.urlparse(ref).path or '/manage/admin'
-        if not back.startswith('/manage'): back = '/manage/admin'
-        self._redirect(back)
+        self._redirect_back_manage('/manage/admin?tab=users',
+                                   msg=f'User {target} unlocked.', msg_type='success')
 
     def _post_set_disabled(self, disabled: bool):
         user = self._get_session_user()
@@ -9692,10 +9712,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         target = fields.get('username', '').strip()
         if target and target != SUPER_USER:
             REGISTRATION_DB.set_disabled(target, disabled, user['username'])
-        ref = self.headers.get('Referer', '')
-        back = urllib.parse.urlparse(ref).path or '/manage/admin'
-        if not back.startswith('/manage'): back = '/manage/admin'
-        self._redirect(back)
+        action = 'disabled' if disabled else 'enabled'
+        self._redirect_back_manage('/manage/admin?tab=users',
+                                   msg=f'User {target} {action}.', msg_type='success')
 
     def _post_admin_set_user_passkey_required(self):
         user = self._get_session_user()
@@ -9795,10 +9814,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         is_admin = fields.get('is_admin', '0') == '1'
         if target and target != SUPER_USER:
             REGISTRATION_DB.set_admin(target, is_admin, user['username'])
-        ref = self.headers.get('Referer', '')
-        back = urllib.parse.urlparse(ref).path or '/manage/admin'
-        if not back.startswith('/manage'): back = '/manage/admin'
-        self._redirect(back)
+        role_txt = 'admin' if is_admin else 'member'
+        self._redirect_back_manage('/manage/admin?tab=users',
+                                   msg=f'User {target} set to {role_txt}.', msg_type='success')
 
 
     # ── Tracker management handlers ──────────────────────────
@@ -9813,10 +9831,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         is_std = fields.get('is_standard', '0') == '1'
         if target and target != SUPER_USER:
             REGISTRATION_DB.set_standard(target, is_std, user['username'])
-        ref = self.headers.get('Referer', '')
-        back = urllib.parse.urlparse(ref).path or '/manage/admin'
-        if not back.startswith('/manage'): back = '/manage/admin'
-        self._redirect(back)
+        tier_txt = 'standard' if is_std else 'basic'
+        self._redirect_back_manage('/manage/admin?tab=users',
+                                   msg=f'User {target} set to {tier_txt}.', msg_type='success')
 
     def _post_delete_all_users(self):
         user = self._get_session_user()
