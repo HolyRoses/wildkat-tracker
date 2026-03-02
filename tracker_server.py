@@ -10662,7 +10662,8 @@ class ManageHandler(BaseHTTPRequestHandler):
     def _post_adjust_credits(self):
         user = self._get_session_user()
         if not user: return self._redirect('/manage')
-        if not (user['is_admin'] or user['username'] == SUPER_USER):
+        is_super = (user['username'] == SUPER_USER)
+        if not (user['is_admin'] or is_super):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
@@ -10672,8 +10673,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         except Exception:
             delta = 0
         if target_username and delta:
-            max_grant = int(REGISTRATION_DB.get_setting('admin_max_point_grant', '1000'))
-            delta = max(-max_grant, min(max_grant, delta))
+            if not is_super:
+                max_grant = int(REGISTRATION_DB.get_setting('admin_max_point_grant', '1000'))
+                delta = max(-max_grant, min(max_grant, delta))
             REGISTRATION_DB.adjust_points(target_username, delta, user['username'])
         referer = fields.get('referer', '')
         self._redirect(referer if referer.startswith('/manage/') else '/manage/admin')
@@ -14052,10 +14054,11 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
       </div>
-            <div class="card">
+      <div class="card">
         <div class="card-title">⚡ Admin Point Grants</div>
         <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
           Maximum points an admin can grant or remove per transaction on a user's profile.
+          Super has no limit.
         </p>
         <form method="POST" action="/manage/admin/save-settings">
           <input type="hidden" name="form_id" value="admin_grant_settings">
@@ -16501,16 +16504,21 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                 + hi + '<button class="btn btn-sm btn-danger">Reset TFA</button></form>'
             )
         hi_referer = '/manage/profile' if is_own_profile else '/manage/admin/user/' + uname_h
+        _is_super_viewer = (viewer['username'] == SUPER_USER)
         max_grant  = int(REGISTRATION_DB.get_setting('admin_max_point_grant', '1000')) if REGISTRATION_DB else 1000
+        delta_limit_attrs = '' if _is_super_viewer else f' min="-{max_grant}" max="{max_grant}"'
+        delta_limit_title = ('Positive adds points, negative removes. Super has no limit.'
+                             if _is_super_viewer else
+                             f'Positive adds points, negative removes. Max ±{max_grant}.')
         credit_btns = (
             f'<form method="POST" action="/manage/admin/adjust-credits" '
             f'style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">'
             f'<input type="hidden" name="username" value="{uname_h}">'
             f'<input type="hidden" name="referer" value="{hi_referer}">'
-            f'<input type="number" name="delta" value="10" min="-{max_grant}" max="{max_grant}" '
+            f'<input type="number" name="delta" value="10"{delta_limit_attrs} '
             f'style="width:90px;padding:6px 10px;background:var(--card2);border:1px solid var(--border);'
             f'border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.85rem" '
-            f'title="Positive adds points, negative removes. Max ±{max_grant}.">'
+            f'title="{delta_limit_title}">'
             f'<button type="submit" class="btn btn-sm btn-green" '
             f'onclick="var v=parseInt(this.form.delta.value)||0;this.form.delta.value=Math.abs(v)">＋ Grant</button>'
             f'<button type="submit" class="btn btn-sm btn-danger" '
