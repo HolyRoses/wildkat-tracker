@@ -4457,6 +4457,59 @@ class RegistrationDB:
             self._fulfill_bounty(bounty_id, refund_requestor=False)
         return True, 'Vote recorded.'
 
+    def admin_remove_bounty(self, bounty_id: int, actor: str, reason: str = '') -> tuple[bool, str]:
+        """Moderation remove for spam/abuse bounties.
+
+        Allowed states: open, pending. Escrow contributions are fully refunded.
+        """
+        b = self.get_bounty(bounty_id)
+        if not b:
+            return False, 'Bounty not found.'
+        if b['status'] == 'removed':
+            return False, 'Bounty is already removed.'
+        if b['status'] not in ('open', 'pending'):
+            return False, 'Only open or pending bounties can be removed.'
+
+        c = self._conn()
+        refunded_total = 0
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            contribs = c.execute(
+                'SELECT username, amount FROM bounty_contributions WHERE bounty_id=?',
+                (bounty_id,)
+            ).fetchall()
+            for row in contribs:
+                amount = int(row['amount'] or 0)
+                if amount <= 0:
+                    continue
+                u = c.execute('SELECT id FROM users WHERE username=?', (row['username'],)).fetchone()
+                if not u:
+                    continue
+                self._award_points_tx(
+                    c, int(u['id']), amount,
+                    f'bounty #{bounty_id} removed by moderation — refunded contribution',
+                    'bounty_refund_admin', str(bounty_id)
+                )
+                refunded_total += amount
+            c.execute(
+                "UPDATE bounties SET status='removed', claimed_infohash=NULL, claimed_by=NULL, claimed_at=NULL "
+                "WHERE id=?",
+                (bounty_id,)
+            )
+            c.execute('COMMIT')
+        except Exception:
+            try:
+                c.execute('ROLLBACK')
+            except Exception:
+                pass
+            raise
+
+        detail = f'from={b["status"]} refunded={refunded_total}'
+        if reason:
+            detail += f' reason={reason[:180]}'
+        self._log(actor, 'bounty_remove_admin', str(bounty_id), detail)
+        return True, f'Bounty removed. Refunded {refunded_total} pts to contributors.'
+
     def _fulfill_bounty(self, bounty_id: int, refund_requestor: bool) -> tuple[bool, str]:
         """Internal: pay out escrow and close bounty as fulfilled."""
         c = self._conn()
@@ -4576,7 +4629,7 @@ class RegistrationDB:
     def list_bounties(self, status: str | None = None, sort: str = 'points',
                       page: int = 1, per_page: int = 20) -> tuple[list, int]:
         c = self._conn()
-        where = ''
+        where = "WHERE status!='removed'"
         args: list = []
         if status:
             where = 'WHERE status=?'
@@ -8571,6 +8624,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_bounty_reject()
         elif path == '/manage/bounty/vote':
             self._post_bounty_vote()
+        elif path == '/manage/bounty/remove':
+            self._post_bounty_remove()
         elif path == '/manage/bounty/comment':
             self._post_bounty_comment()
         elif path == '/manage/points/transfer':
@@ -9592,11 +9647,14 @@ class ManageHandler(BaseHTTPRequestHandler):
         user = self._get_session_user()
         if not user:
             return self._redirect('/manage')
-        if _user_role(user) == 'basic':
+        role = _user_role(user)
+        if role == 'basic':
             return self._redirect('/manage/dashboard')
         bounty = REGISTRATION_DB.get_bounty(bounty_id)
         if not bounty:
             return self._send_html('<h1>Bounty Not Found</h1>', 404)
+        if bounty['status'] == 'removed' and role not in ('super', 'admin'):
+            return self._redirect('/manage/bounty?msg=Bounty+not+found.&msg_type=error')
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
@@ -11237,6 +11295,25 @@ class ManageHandler(BaseHTTPRequestHandler):
         q = urllib.parse.quote(msg)
         self._redirect(f'/manage/bounty/{bounty_id}?msg={q}&msg_type={"success" if ok else "error"}')
 
+    def _post_bounty_remove(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) not in ('super', 'admin'):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            bounty_id = int(fields.get('bounty_id', '0'))
+        except ValueError:
+            bounty_id = 0
+        reason = fields.get('reason', '').strip()[:240]
+        if not bounty_id:
+            return self._redirect('/manage/bounty?msg=Invalid+bounty+id.&msg_type=error')
+        ok, msg = REGISTRATION_DB.admin_remove_bounty(bounty_id, user['username'], reason)
+        q = urllib.parse.quote(msg)
+        self._redirect(f'/manage/bounty/{bounty_id}?msg={q}&msg_type={"success" if ok else "error"}')
+
     def _post_bounty_comment(self):
         user = self._get_session_user()
         if not user:
@@ -11249,15 +11326,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             bounty_id = int(fields.get('bounty_id', '0'))
         except ValueError:
             return self._redirect('/manage/bounty')
+        bounty = REGISTRATION_DB.get_bounty(bounty_id)
+        if not bounty or bounty['status'] in ('expired', 'removed'):
+            return self._redirect(f'/manage/bounty/{bounty_id}?msg=Bounty+is+closed+for+comments.&msg_type=error')
         text = fields.get('body', '').strip()[:2000]
         if text:
             cid = REGISTRATION_DB.add_bounty_comment(bounty_id, user['username'], text)
             REGISTRATION_DB.award_comment_points(user['id'], cid)
-            bounty = REGISTRATION_DB.get_bounty(bounty_id)
-            if bounty:
-                _deliver_bounty_comment_notifications(
-                    cid, bounty_id, bounty['description'], user['username'], text
-                )
+            _deliver_bounty_comment_notifications(
+                cid, bounty_id, bounty['description'], user['username'], text
+            )
         self._redirect(f'/manage/bounty/{bounty_id}#bc-{bounty_id}')
 
     def _post_points_transfer(self):
@@ -18069,6 +18147,7 @@ def _bounty_status_badge(status: str) -> str:
         'pending':   'var(--accent)',
         'fulfilled': 'var(--muted)',
         'expired':   'var(--danger)',
+        'removed':   'var(--danger)',
     }
     c = colors.get(status, 'var(--muted)')
     return (f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;'
@@ -18550,8 +18629,30 @@ def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
         <div style="white-space:pre-wrap;word-break:break-word">{bd_h}</div>
       </div>'''
 
+    moderation_html = ''
+    if role in ('super', 'admin') and status in ('open', 'pending'):
+        moderation_html = f'''
+    <div class="card" style="border:1px solid var(--danger)">
+      <div class="card-title" style="color:var(--danger)">🛡️ Moderation</div>
+      <p style="color:var(--muted);font-size:0.85rem;margin-bottom:10px">
+        Remove spam/abusive bounty listings. Contributor escrow will be refunded.
+      </p>
+      <form method="POST" action="/manage/bounty/remove">
+        <input type="hidden" name="bounty_id" value="{bid}">
+        <div class="form-group">
+          <input type="text" name="reason" maxlength="240" placeholder="Reason (optional)"
+                 style="width:100%;background:var(--card2);border:1px solid var(--border);
+                        border-radius:6px;color:var(--text);padding:8px">
+        </div>
+        <button type="submit" class="btn btn-danger"
+                data-confirm="Remove this bounty and refund contributor escrow?">
+          Remove Bounty
+        </button>
+      </form>
+    </div>'''
+
     comment_form = ''
-    if status not in ('expired',) and role != 'basic':
+    if status not in ('expired', 'removed') and role != 'basic':
         comment_form = f'''
       <form method="POST" action="/manage/bounty/comment" style="margin-top:12px">
         <input type="hidden" name="bounty_id" value="{bid}">
@@ -18617,6 +18718,7 @@ def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
     {info_card}
     {pending_html}
     {fulfilled_html}
+    {moderation_html}
     {contribute_form}
     {claim_form}
     {contrib_html}
