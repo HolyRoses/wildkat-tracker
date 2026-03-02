@@ -5969,11 +5969,14 @@ class RegistrationDB:
             clauses.append('(actor LIKE ? OR action LIKE ? OR target LIKE ? OR detail LIKE ?)')
             params += [like, like, like, like]
         if q_actor:
-            clauses.append('actor LIKE ?');  params.append(f'%{q_actor}%')
+            clauses.append('actor LIKE ?')
+            params.append(f'%{q_actor}%')
         if q_action:
-            clauses.append('action LIKE ?'); params.append(f'%{q_action}%')
+            clauses.append('action LIKE ?')
+            params.append(f'%{q_action}%')
         if q_target:
-            clauses.append('target LIKE ?'); params.append(f'%{q_target}%')
+            clauses.append('target LIKE ?')
+            params.append(f'%{q_target}%')
         where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
         rows = self._conn().execute(
             f'SELECT * FROM events {where} ORDER BY id DESC LIMIT ? OFFSET ?',
@@ -7360,9 +7363,8 @@ WEB_CONFIG: dict = {}   # populated at startup by main()
 # ── In-memory typing presence store ─────────────────────────────────────────
 # {thread_key: {'username': str, 'expires': float}}
 # thread_key = "dm:{user_a}:{user_b}" (sorted alphabetically)
-import threading as _threading
 _TYPING_STORE: dict = {}
-_TYPING_LOCK  = _threading.Lock()
+_TYPING_LOCK  = threading.Lock()
 _ONLINE_MINUTES  = 5   # active within N minutes = online
 _RECENT_MINUTES  = 30  # active within N minutes = recently active
 
@@ -10621,8 +10623,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             for key in ('pw_min_length', 'pw_require_upper', 'pw_require_lower',
                         'pw_require_digit', 'pw_require_symbol'):
                 if key == 'pw_min_length':
-                    try: val = str(max(6, min(64, int(fields.get(key, '12')))))
-                    except: val = '12'
+                    try:
+                        val = str(max(6, min(64, int(fields.get(key, '12')))))
+                    except (TypeError, ValueError):
+                        val = '12'
                 else:
                     val = '1' if fields.get(key) == '1' else '0'
                 REGISTRATION_DB.set_setting(key, val, user['username'])
@@ -10723,8 +10727,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ('points_comment',      '1',  0, 999),
                 ('points_comment_cap',  '10', 0, 999),
             ]:
-                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
-                except: v = default
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except (TypeError, ValueError):
+                    v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
         elif form_id == 'points_spend':
             for key, default, lo, hi in [
@@ -10734,8 +10740,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ('points_penalty_torrent',   '25',   0, 9999),
                 ('points_penalty_comment',   '1',    0, 999),
             ]:
-                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
-                except: v = default
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except (TypeError, ValueError):
+                    v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('auto_promote_enabled', val, user['username'])
@@ -10750,16 +10758,22 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ('bounty_confirm_votes',  '3',   1, 999),
                 ('bounty_pending_hours',  '48',  1, 720),
             ]:
-                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
-                except: v = default
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except (TypeError, ValueError):
+                    v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
         elif form_id == 'leaderboard_settings':
-            try: v = str(max(3, min(100, int(fields.get('leaderboard_top_n', '10')))))
-            except: v = '10'
+            try:
+                v = str(max(3, min(100, int(fields.get('leaderboard_top_n', '10')))))
+            except (TypeError, ValueError):
+                v = '10'
             REGISTRATION_DB.set_setting('leaderboard_top_n', v, user['username'])
         elif form_id == 'admin_grant_settings':
-            try: v = str(max(1, min(999999, int(fields.get('admin_max_point_grant', '1000')))))
-            except: v = '1000'
+            try:
+                v = str(max(1, min(999999, int(fields.get('admin_max_point_grant', '1000')))))
+            except (TypeError, ValueError):
+                v = '1000'
             REGISTRATION_DB.set_setting('admin_max_point_grant', v, user['username'])
         elif form_id == 'dm_settings':
             val = '1' if fields.get('dm_enabled') == '1' else '0'
@@ -10768,8 +10782,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ('dm_cost',        '5',  0, 9999),
                 ('dm_daily_limit', '10', 1, 999),
             ]:
-                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
-                except: v = default
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except (TypeError, ValueError):
+                    v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
         elif form_id == 'gravatar_settings':
             val = '1' if fields.get('gravatar_enabled') == '1' else '0'
@@ -17331,7 +17347,8 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
     if ledger:
         rows = ''
         for e in ledger:
-            d = e['delta']; color = 'var(--green)' if d > 0 else 'var(--danger)'
+            d = e['delta']
+            color = 'var(--green)' if d > 0 else 'var(--danger)'
             sign = '+' if d > 0 else ''
             rows += (f'<tr style="border-top:1px solid var(--border)">'
                      f'<td class="hash" style="padding:8px 12px 8px 0;white-space:nowrap;font-size:0.8rem">{_h((e["created_at"] or "")[:16])}</td>'
