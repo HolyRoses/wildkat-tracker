@@ -12459,16 +12459,20 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
         and REGISTRATION_DB.get_setting('webauthn_enforce_sitewide', '0') == '1'
     )
     passkey_primary_btn = ''
+    passkey_sitewide_divider = ''
     sign_in_btn_cls = 'btn btn-primary'
     sign_in_btn_style = 'width:100%;margin-top:8px'
     sign_in_btn_id = ''
+    passkey_secondary_btn_id = ''
+    black_btn_style = 'width:100%;margin-top:8px;background:#000;color:#fff;border-color:var(--border)'
     if passkey_sitewide:
         passkey_primary_btn = (
             '<button type="button" class="btn btn-primary" style="width:100%;margin-top:8px" '
             'onclick="startPasskeyLogin()">Sign in with Passkey</button>'
         )
+        passkey_sitewide_divider = '<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border)"></div>'
         sign_in_btn_cls = 'btn'
-        sign_in_btn_style = 'width:100%;margin-top:8px;background:#000;color:#fff;border-color:var(--border)'
+        sign_in_btn_style = black_btn_style
         sign_in_btn_id = ' id="sitewide-password-signin"'
     sitewide_hover_script = ''
     if passkey_sitewide:
@@ -12490,14 +12494,15 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
         )
         if passkey_sitewide:
             passkey_block = (
-                '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
+                '<div style="margin-top:12px">'
                 + passkey_controls +
                 '</div>'
             )
         else:
+            passkey_secondary_btn_id = ' id="passkey-secondary-signin"'
             passkey_block = (
                 '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
-                '<button type="button" class="btn btn-sm" style="width:100%" onclick="startPasskeyLogin()">Sign in with Passkey</button>'
+                f'<button type="button"{passkey_secondary_btn_id} class="btn" style="{black_btn_style}" onclick="startPasskeyLogin()">Sign in with Passkey</button>'
                 + passkey_controls +
                 '</div>'
             )
@@ -12578,10 +12583,19 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
           <input id="login-password" type="password" name="password" autocomplete="current-password" required>
         </div>
         ''' + passkey_primary_btn + '''
+        ''' + passkey_sitewide_divider + '''
         <button type="submit"''' + sign_in_btn_id + ''' class="''' + sign_in_btn_cls + '''" style="''' + sign_in_btn_style + '''">Sign In</button>
       </form>
       ''' + passkey_block + '''
       ''' + sitewide_hover_script + '''
+      <script>
+      (function(){
+        var p=document.getElementById("passkey-secondary-signin");
+        if(!p) return;
+        p.addEventListener("mouseenter",function(){p.style.borderColor="var(--accent)";p.style.color="var(--accent)";});
+        p.addEventListener("mouseleave",function(){p.style.borderColor="var(--border)";p.style.color="#fff";});
+      })();
+      </script>
     </div>
   </div>'''
     return _manage_page('Login', body, msg=msg, msg_type=msg_type)
