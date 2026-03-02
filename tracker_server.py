@@ -258,8 +258,10 @@ class PeerRegistry:
 
     def get_peers(self, ih_hex: str, num_want: int, requester_ip: str, requester_port: int):
         """
-        Return (seeds, leechers, downloaded, ipv4_compact, ipv6_compact, peer_dicts).
+        Return (seeds, leechers, downloaded, ipv4_compact, ipv6_compact,
+        ipv4_mapped_compact, peer_dicts).
         ipv4_compact and ipv6_compact are bytes.
+        ipv4_mapped_compact is bytes with IPv4 peers mapped as ::ffff:x.x.x.x.
         peer_dicts is a list[dict] for callers that want the full list.
         """
         with self._lock:
@@ -360,6 +362,17 @@ class PeerRegistry:
     def all_hashes(self):
         with self._lock:
             return list(self._torrents.keys())
+
+    def live_stats(self) -> tuple[int, int]:
+        """Return (active_torrent_count, live_peer_count) under registry lock."""
+        with self._lock:
+            # Keep stats aligned with announce behavior by purging stale peers first.
+            for ih_hex in list(self._torrents.keys()):
+                self._ensure(ih_hex)
+                self._purge_stale(ih_hex)
+            torrent_count = sum(1 for peers in self._torrents.values() if peers)
+            peer_count = sum(len(peers) for peers in self._torrents.values())
+            return torrent_count, peer_count
 
 
 # Module-level shared registry (shared by all handler threads + UDP thread)
@@ -489,11 +502,12 @@ class StatsTracker:
             self.today_bytes_raw  += sent
 
     def snapshot(self) -> dict:
+        torrents, live_peers = REGISTRY.live_stats()
         with self._lock:
             return {
                 'uptime':    time.time() - self.start_time,
-                'torrents':  len(REGISTRY.all_hashes()),
-                'live_peers': sum(len(v) for v in REGISTRY._torrents.values()),
+                'torrents':  torrents,
+                'live_peers': live_peers,
                 'all': {
                     'announces':   self.all_announces,
                     'http':        self.all_http_announces,
@@ -3014,8 +3028,11 @@ class RegistrationDB:
     def refund_topup_order(self, order_id: int, actor: str = 'system',
                            reason: str = 'provider_refund',
                            detail: str = '') -> tuple[bool, str]:
-        """Reverse previously credited points for a refunded/reversed payment."""
+        """Reverse previously credited points for a refunded/reversed payment.
+        Negative resulting balances are intentional and permitted by design.
+        """
         c = self._conn()
+        negative_balance_after = False
         try:
             c.execute('BEGIN IMMEDIATE')
             order = c.execute('SELECT * FROM topup_orders WHERE id=?', (order_id,)).fetchone()
@@ -3040,6 +3057,7 @@ class RegistrationDB:
             c.execute('UPDATE users SET points = points - ? WHERE id = ?', (points, order['user_id']))
             bal_row = c.execute('SELECT points FROM users WHERE id=?', (order['user_id'],)).fetchone()
             balance = bal_row[0] if bal_row else 0
+            negative_balance_after = bool(balance < 0)
             c.execute(
                 'INSERT INTO points_ledger (user_id,delta,balance_after,reason,ref_type,ref_id,created_at)'
                 ' VALUES (?,?,?,?,?,?,?)',
@@ -3091,6 +3109,15 @@ class RegistrationDB:
                 )
         self._log(actor, 'topup_refund', str(order_id),
                   f'user={user["username"]} points=-{points} reason={reason}')
+        if negative_balance_after:
+            log.debug(
+                'TOPUP refund produced negative balance user=%s order_id=%s balance=%s',
+                user['username'], order_id, balance
+            )
+            self._log(
+                actor, 'topup_refund_negative_balance', str(order_id),
+                f'user={user["username"]} balance={balance}'
+            )
         return True, f'Reversed {points} points due to refund.'
 
     def get_topup_stats(self) -> dict:
@@ -3664,13 +3691,10 @@ class RegistrationDB:
 
     # ── Points Engine ─────────────────────────────────────────
 
-    def award_points(self, user_id: int, delta: int, reason: str,
-                     ref_type: str = '', ref_id: str = '') -> int:
-        """Award (positive) or deduct (negative) points. Points can go negative.
-        Writes a ledger entry and returns the new balance."""
-        c = self._conn()
+    def _award_points_tx(self, c, user_id: int, delta: int, reason: str,
+                         ref_type: str = '', ref_id: str = '') -> int:
+        """Apply points and append one ledger row using an existing transaction."""
         c.execute('UPDATE users SET points = points + ? WHERE id = ?', (delta, user_id))
-        c.commit()
         row = c.execute('SELECT points FROM users WHERE id=?', (user_id,)).fetchone()
         balance = row[0] if row else 0
         c.execute(
@@ -3678,8 +3702,25 @@ class RegistrationDB:
             ' VALUES (?,?,?,?,?,?,?)',
             (user_id, delta, balance, reason, ref_type, ref_id, self._ts())
         )
-        c.commit()
         return balance
+
+    def award_points(self, user_id: int, delta: int, reason: str,
+                     ref_type: str = '', ref_id: str = '') -> int:
+        """Award (positive) or deduct (negative) points.
+        Negative balances are intentional in this economy model and are not blocked.
+        Writes a ledger entry and returns the new balance."""
+        c = self._conn()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            balance = self._award_points_tx(c, user_id, delta, reason, ref_type, ref_id)
+            c.execute('COMMIT')
+            return balance
+        except Exception:
+            try:
+                c.execute('ROLLBACK')
+            except Exception:
+                pass
+            raise
 
     def spend_points(self, user_id: int, amount: int, reason: str,
                      ref_type: str = '', ref_id: str = '') -> bool:
@@ -3708,36 +3749,45 @@ class RegistrationDB:
     def daily_login_check(self, user_id: int) -> int:
         """Award daily login + streak bonus points. Returns points awarded (0 if already done today)."""
         today = datetime.date.today().isoformat()
-        user = self.get_user_by_id(user_id)
-        if not user:
-            return 0
-        last_date = user['last_login_date'] if 'last_login_date' in user.keys() else None
-        if last_date == today:
-            return 0  # already awarded today
-        # Calculate streak
-        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
-        current_streak = user['login_streak'] if 'login_streak' in user.keys() else 0
-        new_streak = (current_streak + 1) if last_date == yesterday else 1
-        longest = max(user['longest_streak'] if 'longest_streak' in user.keys() else 0, new_streak)
         c = self._conn()
-        c.execute(
-            'UPDATE users SET last_login_date=?, login_streak=?, longest_streak=? WHERE id=?',
-            (today, new_streak, longest, user_id)
-        )
-        c.commit()
-        # Compute points to award
         daily = int(self.get_setting('points_login_daily', '1'))
         s7    = int(self.get_setting('points_streak_7day',  '1'))
         s30   = int(self.get_setting('points_streak_30day', '4'))
-        total = daily
-        parts = ['daily login']
-        if new_streak % 7 == 0:
-            total += s7
-            parts.append(f'7-day streak (day {new_streak})')
-        if new_streak % 30 == 0:
-            total += s30
-            parts.append(f'30-day streak (day {new_streak})')
-        self.award_points(user_id, total, ' + '.join(parts), 'login', today)
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            user = c.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+            if not user:
+                c.execute('ROLLBACK')
+                return 0
+            last_date = user['last_login_date'] if 'last_login_date' in user.keys() else None
+            if last_date == today:
+                c.execute('ROLLBACK')
+                return 0
+            yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+            current_streak = user['login_streak'] if 'login_streak' in user.keys() else 0
+            new_streak = (current_streak + 1) if last_date == yesterday else 1
+            longest = max(user['longest_streak'] if 'longest_streak' in user.keys() else 0, new_streak)
+            total = daily
+            parts = ['daily login']
+            if new_streak % 7 == 0:
+                total += s7
+                parts.append(f'7-day streak (day {new_streak})')
+            if new_streak % 30 == 0:
+                total += s30
+                parts.append(f'30-day streak (day {new_streak})')
+
+            c.execute(
+                'UPDATE users SET last_login_date=?, login_streak=?, longest_streak=? WHERE id=?',
+                (today, new_streak, longest, user_id)
+            )
+            self._award_points_tx(c, user_id, total, ' + '.join(parts), 'login', today)
+            c.execute('COMMIT')
+        except Exception:
+            try:
+                c.execute('ROLLBACK')
+            except Exception:
+                pass
+            raise
         self.check_auto_promote(user_id)
         return total
 
@@ -4069,61 +4119,95 @@ class RegistrationDB:
 
     def _fulfill_bounty(self, bounty_id: int, refund_requestor: bool) -> tuple[bool, str]:
         """Internal: pay out escrow and close bounty as fulfilled."""
-        b = self.get_bounty(bounty_id)
-        claimer  = b['claimed_by']
-        ih       = b['claimed_infohash']
-        escrow   = b['total_escrow']
-        torrent  = self.get_torrent(ih) if ih else None
-        uploader = torrent['uploaded_by_username'] if torrent else None
-
-        claimer_pct  = int(self.get_setting('bounty_claimer_pct',  '70')) / 100
-        uploader_pct = int(self.get_setting('bounty_uploader_pct', '15')) / 100
-
-        claimer_pay  = int(escrow * claimer_pct)
-        if uploader and uploader != claimer:
-            uploader_pay = int(escrow * uploader_pct)
-        else:
-            uploader_pay = 0
-            claimer_pay  = int(escrow * (claimer_pct + uploader_pct))
-
-        # Pay claimer
-        claimer_user = self.get_user(claimer)
-        if claimer_user:
-            self.award_points(claimer_user['id'], claimer_pay,
-                              f'bounty #{bounty_id} fulfilled (claimer share)',
-                              'bounty_payout', str(bounty_id))
-        # Pay uploader if different
-        if uploader_pay > 0:
-            up_user = self.get_user(uploader)
-            if up_user:
-                self.award_points(up_user['id'], uploader_pay,
-                                  f'your torrent fulfilled bounty #{bounty_id}',
-                                  'bounty_payout', str(bounty_id))
-                self._notify_bounty(uploader, 'bounty_uploader_payout', claimer, bounty_id,
-                                    b['description'], uploader_pay, ih)
-        # Refund requestor their initial cost % if confirming themselves
-        if refund_requestor:
-            refund_pct = int(self.get_setting('bounty_refund_pct', '25')) / 100
-            refund_amt = int(b['initial_cost'] * refund_pct)
-            if refund_amt > 0:
-                req_user = self.get_user(b['created_by'])
-                if req_user:
-                    self.award_points(req_user['id'], refund_amt,
-                                      f'bounty #{bounty_id} confirmed — partial refund',
-                                      'bounty_refund', str(bounty_id))
-
         c = self._conn()
-        c.execute(
-            'UPDATE bounties SET status=?,fulfilled_by=?,fulfilled_at=? WHERE id=?',
-            ('fulfilled', claimer, self._ts(), bounty_id)
-        )
-        c.commit()
+        promoted_user_ids: set[int] = set()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            b = c.execute(
+                "SELECT * FROM bounties WHERE id=? AND status='pending'",
+                (bounty_id,)
+            ).fetchone()
+            if not b:
+                c.execute('ROLLBACK')
+                return False, 'Bounty is no longer pending.'
+
+            claimer = b['claimed_by']
+            ih = b['claimed_infohash']
+            escrow = int(b['total_escrow'] or 0)
+            torrent = c.execute(
+                'SELECT uploaded_by_username FROM torrents WHERE info_hash=?',
+                ((ih or '').upper(),)
+            ).fetchone() if ih else None
+            uploader = torrent['uploaded_by_username'] if torrent else None
+
+            claimer_pct = int(self.get_setting('bounty_claimer_pct', '70')) / 100
+            uploader_pct = int(self.get_setting('bounty_uploader_pct', '15')) / 100
+            claimer_pay = int(escrow * claimer_pct)
+            if uploader and uploader != claimer:
+                uploader_pay = int(escrow * uploader_pct)
+            else:
+                uploader_pay = 0
+                claimer_pay = int(escrow * (claimer_pct + uploader_pct))
+
+            claimer_user = c.execute('SELECT id FROM users WHERE username=?', (claimer,)).fetchone()
+            if claimer_user and claimer_pay > 0:
+                self._award_points_tx(
+                    c, int(claimer_user['id']), claimer_pay,
+                    f'bounty #{bounty_id} fulfilled (claimer share)',
+                    'bounty_payout', str(bounty_id)
+                )
+                promoted_user_ids.add(int(claimer_user['id']))
+
+            if uploader_pay > 0:
+                up_user = c.execute('SELECT id FROM users WHERE username=?', (uploader,)).fetchone()
+                if up_user:
+                    self._award_points_tx(
+                        c, int(up_user['id']), uploader_pay,
+                        f'your torrent fulfilled bounty #{bounty_id}',
+                        'bounty_payout', str(bounty_id)
+                    )
+                    promoted_user_ids.add(int(up_user['id']))
+
+            if refund_requestor:
+                refund_pct = int(self.get_setting('bounty_refund_pct', '25')) / 100
+                refund_amt = int(int(b['initial_cost'] or 0) * refund_pct)
+                if refund_amt > 0:
+                    req_user = c.execute('SELECT id FROM users WHERE username=?', (b['created_by'],)).fetchone()
+                    if req_user:
+                        self._award_points_tx(
+                            c, int(req_user['id']), refund_amt,
+                            f'bounty #{bounty_id} confirmed — partial refund',
+                            'bounty_refund', str(bounty_id)
+                        )
+                        promoted_user_ids.add(int(req_user['id']))
+
+            updated = c.execute(
+                "UPDATE bounties SET status='fulfilled', fulfilled_by=?, fulfilled_at=? "
+                "WHERE id=? AND status='pending'",
+                (claimer, self._ts(), bounty_id)
+            )
+            if updated.rowcount != 1:
+                c.execute('ROLLBACK')
+                return False, 'Bounty state changed during fulfillment.'
+            c.execute('COMMIT')
+        except Exception:
+            try:
+                c.execute('ROLLBACK')
+            except Exception:
+                pass
+            raise
+
         self._log('system', 'bounty_fulfilled', str(bounty_id),
                   f'claimer={claimer} escrow={escrow} refund={refund_requestor}')
-        if claimer_user:
+        if uploader_pay > 0 and uploader and uploader != claimer:
+            self._notify_bounty(uploader, 'bounty_uploader_payout', claimer, bounty_id,
+                                b['description'], uploader_pay, ih)
+        if claimer:
             self._notify_bounty(claimer, 'bounty_fulfilled', b['created_by'], bounty_id,
                                 b['description'], claimer_pay, ih)
             self.notify_followers_bounty_fulfilled(claimer, bounty_id, b['description'])
+        for uid in promoted_user_ids:
+            self.check_auto_promote(uid)
         return True, 'Bounty fulfilled.'
 
     def expire_bounties(self):
@@ -4270,13 +4354,16 @@ class RegistrationDB:
     def _notify_bounty(self, recipient: str, ntype: str, actor: str,
                        bounty_id: int, description: str, amount: int,
                        info_hash: str = '') -> None:
-        """Insert a notification for bounty events. Reuses notifications table with bounty ref."""
+        """Insert a bounty notification using existing notification schema fields.
+        Schema mapping is intentional:
+        - info_hash carries "BOUNTY:{id}" sentinel
+        - torrent_name carries bounty description text
+        - comment_id carries numeric amount payload for payout-style messages
+        """
         user = self.get_user(recipient)
         if not user:
             return
-        # We store bounty_id in comment_id field, info_hash as info_hash,
-        # description in torrent_name, amount in comment_id (overloaded).
-        # Use a special info_hash prefix "BOUNTY:" to distinguish from torrent notifs.
+        # Use a "BOUNTY:" info_hash prefix to distinguish bounty notifications.
         self._conn().execute(
             'INSERT INTO notifications (user_id,type,from_username,info_hash,torrent_name,'
             'comment_id,created_at,is_read) VALUES (?,?,?,?,?,?,?,0)',
@@ -5131,18 +5218,6 @@ class RegistrationDB:
         except Exception:
             return ''
 
-    def get_user_tfa_last_counter(self, user_id: int) -> int:
-        row = self._conn().execute(
-            'SELECT tfa_last_counter FROM users WHERE id=?',
-            (user_id,)
-        ).fetchone()
-        if not row:
-            return -1
-        try:
-            return int(row['tfa_last_counter'])
-        except Exception:
-            return -1
-
     def reserve_user_tfa_totp_counter(self, user_id: int, counter: int) -> bool:
         """Atomically reserve a strictly newer TOTP counter for this user."""
         cur = self._conn().execute(
@@ -5824,6 +5899,7 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
 
     def _send_bencode(self, code: int, obj):
         body = bencode(obj)
+        raw_len = len(body)
 
         # Compress if client advertised gzip support and compression actually saves bytes
         accept_encoding = self.headers.get('Accept-Encoding', '')
@@ -5834,12 +5910,11 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
                 body = compressed
                 use_gzip = True
                 log.debug('HTTP response gzip compressed  original=%d  compressed=%d bytes',
-                          len(bencode(obj)), len(body))
+                          raw_len, len(body))
             else:
                 log.debug('HTTP response gzip skipped  original=%d  compressed=%d bytes (no benefit)',
                           len(body), len(compressed))
 
-        raw_len = len(bencode(obj))
         STATS.record_http_bytes(raw_len, len(body), use_gzip)
         self.send_response(code)
         self.send_header('Content-Type', 'text/plain')
@@ -10520,8 +10595,30 @@ class ManageHandler(BaseHTTPRequestHandler):
                 bands = [{'min_usd': 5, 'multiplier_bp': 10000}]
             bands.sort(key=lambda x: x['min_usd'])
             REGISTRATION_DB.set_setting('topup_multiplier_bands_json', json.dumps(bands), user['username'])
-        self._redirect('/manage/admin?tab=economy' if form_id in ('points_earn','points_spend','bounty_settings','leaderboard_settings','admin_grant_settings','dm_settings')
-                       else ('/manage/admin?tab=topups' if form_id == 'topup_settings' else '/manage/admin'))
+        economy_forms = {
+            'points_earn', 'points_spend', 'auto_promote',
+            'bounty_settings', 'leaderboard_settings',
+            'admin_grant_settings', 'dm_settings',
+        }
+        settings_forms = {
+            'complexity', 'free_signup', 'open_tracker', 'comments_enabled',
+            'robots_txt', 'torrents_per_page', 'upload_limits',
+            'gravatar_settings', 'webauthn_settings', 'tfa_settings',
+        }
+        if form_id == 'topup_settings':
+            tab = 'topups'
+            msg = 'Top-up+settings+saved'
+        elif form_id in economy_forms:
+            tab = 'economy'
+            msg = 'Settings+saved'
+        elif form_id in settings_forms:
+            tab = 'settings'
+            msg = 'Settings+saved'
+        else:
+            tab = ''
+            msg = 'Settings+saved'
+        suffix = f'?tab={tab}&msg={msg}&msg_type=success' if tab else f'?msg={msg}&msg_type=success'
+        self._redirect('/manage/admin' + suffix)
 
     # ── Invite & Credit handlers ─────────────────────────────
 
@@ -11425,6 +11522,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.delete_dm_sender(int(msg_id), uname)
         elif msg['recipient'] == uname:
             REGISTRATION_DB.delete_dm_recip(int(msg_id), uname)
+        else:
+            return self._redirect('/manage/messages')
+        conv_id = msg['conversation_id'] if ('conversation_id' in msg.keys() and msg['conversation_id']) else msg['id']
+        self._redirect(f'/manage/messages/{conv_id}?msg=Message+deleted&msg_type=success')
 
     def _post_dm_delete_conversation(self):
         user = self._get_session_user()
@@ -11448,7 +11549,6 @@ class ManageHandler(BaseHTTPRequestHandler):
         REGISTRATION_DB._log(uname, 'dm_delete_conversation', uname,
                              f'conversation_id={conv_id}')
         self._redirect('/manage/messages?msg=Conversation+deleted&msg_type=success')
-        self._redirect('/manage/messages?msg=Message+deleted&msg_type=success')
 
     def _post_dm_mark_read(self):
         user = self._get_session_user()
