@@ -396,7 +396,9 @@ class StatsTracker:
         self.all_udp_announces   = 0
         self.all_ipv4_clients    = 0
         self.all_ipv6_clients    = 0
-        self.all_unique_ips      = set()
+        # Intentional: we do not persist or retain raw historical IP identities.
+        # This metric tracks the highest unique-IP count observed in a single day.
+        self.all_time_high_daily_unique_ips = 0
         self.all_bytes_sent      = 0   # after compression
         self.all_bytes_raw       = 0   # before compression
         self.all_gzip_count      = 0
@@ -411,6 +413,7 @@ class StatsTracker:
         self.today_ipv4_clients    = 0
         self.today_ipv6_clients    = 0
         self.today_unique_ips      = set()
+        self.today_unique_ips_base = 0
         self.today_bytes_sent      = 0
         self.today_bytes_raw       = 0
         self.today_gzip_count      = 0
@@ -420,8 +423,15 @@ class StatsTracker:
         # ── Yesterday snapshot ────────────────────────────────
         self.yesterday = {}
 
+    def _today_unique_count(self) -> int:
+        return self.today_unique_ips_base + len(self.today_unique_ips)
+
     def _rollover(self):
         yesterday_str = self._today.isoformat()
+        self.all_time_high_daily_unique_ips = max(
+            self.all_time_high_daily_unique_ips,
+            self._today_unique_count()
+        )
         self.yesterday = {
             'date':            yesterday_str,
             'announces':       self.today_announces,
@@ -430,7 +440,7 @@ class StatsTracker:
             'udp':             self.today_udp_announces,
             'ipv4':            self.today_ipv4_clients,
             'ipv6':            self.today_ipv6_clients,
-            'unique_ips':      len(self.today_unique_ips),
+            'unique_ips':      self._today_unique_count(),
             'bytes_sent':      self.today_bytes_sent,
             'bytes_raw':       self.today_bytes_raw,
             'gzip_count':      self.today_gzip_count,
@@ -446,6 +456,7 @@ class StatsTracker:
         self.today_ipv4_clients    = 0
         self.today_ipv6_clients    = 0
         self.today_unique_ips      = set()
+        self.today_unique_ips_base = 0
         self.today_bytes_sent      = 0
         self.today_bytes_raw       = 0
         self.today_gzip_count      = 0
@@ -463,8 +474,11 @@ class StatsTracker:
             self.all_announces   += 1
             self.today_announces += 1
             self.today_hourly[hour] += 1
-            self.all_unique_ips.add(ip)
             self.today_unique_ips.add(ip)
+            self.all_time_high_daily_unique_ips = max(
+                self.all_time_high_daily_unique_ips,
+                self._today_unique_count()
+            )
             if protocol == 'http':
                 self.all_http_announces   += 1
                 self.today_http_announces += 1
@@ -501,6 +515,142 @@ class StatsTracker:
             self.today_bytes_sent += sent
             self.today_bytes_raw  += sent
 
+    def persistence_export(self) -> dict:
+        with self._lock:
+            today_row = {
+                'date': self._today.isoformat(),
+                'announces': self.today_announces,
+                'http': self.today_http_announces,
+                'https': self.today_https_announces,
+                'udp': self.today_udp_announces,
+                'ipv4': self.today_ipv4_clients,
+                'ipv6': self.today_ipv6_clients,
+                'unique_ips': self._today_unique_count(),
+                'bytes_sent': self.today_bytes_sent,
+                'bytes_raw': self.today_bytes_raw,
+                'gzip_count': self.today_gzip_count,
+                'plain_count': self.today_plain_count,
+                'hourly': list(self.today_hourly),
+            }
+            daily_rows = [today_row]
+            if self.yesterday.get('date'):
+                daily_rows.append(dict(self.yesterday))
+            return {
+                'all': {
+                    'announces': self.all_announces,
+                    'http': self.all_http_announces,
+                    'https': self.all_https_announces,
+                    'udp': self.all_udp_announces,
+                    'ipv4': self.all_ipv4_clients,
+                    'ipv6': self.all_ipv6_clients,
+                    'bytes_sent': self.all_bytes_sent,
+                    'bytes_raw': self.all_bytes_raw,
+                    'gzip_count': self.all_gzip_count,
+                    'plain_count': self.all_plain_count,
+                    'all_time_high_daily_unique_ips': self.all_time_high_daily_unique_ips,
+                },
+                'daily_rows': daily_rows,
+            }
+
+    def apply_persistence_state(self, persisted: dict):
+        if not isinstance(persisted, dict):
+            return
+        today_str = datetime.date.today().isoformat()
+        yesterday_str = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+
+        def _to_int(v, default=0):
+            try:
+                return int(v)
+            except Exception:
+                return default
+
+        rows_by_day = {}
+        for r in persisted.get('daily_rows') or []:
+            if not isinstance(r, dict):
+                continue
+            d = str(r.get('date', '')).strip()
+            if d:
+                rows_by_day[d] = r
+
+        with self._lock:
+            all_stats = persisted.get('all') or {}
+            self.all_announces = _to_int(all_stats.get('announces'))
+            self.all_http_announces = _to_int(all_stats.get('http'))
+            self.all_https_announces = _to_int(all_stats.get('https'))
+            self.all_udp_announces = _to_int(all_stats.get('udp'))
+            self.all_ipv4_clients = _to_int(all_stats.get('ipv4'))
+            self.all_ipv6_clients = _to_int(all_stats.get('ipv6'))
+            self.all_bytes_sent = _to_int(all_stats.get('bytes_sent'))
+            self.all_bytes_raw = _to_int(all_stats.get('bytes_raw'))
+            self.all_gzip_count = _to_int(all_stats.get('gzip_count'))
+            self.all_plain_count = _to_int(all_stats.get('plain_count'))
+            self.all_time_high_daily_unique_ips = max(
+                _to_int(all_stats.get('all_time_high_daily_unique_ips')),
+                _to_int((rows_by_day.get(today_str) or {}).get('unique_ips')),
+                _to_int((rows_by_day.get(yesterday_str) or {}).get('unique_ips')),
+            )
+
+            # Rebuild all-time daily totals from persisted rows (up to ~30 recent days).
+            self.daily_totals = {}
+            for day, row in rows_by_day.items():
+                self.daily_totals[day] = _to_int(row.get('announces'))
+
+            self._today = datetime.date.today()
+            today_row = rows_by_day.get(today_str)
+            if today_row:
+                self.today_announces = _to_int(today_row.get('announces'))
+                self.today_http_announces = _to_int(today_row.get('http'))
+                self.today_https_announces = _to_int(today_row.get('https'))
+                self.today_udp_announces = _to_int(today_row.get('udp'))
+                self.today_ipv4_clients = _to_int(today_row.get('ipv4'))
+                self.today_ipv6_clients = _to_int(today_row.get('ipv6'))
+                self.today_unique_ips = set()
+                self.today_unique_ips_base = max(0, _to_int(today_row.get('unique_ips')))
+                self.today_bytes_sent = _to_int(today_row.get('bytes_sent'))
+                self.today_bytes_raw = _to_int(today_row.get('bytes_raw'))
+                self.today_gzip_count = _to_int(today_row.get('gzip_count'))
+                self.today_plain_count = _to_int(today_row.get('plain_count'))
+                hourly = today_row.get('hourly') or []
+                if not isinstance(hourly, list):
+                    hourly = []
+                hourly = [max(0, _to_int(v)) for v in hourly[:24]]
+                hourly += [0] * (24 - len(hourly))
+                self.today_hourly = hourly
+            else:
+                self.today_announces = 0
+                self.today_http_announces = 0
+                self.today_https_announces = 0
+                self.today_udp_announces = 0
+                self.today_ipv4_clients = 0
+                self.today_ipv6_clients = 0
+                self.today_unique_ips = set()
+                self.today_unique_ips_base = 0
+                self.today_bytes_sent = 0
+                self.today_bytes_raw = 0
+                self.today_gzip_count = 0
+                self.today_plain_count = 0
+                self.today_hourly = [0] * 24
+
+            y_row = rows_by_day.get(yesterday_str)
+            if y_row:
+                self.yesterday = {
+                    'date': yesterday_str,
+                    'announces': _to_int(y_row.get('announces')),
+                    'http': _to_int(y_row.get('http')),
+                    'https': _to_int(y_row.get('https')),
+                    'udp': _to_int(y_row.get('udp')),
+                    'ipv4': _to_int(y_row.get('ipv4')),
+                    'ipv6': _to_int(y_row.get('ipv6')),
+                    'unique_ips': _to_int(y_row.get('unique_ips')),
+                    'bytes_sent': _to_int(y_row.get('bytes_sent')),
+                    'bytes_raw': _to_int(y_row.get('bytes_raw')),
+                    'gzip_count': _to_int(y_row.get('gzip_count')),
+                    'plain_count': _to_int(y_row.get('plain_count')),
+                    'hourly': (y_row.get('hourly') or [0] * 24)[:24],
+                }
+            else:
+                self.yesterday = {}
+
     def snapshot(self) -> dict:
         torrents, live_peers = REGISTRY.live_stats()
         with self._lock:
@@ -515,7 +665,7 @@ class StatsTracker:
                     'udp':         self.all_udp_announces,
                     'ipv4':        self.all_ipv4_clients,
                     'ipv6':        self.all_ipv6_clients,
-                    'unique_ips':  len(self.all_unique_ips),
+                    'unique_ips':  self.all_time_high_daily_unique_ips,
                     'bytes_sent':  self.all_bytes_sent,
                     'bytes_raw':   self.all_bytes_raw,
                     'gzip_count':  self.all_gzip_count,
@@ -530,7 +680,7 @@ class StatsTracker:
                     'udp':         self.today_udp_announces,
                     'ipv4':        self.today_ipv4_clients,
                     'ipv6':        self.today_ipv6_clients,
-                    'unique_ips':  len(self.today_unique_ips),
+                    'unique_ips':  self._today_unique_count(),
                     'bytes_sent':  self.today_bytes_sent,
                     'bytes_raw':   self.today_bytes_raw,
                     'gzip_count':  self.today_gzip_count,
@@ -1391,6 +1541,39 @@ class RegistrationDB:
               ON tfa_recovery_events(user_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_tfa_recovery_action_created
               ON tfa_recovery_events(action, id DESC);
+            CREATE TABLE IF NOT EXISTS tracker_stats_state (
+                id                               INTEGER PRIMARY KEY CHECK (id = 1),
+                updated_at                       TEXT    NOT NULL,
+                all_announces                    INTEGER NOT NULL DEFAULT 0,
+                all_http_announces               INTEGER NOT NULL DEFAULT 0,
+                all_https_announces              INTEGER NOT NULL DEFAULT 0,
+                all_udp_announces                INTEGER NOT NULL DEFAULT 0,
+                all_ipv4_clients                 INTEGER NOT NULL DEFAULT 0,
+                all_ipv6_clients                 INTEGER NOT NULL DEFAULT 0,
+                all_bytes_sent                   INTEGER NOT NULL DEFAULT 0,
+                all_bytes_raw                    INTEGER NOT NULL DEFAULT 0,
+                all_gzip_count                   INTEGER NOT NULL DEFAULT 0,
+                all_plain_count                  INTEGER NOT NULL DEFAULT 0,
+                all_time_high_daily_unique_ips   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS tracker_stats_daily (
+                day          TEXT PRIMARY KEY,
+                announces    INTEGER NOT NULL DEFAULT 0,
+                http         INTEGER NOT NULL DEFAULT 0,
+                https        INTEGER NOT NULL DEFAULT 0,
+                udp          INTEGER NOT NULL DEFAULT 0,
+                ipv4         INTEGER NOT NULL DEFAULT 0,
+                ipv6         INTEGER NOT NULL DEFAULT 0,
+                unique_ips   INTEGER NOT NULL DEFAULT 0,
+                bytes_sent   INTEGER NOT NULL DEFAULT 0,
+                bytes_raw    INTEGER NOT NULL DEFAULT 0,
+                gzip_count   INTEGER NOT NULL DEFAULT 0,
+                plain_count  INTEGER NOT NULL DEFAULT 0,
+                hourly_json  TEXT    NOT NULL DEFAULT '[]',
+                updated_at   TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tracker_stats_daily_day
+              ON tracker_stats_daily(day DESC);
         ''')
         # ── Migrations ────────────────────────────────────────
         cols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
@@ -1913,6 +2096,8 @@ class RegistrationDB:
             'peer_query_retry_wait_sec':    '2',
             'peer_query_auto_on_upload':    '0',
             'peer_query_auto_upload_cap':   '5',
+            'stats_persist_enabled':        '0',
+            'stats_persist_interval_sec':   '300',
             'webauthn_login_enabled':       '0',
             'webauthn_enforce_sitewide':    '0',
             'webauthn_enforce_admins':      '0',
@@ -2198,6 +2383,158 @@ class RegistrationDB:
             'auto_upload_cap': auto_upload_cap,
             'min_interval_sec': PEER_SCRAPE_MIN_INTERVAL_SECONDS,
         }
+
+    def get_stats_persist_config(self) -> dict:
+        settings = self.get_all_settings()
+        enabled = settings.get('stats_persist_enabled', '0') == '1'
+        try:
+            interval_sec = max(30, min(3600, int(settings.get('stats_persist_interval_sec', '300') or '300')))
+        except Exception:
+            interval_sec = 300
+        return {
+            'enabled': enabled,
+            'interval_sec': interval_sec,
+        }
+
+    def save_stats_persistence(self, exported: dict):
+        if not isinstance(exported, dict):
+            return
+        all_stats = exported.get('all') or {}
+        rows = exported.get('daily_rows') or []
+        now = self._ts()
+        c = self._conn()
+        c.execute(
+            '''INSERT INTO tracker_stats_state (
+                   id, updated_at, all_announces, all_http_announces, all_https_announces, all_udp_announces,
+                   all_ipv4_clients, all_ipv6_clients, all_bytes_sent, all_bytes_raw,
+                   all_gzip_count, all_plain_count, all_time_high_daily_unique_ips
+               ) VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                   updated_at=excluded.updated_at,
+                   all_announces=excluded.all_announces,
+                   all_http_announces=excluded.all_http_announces,
+                   all_https_announces=excluded.all_https_announces,
+                   all_udp_announces=excluded.all_udp_announces,
+                   all_ipv4_clients=excluded.all_ipv4_clients,
+                   all_ipv6_clients=excluded.all_ipv6_clients,
+                   all_bytes_sent=excluded.all_bytes_sent,
+                   all_bytes_raw=excluded.all_bytes_raw,
+                   all_gzip_count=excluded.all_gzip_count,
+                   all_plain_count=excluded.all_plain_count,
+                   all_time_high_daily_unique_ips=excluded.all_time_high_daily_unique_ips''',
+            (
+                now,
+                int(all_stats.get('announces', 0)),
+                int(all_stats.get('http', 0)),
+                int(all_stats.get('https', 0)),
+                int(all_stats.get('udp', 0)),
+                int(all_stats.get('ipv4', 0)),
+                int(all_stats.get('ipv6', 0)),
+                int(all_stats.get('bytes_sent', 0)),
+                int(all_stats.get('bytes_raw', 0)),
+                int(all_stats.get('gzip_count', 0)),
+                int(all_stats.get('plain_count', 0)),
+                int(all_stats.get('all_time_high_daily_unique_ips', 0)),
+            )
+        )
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            day = (row.get('date') or '').strip()
+            if not day:
+                continue
+            hourly = row.get('hourly') or []
+            if not isinstance(hourly, list):
+                hourly = []
+            hourly = [max(0, int(v)) if str(v).lstrip('-').isdigit() else 0 for v in hourly[:24]]
+            hourly += [0] * (24 - len(hourly))
+            c.execute(
+                '''INSERT INTO tracker_stats_daily (
+                       day, announces, http, https, udp, ipv4, ipv6, unique_ips,
+                       bytes_sent, bytes_raw, gzip_count, plain_count, hourly_json, updated_at
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(day) DO UPDATE SET
+                       announces=excluded.announces,
+                       http=excluded.http,
+                       https=excluded.https,
+                       udp=excluded.udp,
+                       ipv4=excluded.ipv4,
+                       ipv6=excluded.ipv6,
+                       unique_ips=excluded.unique_ips,
+                       bytes_sent=excluded.bytes_sent,
+                       bytes_raw=excluded.bytes_raw,
+                       gzip_count=excluded.gzip_count,
+                       plain_count=excluded.plain_count,
+                       hourly_json=excluded.hourly_json,
+                       updated_at=excluded.updated_at''',
+                (
+                    day,
+                    int(row.get('announces', 0)),
+                    int(row.get('http', 0)),
+                    int(row.get('https', 0)),
+                    int(row.get('udp', 0)),
+                    int(row.get('ipv4', 0)),
+                    int(row.get('ipv6', 0)),
+                    int(row.get('unique_ips', 0)),
+                    int(row.get('bytes_sent', 0)),
+                    int(row.get('bytes_raw', 0)),
+                    int(row.get('gzip_count', 0)),
+                    int(row.get('plain_count', 0)),
+                    json.dumps(hourly),
+                    now,
+                )
+            )
+        c.commit()
+
+    def load_stats_persistence(self) -> dict:
+        c = self._conn()
+        state = c.execute('SELECT * FROM tracker_stats_state WHERE id=1').fetchone()
+        rows = c.execute(
+            '''SELECT day, announces, http, https, udp, ipv4, ipv6, unique_ips,
+                      bytes_sent, bytes_raw, gzip_count, plain_count, hourly_json
+               FROM tracker_stats_daily
+               ORDER BY day DESC
+               LIMIT 35'''
+        ).fetchall()
+        out_rows = []
+        for r in rows:
+            try:
+                hourly = json.loads(r['hourly_json'] or '[]')
+            except Exception:
+                hourly = []
+            if not isinstance(hourly, list):
+                hourly = []
+            out_rows.append({
+                'date': r['day'],
+                'announces': int(r['announces'] or 0),
+                'http': int(r['http'] or 0),
+                'https': int(r['https'] or 0),
+                'udp': int(r['udp'] or 0),
+                'ipv4': int(r['ipv4'] or 0),
+                'ipv6': int(r['ipv6'] or 0),
+                'unique_ips': int(r['unique_ips'] or 0),
+                'bytes_sent': int(r['bytes_sent'] or 0),
+                'bytes_raw': int(r['bytes_raw'] or 0),
+                'gzip_count': int(r['gzip_count'] or 0),
+                'plain_count': int(r['plain_count'] or 0),
+                'hourly': hourly[:24],
+            })
+        out_all = {}
+        if state:
+            out_all = {
+                'announces': int(state['all_announces'] or 0),
+                'http': int(state['all_http_announces'] or 0),
+                'https': int(state['all_https_announces'] or 0),
+                'udp': int(state['all_udp_announces'] or 0),
+                'ipv4': int(state['all_ipv4_clients'] or 0),
+                'ipv6': int(state['all_ipv6_clients'] or 0),
+                'bytes_sent': int(state['all_bytes_sent'] or 0),
+                'bytes_raw': int(state['all_bytes_raw'] or 0),
+                'gzip_count': int(state['all_gzip_count'] or 0),
+                'plain_count': int(state['all_plain_count'] or 0),
+                'all_time_high_daily_unique_ips': int(state['all_time_high_daily_unique_ips'] or 0),
+            }
+        return {'all': out_all, 'daily_rows': out_rows}
 
     def update_torrent_peer_snapshot(self, ih: str, seeds: int, peers: int,
                                      downloaded: int | None, tracker: str, actor: str):
@@ -10320,6 +10657,14 @@ class ManageHandler(BaseHTTPRequestHandler):
                 except Exception:
                     v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
+        elif form_id == 'stats_persistence':
+            enabled = '1' if fields.get('stats_persist_enabled') == '1' else '0'
+            try:
+                interval = str(max(30, min(3600, int(fields.get('stats_persist_interval_sec', '300')))))
+            except Exception:
+                interval = '300'
+            REGISTRATION_DB.set_setting('stats_persist_enabled', enabled, user['username'])
+            REGISTRATION_DB.set_setting('stats_persist_interval_sec', interval, user['username'])
         elif form_id == 'peer_query_settings':
             enabled = '1' if fields.get('peer_query_enabled') == '1' else '0'
             tracker = fields.get('peer_query_tracker', '').strip()
@@ -10619,7 +10964,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         }
         settings_forms = {
             'complexity', 'free_signup', 'open_tracker', 'comments_enabled',
-            'robots_txt', 'torrents_per_page', 'upload_limits',
+            'robots_txt', 'torrents_per_page', 'upload_limits', 'stats_persistence',
             'gravatar_settings', 'webauthn_settings', 'tfa_settings',
         }
         if form_id == 'topup_settings':
@@ -13600,6 +13945,8 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     upload_max_content_mb = settings.get('upload_max_content_mb', '100')
     upload_max_files = settings.get('upload_max_files', '1000')
     upload_max_file_mb = settings.get('upload_max_file_mb', '10')
+    stats_persist_enabled = settings.get('stats_persist_enabled', '0') == '1'
+    stats_persist_interval = settings.get('stats_persist_interval_sec', '300')
     robots_txt_val = settings.get('robots_txt', 'User-agent: *\nDisallow: /')
     ap_enabled = settings.get('auto_promote_enabled', '0') == '1'
     settings_html = f'''
@@ -13710,6 +14057,24 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             <label>Max file size (MB)</label>
             <input type="number" name="upload_max_file_mb" value="{upload_max_file_mb}"
                    min="1" max="1024" style="width:120px">
+          </div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">Stats Persistence</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Periodically save tracker stats to SQLite and restore them on startup.
+          Daily counters only restore into Today/Yesterday when dates match; older data remains historical.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="stats_persistence">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+            <input type="checkbox" name="stats_persist_enabled" value="1" {'checked' if stats_persist_enabled else ''}> Enable stats persistence
+          </label>
+          <div class="form-group">
+            <label>Flush interval (seconds)</label>
+            <input type="number" name="stats_persist_interval_sec" value="{stats_persist_interval}" min="30" max="3600" style="width:120px">
           </div>
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
@@ -17437,6 +17802,14 @@ def main():
     if REGISTRATION_DB is not None:
         REGISTRATION_DB._init_defaults(announce_urls)
         WEB_CONFIG['free_signup'] = REGISTRATION_DB.get_setting('free_signup') == '1'
+        try:
+            _sp_cfg = REGISTRATION_DB.get_stats_persist_config()
+            if _sp_cfg.get('enabled'):
+                _persisted = REGISTRATION_DB.load_stats_persistence()
+                STATS.apply_persistence_state(_persisted)
+                log.info('Stats persistence restored from database.')
+        except Exception as _e:
+            log.warning('stats persistence restore failed (non-fatal): %s', _e)
 
     if args.web_https_port:
         if not ssl_ctx:
@@ -17477,6 +17850,7 @@ def main():
     log.info('Tracker running. Press Ctrl-C to stop.')
 
     # ── Stats loop ───────────────────────────────────────────
+    _last_stats_persist_flush = 0.0
     try:
         while True:
             time.sleep(60)
@@ -17510,6 +17884,18 @@ def main():
                     REGISTRATION_DB.expire_tfa_challenges()
                 except Exception as _e:
                     log.warning('expire_tfa_challenges failed (non-fatal): %s', _e)
+                try:
+                    _sp_cfg = REGISTRATION_DB.get_stats_persist_config()
+                    _now = time.time()
+                    if _sp_cfg.get('enabled'):
+                        _interval = int(_sp_cfg.get('interval_sec', 300))
+                        if (_now - _last_stats_persist_flush) >= _interval:
+                            REGISTRATION_DB.save_stats_persistence(STATS.persistence_export())
+                            _last_stats_persist_flush = _now
+                    else:
+                        _last_stats_persist_flush = _now
+                except Exception as _e:
+                    log.warning('stats persistence flush failed (non-fatal): %s', _e)
             hashes = REGISTRY.all_hashes()
             total_peers = sum(
                 len(REGISTRY._torrents.get(h, {})) for h in hashes
