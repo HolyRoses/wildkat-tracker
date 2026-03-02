@@ -10221,7 +10221,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/dashboard')
         count = REGISTRATION_DB.delete_all_users(user['username'], user['username'])
         log.info('DELETE ALL USERS: %d users removed by %s', count, user['username'])
-        self._redirect('/manage/admin')
+        msg = urllib.parse.quote(f'Deleted {count} user(s).')
+        self._redirect(f'/manage/admin?tab=danger&msg={msg}')
 
     def _post_delete_all_torrents_global(self):
         user = self._get_session_user()
@@ -10229,8 +10230,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage')
         if user['username'] != SUPER_USER:
             return self._redirect('/manage/dashboard')
+        deleted = REGISTRATION_DB.count_torrents()
         REGISTRATION_DB.delete_all_torrents(user['username'])
-        self._redirect('/manage/admin')
+        msg = urllib.parse.quote(f'Deleted {deleted} torrent(s).')
+        self._redirect(f'/manage/admin?tab=danger&msg={msg}')
 
     def _post_delete_all_torrents_user(self):
         user = self._get_session_user()
