@@ -1005,9 +1005,12 @@ def _pagination_html(current_page: int, total_pages: int, base_url: str,
 
 def _user_role(user) -> str:
     """Return 'super','admin','standard','basic' for a user row."""
-    if user['username'] == SUPER_USER: return 'super'
-    if user['is_admin']:               return 'admin'
-    if 'is_standard' in user.keys() and user['is_standard']: return 'standard'
+    if user['username'] == SUPER_USER:
+        return 'super'
+    if user['is_admin']:
+        return 'admin'
+    if 'is_standard' in user.keys() and user['is_standard']:
+        return 'standard'
     return 'basic'
 
 
@@ -1196,7 +1199,7 @@ def _build_tfa_fernet():
     if not raw:
         return None
     try:
-        key_bytes = raw.encode('ascii')
+        raw.encode('ascii')
         key = b''
         # If already base64-decodable, require exact Fernet key material length.
         try:
@@ -1347,8 +1350,10 @@ class RegistrationDB:
                 getattr(self._local, 'conn_gen', -1) != self._restore_gen):
             old = getattr(self._local, 'conn', None)
             if old:
-                try: old.close()
-                except Exception: pass
+                try:
+                    old.close()
+                except Exception:
+                    pass
             conn = sqlite3.connect(self._path, check_same_thread=False,
                                    timeout=10)
             conn.row_factory = sqlite3.Row
@@ -3772,7 +3777,8 @@ class RegistrationDB:
         row = self._conn().execute('SELECT user_id,ip_address FROM ip_allowlist WHERE id=?', (entry_id,)).fetchone()
         self._conn().execute('DELETE FROM ip_allowlist WHERE id=?', (entry_id,))
         self._conn().commit()
-        if row: self._log(actor, 'ip_allowlist_remove', str(row[0]), row[1])
+        if row:
+            self._log(actor, 'ip_allowlist_remove', str(row[0]), row[1])
 
     def clear_ip_allowlist(self, user_id: int, actor: str):
         self._conn().execute('DELETE FROM ip_allowlist WHERE user_id=?', (user_id,))
@@ -4131,7 +4137,7 @@ class RegistrationDB:
     def award_upload_points(self, user_id: int, torrent_name: str, info_hash: str) -> int:
         """Award points for a new torrent upload. Returns points awarded."""
         pts = int(self.get_setting('points_upload', '25'))
-        bal = self.award_points(user_id, pts, f'upload: {torrent_name}', 'torrent', info_hash)
+        self.award_points(user_id, pts, f'upload: {torrent_name}', 'torrent', info_hash)
         self.check_auto_promote(user_id)
         return pts
 
@@ -4374,9 +4380,6 @@ class RegistrationDB:
         expiry_dt = datetime.datetime.fromisoformat(b['expires_at'] + 'T23:59:59')
         if now > expiry_dt:
             return False, 'This bounty has expired.'
-        pending_until = (now + datetime.timedelta(
-            hours=int(self.get_setting('bounty_pending_hours', '48'))
-        )).isoformat()
         c = self._conn()
         c.execute(
             'UPDATE bounties SET status=?,claimed_infohash=?,claimed_by=?,claimed_at=? WHERE id=?',
@@ -4865,7 +4868,9 @@ class RegistrationDB:
 
     def backup_to_bytes(self) -> bytes:
         """Return a gzip-compressed snapshot of the live DB as raw bytes."""
-        import io, gzip, tempfile, os
+        import gzip
+        import tempfile
+        import os
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tf:
             tmp_path = tf.name
         try:
@@ -4883,7 +4888,10 @@ class RegistrationDB:
 
     def restore_from_bytes(self, gz_data: bytes, actor: str) -> None:
         """Replace the live DB with a gzip-compressed SQLite backup."""
-        import gzip, tempfile, os, shutil
+        import gzip
+        import tempfile
+        import os
+        import shutil
         try:
             raw = gzip.decompress(gz_data)
         except Exception:
@@ -4916,8 +4924,10 @@ class RegistrationDB:
                 for ext in ('-wal', '-shm'):
                     sidecar = self._path + ext
                     if os.path.exists(sidecar):
-                        try: os.unlink(sidecar)
-                        except Exception: pass
+                        try:
+                            os.unlink(sidecar)
+                        except Exception:
+                            pass
                 # Bump generation — every thread will reopen on next DB call
                 self._restore_gen += 1
         finally:
@@ -5967,11 +5977,14 @@ class RegistrationDB:
             clauses.append('(actor LIKE ? OR action LIKE ? OR target LIKE ? OR detail LIKE ?)')
             params += [like, like, like, like]
         if q_actor:
-            clauses.append('actor LIKE ?');  params.append(f'%{q_actor}%')
+            clauses.append('actor LIKE ?')
+            params.append(f'%{q_actor}%')
         if q_action:
-            clauses.append('action LIKE ?'); params.append(f'%{q_action}%')
+            clauses.append('action LIKE ?')
+            params.append(f'%{q_action}%')
         if q_target:
-            clauses.append('target LIKE ?'); params.append(f'%{q_target}%')
+            clauses.append('target LIKE ?')
+            params.append(f'%{q_target}%')
         where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
         rows = self._conn().execute(
             f'SELECT * FROM events {where} ORDER BY id DESC LIMIT ? OFFSET ?',
@@ -6491,8 +6504,10 @@ def _fmt_uptime(seconds: float) -> str:
     hours, s   = divmod(s, 3600)
     minutes, _ = divmod(s, 60)
     parts = []
-    if days:    parts.append(f'{days}d')
-    if hours:   parts.append(f'{hours}h')
+    if days:
+        parts.append(f'{days}d')
+    if hours:
+        parts.append(f'{hours}h')
     parts.append(f'{minutes}m')
     return ' '.join(parts)
 
@@ -6598,7 +6613,6 @@ def generate_stats_html(snap: dict, web_config: dict, show_manage: bool = False)
     else:
         manage_btn = ''
     announce_urls = web_config.get('announce_urls', [])
-    domain        = web_config.get('domain', '')
 
     # Build announce URL rows
     url_rows = ''
@@ -7359,9 +7373,8 @@ WEB_CONFIG: dict = {}   # populated at startup by main()
 # ── In-memory typing presence store ─────────────────────────────────────────
 # {thread_key: {'username': str, 'expires': float}}
 # thread_key = "dm:{user_a}:{user_b}" (sorted alphabetically)
-import threading as _threading
 _TYPING_STORE: dict = {}
-_TYPING_LOCK  = _threading.Lock()
+_TYPING_LOCK  = threading.Lock()
 _ONLINE_MINUTES  = 5   # active within N minutes = online
 _RECENT_MINUTES  = 30  # active within N minutes = recently active
 
@@ -9526,13 +9539,16 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_notifications(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         self._send_html(_render_notifications_page(user))
 
     def _get_bounty_board(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
         qs   = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         sort = qs.get('sort', ['points'])[0]
         raw_status = qs.get('status', [None])[0]
@@ -9558,18 +9574,23 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_leaderboard(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
         top_n = int(REGISTRATION_DB.get_setting('leaderboard_top_n', '10'))
         data  = REGISTRATION_DB.get_leaderboard(top_n)
         self._send_html(_render_leaderboard(user, data, top_n))
 
     def _get_bounty_detail(self, bounty_id: int):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
         bounty = REGISTRATION_DB.get_bounty(bounty_id)
-        if not bounty: return self._send_html('<h1>Bounty Not Found</h1>', 404)
+        if not bounty:
+            return self._send_html('<h1>Bounty Not Found</h1>', 404)
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
@@ -9587,7 +9608,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_comment(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body   = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         ih     = fields.get('info_hash', '').strip().upper()
@@ -9597,7 +9619,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not ih or not text:
             return self._redirect(f'/manage/torrent/{ih.lower()}')
         t = REGISTRATION_DB.get_torrent(ih)
-        if not t: return self._redirect('/manage/dashboard')
+        if not t:
+            return self._redirect('/manage/dashboard')
         # Block if comments system is disabled globally
         if REGISTRATION_DB.get_setting('comments_enabled', '1') != '1':
             return self._redirect(f'/manage/torrent/{ih.lower()}')
@@ -9626,7 +9649,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_comment_edit(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body   = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         cid    = fields.get('comment_id', '').strip()
@@ -9650,7 +9674,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_comment_delete(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body   = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         cid    = fields.get('comment_id', '').strip()
@@ -9663,7 +9688,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_notification_read(self, nid_str: str):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         if nid_str.isdigit():
             n = REGISTRATION_DB.get_notification(int(nid_str), user['id'])
             if n:
@@ -9689,7 +9715,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_delete_all_comments_global(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         if _user_role(user) not in ('super', 'admin'):
             return self._redirect('/manage/dashboard')
         count = REGISTRATION_DB.delete_all_comments_global(user['username'])
@@ -9698,7 +9725,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_system_wipe(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         if _user_role(user) != 'super':
             return self._redirect('/manage/dashboard')
         body = self._read_body()
@@ -9715,26 +9743,30 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_delete_all_comments(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         if _user_role(user) not in ('super', 'admin'):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         ih = fields.get('info_hash', '').strip().upper()
-        if not ih: return self._redirect('/manage/dashboard')
+        if not ih:
+            return self._redirect('/manage/dashboard')
         count = REGISTRATION_DB.delete_all_comments(ih, user['username'])
         msg = urllib.parse.quote(f'{count} comment(s) deleted')
         self._redirect(f'/manage/torrent/{ih.lower()}?msg={msg}&msg_type=success')
 
     def _post_notification_read_all(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         REGISTRATION_DB.mark_all_notifications_read(user['id'])
         self._redirect('/manage/notifications')
 
     def _post_toggle_comments_lock(self, lock: bool):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         ih = fields.get('info_hash', '').strip().upper()
@@ -9743,7 +9775,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         if _user_role(user) not in ('super', 'admin'):
             return self._redirect(f'/manage/torrent/{ih.lower()}')
         t = REGISTRATION_DB.get_torrent(ih.upper())
-        if not t: return self._redirect('/manage/dashboard')
+        if not t:
+            return self._redirect('/manage/dashboard')
         REGISTRATION_DB.set_comments_locked(ih, lock, user['username'])
         self._redirect(f'/manage/torrent/{ih.lower()}')
 
@@ -9786,13 +9819,17 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_torrent_detail(self, ih: str):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         t = REGISTRATION_DB.get_torrent(ih.upper())
-        if not t: return self._send_html('<h1>Torrent not found</h1>', 404)
+        if not t:
+            return self._send_html('<h1>Torrent not found</h1>', 404)
         referer = self.headers.get('Referer', '')
         back = urllib.parse.urlparse(referer).path or '/manage/dashboard'
-        if back.startswith('/manage/torrent'): back = '/manage/dashboard'
-        if back == '/manage/upload': back = '/manage/dashboard'
+        if back.startswith('/manage/torrent'):
+            back = '/manage/dashboard'
+        if back == '/manage/upload':
+            back = '/manage/dashboard'
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
@@ -9949,7 +9986,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_admin_set_password(self, target_username: str):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         if not (user['is_admin'] or user['username'] == SUPER_USER):
             return self._redirect('/manage/dashboard')
         target = REGISTRATION_DB.get_user(target_username)
@@ -9966,7 +10004,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_admin_set_password(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         is_super = user['username'] == SUPER_USER
         if not (user['is_admin'] or is_super):
             return self._redirect('/manage/dashboard')
@@ -10160,8 +10199,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_set_standard(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if not (user['is_admin'] or user['username'] == SUPER_USER): return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if not (user['is_admin'] or user['username'] == SUPER_USER):
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         target = fields.get('username', '').strip()
@@ -10174,22 +10215,27 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_delete_all_users(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if user['username'] != SUPER_USER: return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if user['username'] != SUPER_USER:
+            return self._redirect('/manage/dashboard')
         count = REGISTRATION_DB.delete_all_users(user['username'], user['username'])
         log.info('DELETE ALL USERS: %d users removed by %s', count, user['username'])
         self._redirect('/manage/admin')
 
     def _post_delete_all_torrents_global(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if user['username'] != SUPER_USER: return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if user['username'] != SUPER_USER:
+            return self._redirect('/manage/dashboard')
         REGISTRATION_DB.delete_all_torrents(user['username'])
         self._redirect('/manage/admin')
 
     def _post_delete_all_torrents_user(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         target_username = fields.get('username', '').strip()
@@ -10212,8 +10258,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_ip_lock(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if user['username'] != SUPER_USER: return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if user['username'] != SUPER_USER:
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         target_uid = int(fields.get('user_id', 0))
@@ -10230,8 +10278,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_ip_lock_remove(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if user['username'] != SUPER_USER: return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if user['username'] != SUPER_USER:
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         entry_id   = int(fields.get('entry_id', 0))
@@ -10242,8 +10292,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_ip_lock_clear(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if user['username'] != SUPER_USER: return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if user['username'] != SUPER_USER:
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         target_uid      = int(fields.get('user_id', 0))
@@ -10254,7 +10306,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_search(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         qs = urllib.parse.urlparse(self.path).query
         params = urllib.parse.parse_qs(qs)
         query  = params.get('q', [''])[0].strip()[:200]
@@ -10275,8 +10328,10 @@ class ManageHandler(BaseHTTPRequestHandler):
     def _serve_robots(self):
         txt = 'User-agent: *\nDisallow: /manage\n'
         if REGISTRATION_DB:
-            try: txt = REGISTRATION_DB.get_setting('robots_txt') or txt
-            except Exception: pass
+            try:
+                txt = REGISTRATION_DB.get_setting('robots_txt') or txt
+            except Exception:
+                pass
         data = txt.encode()
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')
@@ -10291,10 +10346,13 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_public_profile(self, username: str):
         viewer = self._get_session_user()
-        if not viewer: return self._redirect('/manage')
-        if _user_role(viewer) == 'basic': return self._redirect('/manage/dashboard')
+        if not viewer:
+            return self._redirect('/manage')
+        if _user_role(viewer) == 'basic':
+            return self._redirect('/manage/dashboard')
         target = REGISTRATION_DB.get_user(username)
-        if not target: return self._redirect('/manage/dashboard')
+        if not target:
+            return self._redirect('/manage/dashboard')
         per_page = int(REGISTRATION_DB.get_setting('torrents_per_page', '50'))
         page     = _get_page_param(self.path)
         total    = REGISTRATION_DB.count_torrents(user_id=target['id'])
@@ -10310,7 +10368,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_profile(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         is_super  = user['username'] == SUPER_USER
         per_page  = int(REGISTRATION_DB.get_setting('torrents_per_page', '50'))
         page      = _get_page_param(self.path)
@@ -10568,8 +10627,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_tracker_add(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if not (user['is_admin'] or user['username'] == SUPER_USER): return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if not (user['is_admin'] or user['username'] == SUPER_USER):
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         url = fields.get('url', '').strip()
@@ -10579,28 +10640,36 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_tracker_delete(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if not (user['is_admin'] or user['username'] == SUPER_USER): return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if not (user['is_admin'] or user['username'] == SUPER_USER):
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         tid = int(fields.get('tid', 0))
-        if tid: REGISTRATION_DB.delete_magnet_tracker(tid, user['username'])
+        if tid:
+            REGISTRATION_DB.delete_magnet_tracker(tid, user['username'])
         self._redirect('/manage/admin')
 
     def _post_tracker_toggle(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if not (user['is_admin'] or user['username'] == SUPER_USER): return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if not (user['is_admin'] or user['username'] == SUPER_USER):
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         tid = int(fields.get('tid', 0))
-        if tid: REGISTRATION_DB.toggle_magnet_tracker(tid, user['username'])
+        if tid:
+            REGISTRATION_DB.toggle_magnet_tracker(tid, user['username'])
         self._redirect('/manage/admin')
 
     def _post_tracker_move(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if not (user['is_admin'] or user['username'] == SUPER_USER): return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if not (user['is_admin'] or user['username'] == SUPER_USER):
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         tid = int(fields.get('tid', 0))
@@ -10611,8 +10680,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_save_settings(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if user['username'] != SUPER_USER: return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if user['username'] != SUPER_USER:
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         form_id = fields.get('form_id', '')
@@ -10620,8 +10691,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             for key in ('pw_min_length', 'pw_require_upper', 'pw_require_lower',
                         'pw_require_digit', 'pw_require_symbol'):
                 if key == 'pw_min_length':
-                    try: val = str(max(6, min(64, int(fields.get(key, '12')))))
-                    except: val = '12'
+                    try:
+                        val = str(max(6, min(64, int(fields.get(key, '12')))))
+                    except (TypeError, ValueError):
+                        val = '12'
                 else:
                     val = '1' if fields.get(key) == '1' else '0'
                 REGISTRATION_DB.set_setting(key, val, user['username'])
@@ -10722,8 +10795,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ('points_comment',      '1',  0, 999),
                 ('points_comment_cap',  '10', 0, 999),
             ]:
-                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
-                except: v = default
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except (TypeError, ValueError):
+                    v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
         elif form_id == 'points_spend':
             for key, default, lo, hi in [
@@ -10733,8 +10808,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ('points_penalty_torrent',   '25',   0, 9999),
                 ('points_penalty_comment',   '1',    0, 999),
             ]:
-                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
-                except: v = default
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except (TypeError, ValueError):
+                    v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('auto_promote_enabled', val, user['username'])
@@ -10749,16 +10826,22 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ('bounty_confirm_votes',  '3',   1, 999),
                 ('bounty_pending_hours',  '48',  1, 720),
             ]:
-                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
-                except: v = default
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except (TypeError, ValueError):
+                    v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
         elif form_id == 'leaderboard_settings':
-            try: v = str(max(3, min(100, int(fields.get('leaderboard_top_n', '10')))))
-            except: v = '10'
+            try:
+                v = str(max(3, min(100, int(fields.get('leaderboard_top_n', '10')))))
+            except (TypeError, ValueError):
+                v = '10'
             REGISTRATION_DB.set_setting('leaderboard_top_n', v, user['username'])
         elif form_id == 'admin_grant_settings':
-            try: v = str(max(1, min(999999, int(fields.get('admin_max_point_grant', '1000')))))
-            except: v = '1000'
+            try:
+                v = str(max(1, min(999999, int(fields.get('admin_max_point_grant', '1000')))))
+            except (TypeError, ValueError):
+                v = '1000'
             REGISTRATION_DB.set_setting('admin_max_point_grant', v, user['username'])
         elif form_id == 'dm_settings':
             val = '1' if fields.get('dm_enabled') == '1' else '0'
@@ -10767,8 +10850,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ('dm_cost',        '5',  0, 9999),
                 ('dm_daily_limit', '10', 1, 999),
             ]:
-                try: v = str(max(lo, min(hi, int(fields.get(key, default)))))
-                except: v = default
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except (TypeError, ValueError):
+                    v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
         elif form_id == 'gravatar_settings':
             val = '1' if fields.get('gravatar_enabled') == '1' else '0'
@@ -10986,7 +11071,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_admin_generate_invite(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         if not (user['is_admin'] or user['username'] == SUPER_USER):
             return self._redirect('/manage/dashboard')
         REGISTRATION_DB.create_invite_code(user['username'])
@@ -10994,7 +11080,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_admin_delete_invite(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         if not (user['is_admin'] or user['username'] == SUPER_USER):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
@@ -11006,7 +11093,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_adjust_credits(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         is_super = (user['username'] == SUPER_USER)
         if not (user['is_admin'] or is_super):
             return self._redirect('/manage/dashboard')
@@ -11027,8 +11115,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_bounty_create(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         description = fields.get('description', '').strip()[:500]
@@ -11041,8 +11131,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_bounty_contribute(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         try:
@@ -11056,8 +11148,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_bounty_claim(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         try:
@@ -11071,7 +11165,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_bounty_confirm(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         try:
@@ -11084,7 +11179,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_bounty_reject(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         try:
@@ -11097,8 +11193,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_bounty_vote(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         try:
@@ -11111,8 +11209,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_bounty_comment(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if _user_role(user) == 'basic': return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         try:
@@ -11132,7 +11232,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_points_transfer(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         to_user = fields.get('to_username', '').strip()
@@ -11702,9 +11803,11 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_messages(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         role = _user_role(user)
-        if role == 'basic': return self._redirect('/manage/dashboard')
+        if role == 'basic':
+            return self._redirect('/manage/dashboard')
         qs   = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         tab      = qs.get('tab', ['inbox'])[0]
         msg      = qs.get('msg',  [''])[0]
@@ -11721,9 +11824,11 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_message_thread(self, conv_id_str: str):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         role = _user_role(user)
-        if role == 'basic': return self._redirect('/manage/dashboard')
+        if role == 'basic':
+            return self._redirect('/manage/dashboard')
         msg_id_str = conv_id_str  # keep variable name for rest of handler
         if not msg_id_str.isdigit():
             return self._redirect('/manage/messages')
@@ -11743,9 +11848,11 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_dm_send(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         role = _user_role(user)
-        if role == 'basic': return self._redirect('/manage/dashboard')
+        if role == 'basic':
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         recipient_raw = fields.get('recipient', '').strip()
@@ -11823,9 +11930,11 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_dm_reply(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         role = _user_role(user)
-        if role == 'basic': return self._redirect('/manage/dashboard')
+        if role == 'basic':
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         reply_to  = fields.get('reply_to_id', '').strip()
@@ -11874,13 +11983,16 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_dm_delete(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         msg_id = fields.get('msg_id', '').strip()
-        if not msg_id.isdigit(): return self._redirect('/manage/messages')
+        if not msg_id.isdigit():
+            return self._redirect('/manage/messages')
         msg = REGISTRATION_DB.get_dm(int(msg_id))
-        if not msg: return self._redirect('/manage/messages')
+        if not msg:
+            return self._redirect('/manage/messages')
         uname = user['username']
         if msg['sender'] == uname:
             REGISTRATION_DB.delete_dm_sender(int(msg_id), uname)
@@ -11893,7 +12005,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_dm_delete_conversation(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         conv_id = fields.get('conversation_id', '').strip()
@@ -11916,13 +12029,15 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_dm_mark_read(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         REGISTRATION_DB.mark_all_dm_read(user['username'])
         self._redirect('/manage/messages?msg=All+marked+read&msg_type=success')
 
     def _post_dm_block(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         target = fields.get('username', '').strip()
@@ -11932,7 +12047,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_dm_unblock(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         target = fields.get('username', '').strip()
@@ -11941,8 +12057,10 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_dm_broadcast(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
-        if user['username'] != SUPER_USER: return self._redirect('/manage/dashboard')
+        if not user:
+            return self._redirect('/manage')
+        if user['username'] != SUPER_USER:
+            return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         subject = fields.get('subject', '').strip()[:200]
@@ -11954,7 +12072,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_dm_toggle(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         allow       = fields.get('allow_dms',   '0') == '1'
@@ -12017,7 +12136,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _post_profile_generate_invite(self):
         user = self._get_session_user()
-        if not user: return self._redirect('/manage')
+        if not user:
+            return self._redirect('/manage')
         token = REGISTRATION_DB.spend_points_for_invite(user['username'])
         if not token:
             cost = REGISTRATION_DB.get_setting('points_invite_cost', '1000')
@@ -12090,11 +12210,14 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _get_user_detail(self, username: str):
         viewer = self._get_session_user()
-        if not viewer: return self._redirect('/manage')
+        if not viewer:
+            return self._redirect('/manage')
         is_super = viewer['username'] == SUPER_USER
-        if not (viewer['is_admin'] or is_super): return self._redirect('/manage/dashboard')
+        if not (viewer['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
         target = REGISTRATION_DB.get_user(username)
-        if not target: return self._redirect('/manage/admin')
+        if not target:
+            return self._redirect('/manage/admin')
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg = urllib.parse.unquote(qs.get('msg', [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
@@ -13200,7 +13323,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                f'{nav_avatar}<span class="nav-username">{_h(user["username"])}</span> '
                f'<span class="badge badge-{role}">{role_label}</span></a>'
                + mail_html + bell_html +
-               f'<a href="/manage/logout" class="btn btn-sm">Logout</a>')
+               '<a href="/manage/logout" class="btn btn-sm">Logout</a>')
         center_nav = (
             '<a href="/manage/dashboard" class="nav-btn">🖥 Dashboard</a>'
             '<a href="/manage/search" class="nav-btn">🔍 Search</a>'
@@ -13208,7 +13331,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             + ('' if role == 'basic' else
                '<a href="/manage/bounty" class="nav-btn">🎯 Bounties</a>'
                '<a href="/manage/leaderboard" class="nav-btn">🏆 Leaderboard</a>')
-            + (f'<a href="/manage/topups" class="nav-btn">💳 Top-ups</a>'
+            + ('<a href="/manage/topups" class="nav-btn">💳 Top-ups</a>'
                if REGISTRATION_DB and REGISTRATION_DB.topup_enabled_for_user(user) else '')
         )
     else:
@@ -13229,10 +13352,14 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
 def _pw_requirements_html(settings: dict) -> str:
     """Render password requirements list for display on forms."""
     reqs = [f"At least {settings.get('pw_min_length','12')} characters"]
-    if settings.get('pw_require_upper','1') == '1': reqs.append('One uppercase letter')
-    if settings.get('pw_require_lower','1') == '1': reqs.append('One lowercase letter')
-    if settings.get('pw_require_digit','1') == '1': reqs.append('One digit')
-    if settings.get('pw_require_symbol','1') == '1': reqs.append('One symbol (!@#$%^&* etc.)')
+    if settings.get('pw_require_upper','1') == '1':
+        reqs.append('One uppercase letter')
+    if settings.get('pw_require_lower','1') == '1':
+        reqs.append('One lowercase letter')
+    if settings.get('pw_require_digit','1') == '1':
+        reqs.append('One digit')
+    if settings.get('pw_require_symbol','1') == '1':
+        reqs.append('One symbol (!@#$%^&* etc.)')
     items = ''.join(f'<li>{r}</li>' for r in reqs)
     return (f'<div style="background:var(--card2);border:1px solid var(--border);border-radius:8px;'
             f'padding:12px 16px;margin-bottom:16px;font-size:0.82rem;color:var(--muted)">'
@@ -13663,10 +13790,14 @@ def _render_goodbye_page() -> str:
 
 def _fmt_size(b: int) -> str:
     """Human-friendly file size."""
-    if b == 0: return '--'
-    if b < 1024: return f'{b} B'
-    if b < 1024**2: return f'{b/1024:.1f} KB'
-    if b < 1024**3: return f'{b/1024**2:.1f} MB'
+    if b == 0:
+        return '--'
+    if b < 1024:
+        return f'{b} B'
+    if b < 1024**2:
+        return f'{b/1024:.1f} KB'
+    if b < 1024**3:
+        return f'{b/1024**2:.1f} MB'
     return f'{b/1024**3:.2f} GB'
 
 
@@ -13948,7 +14079,6 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     stats_persist_enabled = settings.get('stats_persist_enabled', '0') == '1'
     stats_persist_interval = settings.get('stats_persist_interval_sec', '300')
     robots_txt_val = settings.get('robots_txt', 'User-agent: *\nDisallow: /')
-    ap_enabled = settings.get('auto_promote_enabled', '0') == '1'
     settings_html = f'''
     <div class="two-col">
       <div class="card">
@@ -14183,8 +14313,8 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             status = '<span style="color:var(--green)">Pending</span>'
             actions = (
                 f'<button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(invite_url)})">&#128279; Copy URL</button>'
-                + f'<form method="POST" action="/manage/admin/delete-invite" style="display:inline"'
-                + f' data-confirm="Delete this invite code?">'
+                + '<form method="POST" action="/manage/admin/delete-invite" style="display:inline"'
+                + ' data-confirm="Delete this invite code?">'
                 + f'<input type="hidden" name="code" value="{code_h}">'
                 + '<button class="btn btn-sm btn-danger">Delete</button></form>'
             )
@@ -14657,7 +14787,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     </div>'''
 
     # ── Auto-promote + Danger HTML ───────────────────────────
-    danger_html = f'''
+    danger_html = '''
     <div class="two-col">
       <div class="card" style="border-color:rgba(224,91,48,0.3)">
         <div class="card-title" style="color:var(--accent2)">Delete All Users</div>
@@ -15126,7 +15256,8 @@ def _deliver_notifications(cid: int, ih: str, tname: str,
     poster = REGISTRATION_DB.get_user(uname)
     poster_id = poster['id'] if poster else -1
     for mname in mentioned:
-        if mname == uname: continue
+        if mname == uname:
+            continue
         muser = REGISTRATION_DB.get_user(mname)
         if muser and muser['id'] != poster_id:
             REGISTRATION_DB.add_notification(
@@ -15207,7 +15338,7 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
             )
 
             uname_js = uname.replace("'", "\\'")
-            reply_onclick = 'toggleReplyForm(' + str(cid) + ', \'' + uname_js + '\')'  
+            reply_onclick = 'toggleReplyForm(' + str(cid) + ', \'' + uname_js + '\')'
             action_btns = []
             if not locked:
                 action_btns.append(
@@ -15292,12 +15423,12 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
 
     if locked:
         add_form = (
-            f'<div class="card" style="border-color:rgba(224,91,48,0.3)">'
-            f'<div role="status" aria-live="polite"'
-            f' style="display:flex;align-items:center;gap:10px;color:var(--muted);'
-            f'font-family:var(--mono);font-size:0.82rem">'
-            f'&#x1F512; Comments are locked for this torrent.'
-            f'</div></div>'
+            '<div class="card" style="border-color:rgba(224,91,48,0.3)">'
+            '<div role="status" aria-live="polite"'
+            ' style="display:flex;align-items:center;gap:10px;color:var(--muted);'
+            'font-family:var(--mono);font-size:0.82rem">'
+            '&#x1F512; Comments are locked for this torrent.'
+            '</div></div>'
         )
     else:
         add_form = (
@@ -15433,7 +15564,7 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
     compose_html = (
         f'<div style="max-width:600px">'
         f'<form method="POST" action="/manage/messages/send">'
-        
+
         f'<div style="margin-bottom:12px">'
         f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">To (username, or multiple separated by ;)</label>'
         f'<input type="text" name="recipient" required value="{_h(compose_to)}" placeholder="e.g. cathy; bob; john" style="width:100%;background:var(--card2);'
@@ -15460,27 +15591,27 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
     broadcast_html = ''
     if is_super:
         broadcast_html = (
-            f'<div style="max-width:600px">'
-            f'<div style="background:var(--accent)22;border:1px solid var(--accent);border-radius:6px;'
-            f'padding:12px;margin-bottom:16px;font-size:0.85rem;color:var(--accent)">'
-            f'&#x1F4E2; Broadcast sends to ALL non-disabled users. No point cost.</div>'
-            f'<form method="POST" action="/manage/messages/broadcast">'
-            
-            f'<div style="margin-bottom:12px">'
-            f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Subject</label>'
-            f'<input type="text" name="subject" required maxlength="200" style="width:100%;background:var(--card2);'
-            f'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;box-sizing:border-box">'
-            f'</div>'
-            f'<div style="margin-bottom:12px">'
-            f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Message</label>'
-            f'<textarea name="body" required rows="6" maxlength="5000" style="width:100%;background:var(--card2);'
-            f'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;'
-            f'box-sizing:border-box;resize:vertical"></textarea>'
-            f'</div>'
-            f'<button type="submit" class="btn" style="background:var(--accent)22;border-color:var(--accent);'
-            f'color:var(--accent)" onclick="return confirm(\'Send broadcast DM to all users?\')">'
-            f'&#x1F4E2; Send Broadcast</button>'
-            f'</form></div>')
+            '<div style="max-width:600px">'
+            '<div style="background:var(--accent)22;border:1px solid var(--accent);border-radius:6px;'
+            'padding:12px;margin-bottom:16px;font-size:0.85rem;color:var(--accent)">'
+            '&#x1F4E2; Broadcast sends to ALL non-disabled users. No point cost.</div>'
+            '<form method="POST" action="/manage/messages/broadcast">'
+
+            '<div style="margin-bottom:12px">'
+            '<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Subject</label>'
+            '<input type="text" name="subject" required maxlength="200" style="width:100%;background:var(--card2);'
+            'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;box-sizing:border-box">'
+            '</div>'
+            '<div style="margin-bottom:12px">'
+            '<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Message</label>'
+            '<textarea name="body" required rows="6" maxlength="5000" style="width:100%;background:var(--card2);'
+            'border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;'
+            'box-sizing:border-box;resize:vertical"></textarea>'
+            '</div>'
+            '<button type="submit" class="btn" style="background:var(--accent)22;border-color:var(--accent);'
+            'color:var(--accent)" onclick="return confirm(\'Send broadcast DM to all users?\')">'
+            '&#x1F4E2; Send Broadcast</button>'
+            '</form></div>')
 
     tabs = [('inbox',   f'&#x1F4E5; Inbox{" (" + str(unread_count) + ")" if unread_count else ""}'),
             ('sent',    '&#x1F4E4; Sent'),
@@ -15507,16 +15638,16 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
     toggle_html = (
         f'<form method="POST" action="/manage/messages/toggle-dms" style="margin-top:8px">'
         f'<input type="hidden" name="form_scope" value="messages_quick">'
-        
+
         f'<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
         f'<input type="checkbox" name="allow_dms" value="1" {allow_checked} onchange="_submitFormWithCsrf(this.form)">'
         f' Allow others to send me DMs</label></form>')
 
     mark_all = ''
     if unread_count:
-        mark_all = (f'<form method="POST" action="/manage/messages/mark-read" style="display:inline;margin-top:4px">'
-                    
-                    f'<button class="btn btn-sm">&#x2713; Mark all read</button></form>')
+        mark_all = ('<form method="POST" action="/manage/messages/mark-read" style="display:inline;margin-top:4px">'
+
+                    '<button class="btn btn-sm">&#x2713; Mark all read</button></form>')
 
     body = (
         f'<div class="page-title">📬 Messages</div>'
@@ -15533,7 +15664,6 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
 
 def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
     uname = viewer['username']
-    role  = _user_role(viewer)
     other_party = None
     for m in thread:
         if m['sender'] != uname:
@@ -15556,7 +15686,7 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
                        ) if (m['is_broadcast'] if 'is_broadcast' in m.keys() else 0) else ''
         del_form = (
             f'<form method="POST" action="/manage/messages/delete" style="display:inline;margin-left:8px">'
-            
+
             f'<input type="hidden" name="msg_id" value="{m["id"]}">'
             f'<button class="btn btn-sm" style="font-size:0.7rem;background:var(--red)22;'
             f'color:var(--red);border-color:var(--red)" '
@@ -15578,7 +15708,7 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
         f'<div class="card" style="margin-top:16px">'
         f'<div class="card-title" style="font-size:0.9rem">Reply</div>'
         f'<form method="POST" action="/manage/messages/reply">'
-        
+
         f'<input type="hidden" name="reply_to_id" value="{last_msg["id"]}">'
         f'<textarea name="body" rows="4" maxlength="5000" placeholder="Write a reply..." '
         f'style="width:100%;background:var(--card2);border:1px solid var(--border);'
@@ -15591,7 +15721,6 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
     # ── Compute presence now so profile_link dot renders correctly on first load ──
     other_user_row  = REGISTRATION_DB.get_user(other_party) if (other_party and REGISTRATION_DB) else None
     presence_status = _online_status(other_user_row)
-    presence_dot    = _online_dot_html(presence_status)
     if other_party:
         other_user = REGISTRATION_DB.get_user(other_party) if REGISTRATION_DB else None
         other_role = _user_role(other_user) if other_user else 'basic'
@@ -15618,9 +15747,6 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
     profile_link = ''
     if other_party:
         opu = _h(other_party)
-        dot_html = (f'<span id="dm-presence-dot" title="{{}}" '
-                    f'style="display:inline-block;width:8px;height:8px;border-radius:50%;'
-                    f'background:{{}};vertical-align:middle;margin-right:4px"></span>')
         # Set initial color based on current presence
         init_color = {'online':'var(--green)','recent':'var(--accent)','offline':'var(--border)','hidden':''}.get(presence_status, 'var(--border)')
         init_tip   = {'online':'Online now','recent':'Recently active','offline':'Offline','hidden':''}.get(presence_status, '')
@@ -15923,9 +16049,9 @@ def _render_notifications_page(viewer) -> str:
     mark_all = ''
     if unread_count:
         mark_all = (
-            f'<form method="POST" action="/manage/notifications/read-all" style="display:inline">'
-            f'<button class="btn btn-sm">✓ Mark all read</button>'
-            f'</form>'
+            '<form method="POST" action="/manage/notifications/read-all" style="display:inline">'
+            '<button class="btn btn-sm">✓ Mark all read</button>'
+            '</form>'
         )
 
     body = (
@@ -16182,7 +16308,6 @@ def _render_public_profile(viewer, target_user, torrents: list,
     uname_h   = _h(uname)
     vrole     = _user_role(viewer)
     trole     = _user_role(target_user)
-    is_super  = viewer['username'] == SUPER_USER
     is_own    = viewer['id'] == target_user['id']
 
     # If viewer is admin/super, link back to admin view
@@ -16334,7 +16459,6 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '</tr>'
         )
 
-    credits_val = target_user['credits'] if 'credits' in target_user.keys() else 0
     pts_val     = target_user['points']  if 'points'  in target_user.keys() else 0
     streak_val  = target_user['login_streak'] if 'login_streak' in target_user.keys() else 0
     followers_count, following_count = REGISTRATION_DB.get_follow_counts(target_user['id']) if REGISTRATION_DB else (0, 0)
@@ -17253,7 +17377,6 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
 
     role  = _user_role(target_user)
     pts   = target_user['points'] if 'points' in target_user.keys() else 0
-    uname = target_user['username']
     out   = ''
 
     # Basic sandbox teaser
@@ -17265,9 +17388,9 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
         if ap_enabled:
             pct = min(100, int(pts / threshold * 100)) if threshold > 0 else 0
             out += (
-                f'''<div class="card" style="border:1px solid var(--accent)">'''
-                + f'<div class="card-title" style="color:var(--accent)">🔒 Basic Member — Unlock More Features</div>'
-                + f'<p style="color:var(--muted);font-size:0.88rem;margin-bottom:12px">'
+                '''<div class="card" style="border:1px solid var(--accent)">'''
+                + '<div class="card-title" style="color:var(--accent)">🔒 Basic Member — Unlock More Features</div>'
+                + '<p style="color:var(--muted);font-size:0.88rem;margin-bottom:12px">'
                 + f'Reach <strong>{threshold} points</strong> to unlock <strong>Standard</strong> membership:</p>'
                 + '<ul style="color:var(--muted);font-size:0.88rem;margin:0 0 16px 20px;line-height:1.8">'
                 + '<li>🎯 <strong>Bounty Board</strong> — post requests, claim rewards</li>'
@@ -17275,7 +17398,7 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
                 + '<li>👥 <strong>Public Profiles</strong> — view other members</li>'
                 + '<li>💸 <strong>Point Transfers</strong> — send points to friends</li>'
                 + '<li>✅ <strong>Bounty Voting</strong> — vote on fulfillment claims</li></ul>'
-                + f'<div style="background:var(--card2);border-radius:8px;overflow:hidden;height:12px;margin-bottom:8px">'
+                + '<div style="background:var(--card2);border-radius:8px;overflow:hidden;height:12px;margin-bottom:8px">'
                 + f'<div style="background:var(--accent);height:100%;width:{pct}%;transition:width 0.3s"></div></div>'
                 + f'<div style="font-size:0.82rem;color:var(--muted)">{pts} / {threshold} points ({pct}%)'
                 + ' — earn by logging in daily, uploading torrents, and commenting</div></div>'
@@ -17287,7 +17410,7 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
     out += (
         '<div class="card">'
         + '<div class="card-title">💸 Send Points</div>'
-        + f'<p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px">'
+        + '<p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px">'
         + f'Transfer points. A <strong>{fee_pct}%</strong> fee is destroyed. Balance: <strong>{pts} pts</strong></p>'
         + '<form method="POST" action="/manage/points/transfer">'
         + '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">'
@@ -17339,7 +17462,8 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
     if ledger:
         rows = ''
         for e in ledger:
-            d = e['delta']; color = 'var(--green)' if d > 0 else 'var(--danger)'
+            d = e['delta']
+            color = 'var(--green)' if d > 0 else 'var(--danger)'
             sign = '+' if d > 0 else ''
             rows += (f'<tr style="border-top:1px solid var(--border)">'
                      f'<td class="hash" style="padding:8px 12px 8px 0;white-space:nowrap;font-size:0.8rem">{_h((e["created_at"] or "")[:16])}</td>'
@@ -17403,7 +17527,7 @@ def _render_invite_section(viewer, target_user, is_own_profile: bool, db) -> str
             + f'<td class="hash" style="font-size:0.78rem">{code_h[:20]}...</td>'
             + f'<td class="hash">{_h((c["created_at"] or "")[:10])}</td>'
             + '<td><span style="color:var(--green)">Pending</span></td>'
-            + f'<td><div class="actions">'
+            + '<td><div class="actions">'
             + f'<button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(invite_path)})">&#128279; Copy URL</button>'
             + '</div></td>'
             + '</tr>'
@@ -17991,9 +18115,7 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
                 f'<div class="card-title">{icon} {title}</div>'
                 f'<p style="color:var(--muted);font-size:0.82rem;margin-bottom:12px">{desc}</p>'
                 + _lb_table(rows, cols) +
-                f'</div>')
-
-    uname = viewer['username']
+                '</div>')
 
     card_holders   = _card("Top Holders",      "💰", data["holders"],        cols_holders,
                            "Who's sitting on the most points right now.")
