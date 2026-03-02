@@ -201,4 +201,7 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 ## Requirements
 
 - Python 3.10+
-- No external packages required for core tracker features (optional passkey support requires `python3-fido2`)
+- No external packages required for core tracker features
+- Optional auth packages:
+  - Passkeys (WebAuthn): `python3-fido2`
+  - TFA QR rendering on setup page: `python3-qrcode`

@@ -7368,6 +7368,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _session_has_active_delete_challenge(self) -> bool:
+        if AUTH_BREAK_GLASS:
+            return False
+        if not REGISTRATION_DB:
+            return False
+        user = self._get_session_user()
+        if not user:
+            return False
+        return bool(REGISTRATION_DB.get_active_account_delete_challenge(int(user['id'])))
+
     def _resolve_post_auth_redirect(self, user, token: str, policy: dict,
                                     client_ip: str = '', user_agent: str = '') -> str:
         if policy.get('must_enroll_passkey'):
@@ -7517,6 +7527,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         gate_allow = (
             '/manage', '/manage/logout', '/manage/passkey-enroll',
             '/manage/tfa/setup', '/manage/tfa/challenge',
+            '/manage/account/delete/confirm',
             '/manage/poll', '/manage/notifications/preview',
         )
         if path not in gate_allow:
@@ -7527,6 +7538,8 @@ class ManageHandler(BaseHTTPRequestHandler):
                 return self._redirect('/manage/passkey-enroll')
             if user and self._session_requires_tfa_enroll():
                 return self._redirect('/manage/tfa/setup')
+            if user and self._session_has_active_delete_challenge():
+                return self._redirect('/manage/account/delete/confirm')
 
         if path in ('/manage', ''):
             user = self._get_session_user()
@@ -7708,6 +7721,19 @@ class ManageHandler(BaseHTTPRequestHandler):
                 return self._redirect('/manage/passkey-enroll')
             if user and self._session_requires_tfa_enroll() and path not in ('/manage/tfa/setup/start', '/manage/tfa/setup/verify'):
                 return self._redirect('/manage/tfa/setup')
+            if user and self._session_has_active_delete_challenge():
+                delete_allowed = (
+                    '/manage/logout',
+                    '/manage/webauthn/register/start',
+                    '/manage/webauthn/register/finish',
+                    '/manage/tfa/challenge',
+                    '/manage/tfa/setup/start',
+                    '/manage/tfa/setup/verify',
+                    '/manage/account/delete/confirm',
+                    '/manage/account/delete/cancel',
+                )
+                if path not in delete_allowed:
+                    return self._redirect('/manage/account/delete/confirm')
 
         if path == '/manage/login':
             self._post_login()
@@ -8054,11 +8080,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         if token:
             REGISTRATION_DB.set_session_tfa_enroll(token, False)
         REGISTRATION_DB._log(user['username'], 'tfa_enroll_finish', user['username'], f'backup_codes={len(backup_codes)}')
+        delete_flow_active = bool(REGISTRATION_DB.get_active_account_delete_challenge(int(user['id'])))
         self._send_html(_render_tfa_setup_page(
             REGISTRATION_DB.get_user_by_id(int(user['id'])) or user,
             msg='TFA is now enabled. Save your backup codes.',
             msg_type='success',
-            backup_codes=backup_codes
+            backup_codes=backup_codes,
+            delete_flow_active=delete_flow_active
         ))
 
     def _post_tfa_challenge(self):
@@ -12645,7 +12673,9 @@ def _render_passkey_enroll_page(user, msg: str = '', msg_type: str = 'error') ->
     return _manage_page('Passkey Enrollment Required', body, user=user, msg=msg, msg_type=msg_type)
 
 
-def _render_tfa_setup_page(user, msg: str = '', msg_type: str = 'error', backup_codes: list[str] | None = None) -> str:
+def _render_tfa_setup_page(user, msg: str = '', msg_type: str = 'error',
+                           backup_codes: list[str] | None = None,
+                           delete_flow_active: bool = False) -> str:
     token = _session_token_for(user)
     csrf = _csrf_token(token) if token else ''
     secret = _totp_secret_generate()
@@ -12682,6 +12712,13 @@ def _render_tfa_setup_page(user, msg: str = '', msg_type: str = 'error', backup_
             f'<ul style="margin:0;padding-left:18px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 18px">{lines}</ul>'
             '</div>'
         )
+        if delete_flow_active:
+            backup_block += (
+                '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
+                '<a href="/manage/account/delete/confirm" class="btn btn-danger">Continue Deletion</a>'
+                '<a href="/manage/account/delete/cancel" class="btn btn-sm">Cancel Deletion</a>'
+                '</div>'
+            )
     body = (
         '<div style="max-width:700px;margin:40px auto">'
         '<div class="page-title">Set Up Two-Factor Authentication</div>'

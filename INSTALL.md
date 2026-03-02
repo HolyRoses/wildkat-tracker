@@ -10,6 +10,16 @@ For day-to-day operation and UI workflows, use `USER_GUIDE.md`.
 - A public-facing server with ports accessible from the internet
 - A domain name pointed at your server
 - Optional for passkey/WebAuthn login: `python3-fido2`
+- Optional for TFA setup QR rendering: `python3-qrcode`
+
+If you plan to use passkey login and TFA QR setup on Ubuntu, install:
+
+```bash
+sudo apt install -y python3-fido2
+sudo apt install -y python3-qrcode
+```
+
+On other operating systems, install equivalent packages (for example via `pip`) for `fido2` and `qrcode`.
 
 ---
 
@@ -426,6 +436,7 @@ systemctl start tracker
 | `--super-user` | — | Superuser username — required when `--registration` is set |
 | `--super-user-password` | — | Set or reset the superuser password (process exits after setting) |
 | `--super-user-reset-passkeys` | off | Reset superuser passkeys and passkey-required flags, then exit |
+| `--super-user-reset-tfa` | off | Reset superuser TFA secret/backup codes and TFA-required flag, then exit |
 | `--auth-break-glass` | off | Temporary startup override that bypasses passkey enforcement gates |
 | `--db` | `/opt/tracker/tracker.db` | Path to the SQLite database file |
 | `--manage-port` | same as `--web-https-port` | HTTPS port for the management interface if different from stats port |
