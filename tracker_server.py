@@ -15940,7 +15940,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     uname_h = _h(uname)          # HTML-safe for output
     t_role = _user_role(target_user)
     role_badge = {
-        'super':    '<span class="badge badge-super">SUPERUSER</span>',
+        'super':    '<span class="badge badge-super">SUPER</span>',
         'admin':    '<span class="badge badge-admin">ADMIN</span>',
         'standard': '<span class="badge badge-standard">STANDARD</span>',
         'basic':    '<span class="badge badge-basic">BASIC</span>',
