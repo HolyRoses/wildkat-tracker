@@ -58,7 +58,6 @@ import sys
 import threading
 import time
 import queue
-import pickle
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -112,6 +111,9 @@ PEER_SCRAPE_MIN_INTERVAL_SECONDS = 3 * 60 * 60
 ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES = 5
 WEBAUTHN_CHALLENGE_TTL_SECONDS = 300
 TFA_CHALLENGE_TTL_SECONDS = 300
+TFA_CHALLENGE_MAX_ATTEMPTS = 8
+TFA_CHALLENGE_BACKOFF_BASE_SECONDS = 2
+TFA_CHALLENGE_BACKOFF_MAX_SECONDS = 60
 PEER_TTL            = 3600   # seconds before a peer is purged
 MAX_PEERS_PER_REPLY  = 200
 MAX_SCRAPE_HASHES    = 5      # max info_hashes per scrape request
@@ -874,6 +876,93 @@ def _json_safe_obj(value: Any):
     return value
 
 
+def _typed_json_encode(value: Any):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return {'__wk_type': 'bytes', 'b64': _b64url_encode(bytes(value))}
+    if isinstance(value, tuple):
+        return {'__wk_type': 'tuple', 'items': [_typed_json_encode(v) for v in value]}
+    if isinstance(value, list):
+        return {'__wk_type': 'list', 'items': [_typed_json_encode(v) for v in value]}
+    if isinstance(value, dict):
+        return {
+            '__wk_type': 'dict',
+            'items': [[_typed_json_encode(k), _typed_json_encode(v)] for k, v in value.items()],
+        }
+    raise TypeError(f'Unsupported type in typed JSON encode: {type(value)!r}')
+
+
+def _typed_json_decode(value: Any):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [_typed_json_decode(v) for v in value]
+    if not isinstance(value, dict):
+        raise ValueError('Invalid typed JSON value')
+    t = value.get('__wk_type')
+    if not t:
+        return {str(k): _typed_json_decode(v) for k, v in value.items()}
+    if t == 'bytes':
+        return _b64url_decode(str(value.get('b64', '')))
+    if t == 'tuple':
+        return tuple(_typed_json_decode(v) for v in (value.get('items') or []))
+    if t == 'list':
+        return [_typed_json_decode(v) for v in (value.get('items') or [])]
+    if t == 'dict':
+        out = {}
+        for kv in (value.get('items') or []):
+            if not isinstance(kv, list) or len(kv) != 2:
+                raise ValueError('Invalid typed JSON dict entry')
+            out[_typed_json_decode(kv[0])] = _typed_json_decode(kv[1])
+        return out
+    raise ValueError('Unknown typed JSON marker')
+
+
+def _webauthn_state_pack(state: Any) -> str:
+    payload = _typed_json_encode(state)
+    signed = {'v': 1, 'payload': payload}
+    canon = json.dumps(signed, sort_keys=True, separators=(',', ':'))
+    key = _CSRF_SECRET or b'webauthn-state-fallback'
+    sig = hmac.new(key, canon.encode('utf-8'), hashlib.sha256).hexdigest()
+    return json.dumps({'v': 1, 'payload': payload, 'sig': sig}, separators=(',', ':'))
+
+
+def _webauthn_state_unpack(state_json: str):
+    try:
+        blob = json.loads(state_json or '{}')
+    except Exception:
+        return None
+    if not isinstance(blob, dict):
+        return None
+    v = int(blob.get('v', 0))
+    payload = blob.get('payload')
+    sig = str(blob.get('sig', '')).strip().lower()
+    if v != 1 or payload is None or not re.fullmatch(r'[a-f0-9]{64}', sig):
+        return None
+    signed = {'v': v, 'payload': payload}
+    canon = json.dumps(signed, sort_keys=True, separators=(',', ':'))
+    key = _CSRF_SECRET or b'webauthn-state-fallback'
+    expected = hmac.new(key, canon.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        return _typed_json_decode(payload)
+    except Exception:
+        return None
+
+
+def _seconds_until_iso(ts: str) -> int:
+    try:
+        dt = datetime.datetime.fromisoformat((ts or '').strip())
+    except Exception:
+        return 0
+    left = (dt - datetime.datetime.now()).total_seconds()
+    if left <= 0:
+        return 0
+    return int(left + 0.999)
+
+
 def _nested_get(obj, path: list[str], default=''):
     cur = obj
     for p in path:
@@ -1165,6 +1254,9 @@ class RegistrationDB:
                 user_id         INTEGER NOT NULL,
                 flow_type       TEXT    NOT NULL,
                 challenge_token TEXT    NOT NULL UNIQUE,
+                auth_attempts   INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                blocked_until   TEXT,
                 created_at      TEXT    NOT NULL,
                 expires_at      TEXT    NOT NULL,
                 used_at         TEXT,
@@ -1519,11 +1611,6 @@ class RegistrationDB:
         except Exception:
             pass  # column already exists
         try:
-            self._conn().execute('ALTER TABLE users ADD COLUMN webauthn_preferred INTEGER NOT NULL DEFAULT 0')
-            self._conn().commit()
-        except Exception:
-            pass  # column already exists
-        try:
             self._conn().execute('ALTER TABLE users ADD COLUMN webauthn_required INTEGER NOT NULL DEFAULT 0')
             self._conn().commit()
         except Exception:
@@ -1607,6 +1694,16 @@ class RegistrationDB:
         wcols = [r[1] for r in c.execute('PRAGMA table_info(webauthn_credentials)').fetchall()]
         if 'is_primary' not in wcols:
             c.execute('ALTER TABLE webauthn_credentials ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0')
+            c.commit()
+        tfa_ch_cols = [r[1] for r in c.execute('PRAGMA table_info(tfa_challenges)').fetchall()]
+        if 'auth_attempts' not in tfa_ch_cols:
+            c.execute('ALTER TABLE tfa_challenges ADD COLUMN auth_attempts INTEGER NOT NULL DEFAULT 0')
+            c.commit()
+        if 'last_attempt_at' not in tfa_ch_cols:
+            c.execute('ALTER TABLE tfa_challenges ADD COLUMN last_attempt_at TEXT')
+            c.commit()
+        if 'blocked_until' not in tfa_ch_cols:
+            c.execute('ALTER TABLE tfa_challenges ADD COLUMN blocked_until TEXT')
             c.commit()
 
     def _init_defaults(self, announce_urls: list):
@@ -4635,11 +4732,10 @@ class RegistrationDB:
 
     # ── WebAuthn / Passkeys ──────────────────────────────────
 
-    def set_user_webauthn_preferences(self, user_id: int, enabled: bool,
-                                      preferred: bool, required: bool):
+    def set_user_webauthn_preferences(self, user_id: int, enabled: bool, required: bool):
         self._conn().execute(
-            'UPDATE users SET webauthn_enabled=?, webauthn_preferred=?, webauthn_required=? WHERE id=?',
-            (1 if enabled else 0, 1 if preferred else 0, 1 if required else 0, user_id)
+            'UPDATE users SET webauthn_enabled=?, webauthn_required=? WHERE id=?',
+            (1 if enabled else 0, 1 if required else 0, user_id)
         )
         self._conn().commit()
 
@@ -4797,7 +4893,7 @@ class RegistrationDB:
             (user_id,),
         ).rowcount
         c.execute(
-            'UPDATE users SET webauthn_enabled=0, webauthn_preferred=0, webauthn_required=0, webauthn_required_admin=0 WHERE id=?',
+            'UPDATE users SET webauthn_enabled=0, webauthn_required=0, webauthn_required_admin=0 WHERE id=?',
             (user_id,),
         )
         c.execute('DELETE FROM webauthn_challenges WHERE user_id=?', (user_id,))
@@ -4998,6 +5094,41 @@ class RegistrationDB:
         )
         self._conn().commit()
         return int(cur.lastrowid), token
+
+    def get_tfa_challenge_wait_seconds(self, challenge_id: int) -> int:
+        row = self._conn().execute(
+            'SELECT blocked_until FROM tfa_challenges WHERE id=? AND used_at IS NULL',
+            (challenge_id,)
+        ).fetchone()
+        if not row:
+            return 0
+        return _seconds_until_iso(row['blocked_until'] or '')
+
+    def register_tfa_challenge_failure(self, challenge_id: int) -> tuple[int, int]:
+        c = self._conn()
+        row = c.execute(
+            'SELECT auth_attempts FROM tfa_challenges WHERE id=? AND used_at IS NULL',
+            (challenge_id,)
+        ).fetchone()
+        if not row:
+            return 0, 0
+        attempts = int(row['auth_attempts'] or 0) + 1
+        wait = min(TFA_CHALLENGE_BACKOFF_MAX_SECONDS,
+                   TFA_CHALLENGE_BACKOFF_BASE_SECONDS * (2 ** max(0, attempts - 1)))
+        blocked_until = (datetime.datetime.now() + datetime.timedelta(seconds=wait)).isoformat(timespec='seconds')
+        c.execute(
+            'UPDATE tfa_challenges SET auth_attempts=?, last_attempt_at=?, blocked_until=? WHERE id=?',
+            (attempts, self._ts(), blocked_until, challenge_id)
+        )
+        c.commit()
+        return attempts, wait
+
+    def clear_tfa_challenge_failures(self, challenge_id: int):
+        self._conn().execute(
+            'UPDATE tfa_challenges SET auth_attempts=0, last_attempt_at=NULL, blocked_until=NULL WHERE id=?',
+            (challenge_id,)
+        )
+        self._conn().commit()
 
     def get_tfa_challenge_by_token(self, token: str, flow_type: str = 'login'):
         return self._conn().execute(
@@ -7942,6 +8073,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not challenge:
             REGISTRATION_DB.set_session_pending_tfa_challenge(token, None)
             return self._redirect('/manage/dashboard')
+        wait_left = REGISTRATION_DB.get_tfa_challenge_wait_seconds(int(challenge['id']))
+        if wait_left > 0:
+            q = urllib.parse.quote(f'Too many attempts. Wait {wait_left}s and try again.')
+            return self._redirect(f'/manage/tfa/challenge?msg={q}&msg_type=error')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         code = fields.get('code', '').strip()
@@ -7957,8 +8092,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             ok = True
             used_backup = True
         if not ok:
-            q = urllib.parse.quote('Invalid authenticator or backup code.')
+            attempts, wait = REGISTRATION_DB.register_tfa_challenge_failure(int(challenge['id']))
+            log.warning('TFA challenge failed user=%s challenge_id=%s attempts=%s backoff_sec=%s',
+                        user['username'], challenge['id'], attempts, wait)
+            q = urllib.parse.quote(f'Invalid authenticator or backup code. Try again in {wait}s.')
             return self._redirect(f'/manage/tfa/challenge?msg={q}&msg_type=error')
+        REGISTRATION_DB.clear_tfa_challenge_failures(int(challenge['id']))
         REGISTRATION_DB.consume_tfa_challenge(int(challenge['id']))
         REGISTRATION_DB.mark_session_tfa_verified(token)
         REGISTRATION_DB.touch_user_tfa_verified(int(user['id']))
@@ -8097,19 +8236,22 @@ class ManageHandler(BaseHTTPRequestHandler):
         all_credentials = bool(payload.get('all_credentials'))
         if not username:
             return self._send_json({'ok': False, 'error': 'Username is required.'}, 400)
+        generic_fail = {'ok': False, 'error': 'Invalid credentials.'}
         user = REGISTRATION_DB.get_user(username)
         if not user or user['is_disabled'] or user['is_locked']:
-            return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 403)
+            return self._send_json(generic_fail, 403)
         policy = _auth_factor_policy_for_user(user)
         user_enabled = _flag_true(user['webauthn_enabled']) if ('webauthn_enabled' in user.keys()) else False
         if not user_enabled and not policy.get('passkey_required'):
-            return self._send_json({'ok': False, 'error': 'Passkey sign-in is not enabled for this account.'}, 400)
+            log.warning('WEBAUTHN auth start denied user=%s reason=account_passkey_disabled', username)
+            return self._send_json(generic_fail, 403)
         if not user_enabled and policy.get('passkey_required'):
             log.debug('WEBAUTHN auth start user flag disabled; proceeding due to policy user=%s policy_required=1',
                       username)
         rows = REGISTRATION_DB.list_webauthn_credentials(user['id'])
         if not rows:
-            return self._send_json({'ok': False, 'error': 'No registered passkeys for this account.'}, 400)
+            log.warning('WEBAUTHN auth start denied user=%s reason=no_registered_passkeys', username)
+            return self._send_json(generic_fail, 403)
         server = self._webauthn_server()
         if not server:
             return self._send_json({'ok': False, 'error': 'Unable to initialize WebAuthn server.'}, 500)
@@ -8150,7 +8292,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         try:
             auth_data, state = server.authenticate_begin(creds, user_verification='preferred')
             options = auth_data.get('publicKey', auth_data)
-            state_blob = base64.b64encode(pickle.dumps(state)).decode('ascii')
+            state_blob = _webauthn_state_pack(state)
             challenge = options.get('challenge')
             challenge_b64 = _b64url_encode(challenge if isinstance(challenge, (bytes, bytearray)) else bytes(challenge))
             challenge_id = REGISTRATION_DB.create_webauthn_challenge(
@@ -8215,7 +8357,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             except Exception:
                 continue
         try:
-            state = pickle.loads(base64.b64decode(ch['state_json']))
+            state = _webauthn_state_unpack(ch['state_json'])
+            if state is None:
+                log.warning('WEBAUTHN auth finish invalid challenge state challenge_id=%s', challenge_id)
+                return self._send_json({'ok': False, 'error': 'Authentication challenge expired or invalid.'}, 400)
             cred_id_b64 = str(cred.get('id', '')).strip()
             resp = cred.get('response', {}) if isinstance(cred.get('response'), dict) else {}
             client_data = CollectedClientData(_b64url_decode(str(resp.get('clientDataJSON', ''))))
@@ -8301,7 +8446,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             options = reg_data.get('publicKey', reg_data)
             challenge = options.get('challenge')
             challenge_b64 = _b64url_encode(challenge if isinstance(challenge, (bytes, bytearray)) else bytes(challenge))
-            state_blob = base64.b64encode(pickle.dumps(state)).decode('ascii')
+            state_blob = _webauthn_state_pack(state)
             challenge_id = REGISTRATION_DB.create_webauthn_challenge(
                 user['id'],
                 'register',
@@ -8340,7 +8485,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not server:
             return self._send_json({'ok': False, 'error': 'Unable to initialize WebAuthn server.'}, 500)
         try:
-            state = pickle.loads(base64.b64decode(ch['state_json']))
+            state = _webauthn_state_unpack(ch['state_json'])
+            if state is None:
+                log.warning('WEBAUTHN register finish invalid challenge state challenge_id=%s', challenge_id)
+                return self._send_json({'ok': False, 'error': 'Registration challenge expired or invalid.'}, 400)
             resp = cred.get('response', {}) if isinstance(cred.get('response'), dict) else {}
             client_data = CollectedClientData(_b64url_decode(str(resp.get('clientDataJSON', ''))))
             att_obj = AttestationObject(_b64url_decode(str(resp.get('attestationObject', ''))))
@@ -8365,7 +8513,6 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.set_user_webauthn_preferences(
                 user['id'],
                 enabled=True,
-                preferred=bool(user['webauthn_preferred']) if 'webauthn_preferred' in user.keys() else False,
                 required=bool(user['webauthn_required']) if 'webauthn_required' in user.keys() else False,
             )
             tok = self._current_valid_session_token()
@@ -8398,9 +8545,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         user_account_required = _flag_true(user['webauthn_required']) if ('webauthn_required' in user.keys()) else False
         # Unchecked checkboxes are omitted from multipart payloads.
         # Preserve current enabled state only when that control is effectively locked.
-        enabled_locked = bool(enforced_policy_required or user_account_required)
+        enabled_locked = bool(enforced_policy_required)
         enabled = (fields.get('webauthn_enabled') == '1') if ('webauthn_enabled' in fields) else (enabled_current if enabled_locked else False)
-        preferred = fields.get('webauthn_preferred') == '1'
         required = fields.get('webauthn_required') == '1'
         if required and not _webauthn_login_enabled():
             return self._redirect('/manage/profile?msg=Operator+must+enable+WebAuthn+login+before+requiring+passkeys.&msg_type=error')
@@ -8412,12 +8558,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             required = True
         if required and not enabled:
             return self._redirect('/manage/profile?msg=Enable+passkey+sign-in+before+requiring+passkey+login.&msg_type=error')
-        REGISTRATION_DB.set_user_webauthn_preferences(user['id'], enabled, preferred, required)
+        REGISTRATION_DB.set_user_webauthn_preferences(user['id'], enabled, required)
         REGISTRATION_DB._log(
             user['username'],
             'webauthn_preferences',
             user['username'],
-            f'enabled={int(enabled)} preferred={int(preferred)} required={int(required)} admin_required={1 if admin_required else 0} server_policy_required={1 if server_policy_required else 0} user_account_required={1 if user_account_required else 0}'
+            f'enabled={int(enabled)} required={int(required)} admin_required={1 if admin_required else 0} server_policy_required={1 if server_policy_required else 0} user_account_required={1 if user_account_required else 0}'
         )
         if admin_required:
             self._redirect('/manage/profile?msg=Passkey+preferences+saved.+Admin+policy+keeps+passkey+requirement+enabled.&msg_type=success')
@@ -15579,7 +15725,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         ) if REGISTRATION_DB else False
         _server_policy_enforced = bool(_sitewide_enforced or _admin_scope_enforced)
         _effective_required = bool(_webauthn_required or _webauthn_required_admin or _server_policy_enforced)
-        _enabled_disabled_attr = 'disabled' if _effective_required else ''
+        _enabled_disabled_attr = 'disabled' if (_webauthn_required_admin or _server_policy_enforced) else ''
         _required_disabled_attr = 'disabled' if (_webauthn_required_admin or _server_policy_enforced) else ''
         if _server_policy_enforced:
             _required_note = '<div class="muted" style="font-size:0.78rem;margin-top:4px">Server policy is enforcing passkey requirements.</div>'
