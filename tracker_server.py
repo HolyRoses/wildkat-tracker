@@ -5591,6 +5591,11 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
         msg = fmt % args if args else str(fmt)
         log.debug('WEB %s %s', self.client_address[0], msg)
 
+    def _request_is_https(self) -> bool:
+        # In this server design, TLS is applied to accepted connections, not
+        # the listening socket. Check the active request socket.
+        return isinstance(getattr(self, 'request', None), ssl.SSLSocket)
+
     def do_HEAD(self):
         # Return same headers as GET but no body — satisfies scanners
         path = getattr(self, 'path', '/')
@@ -5732,7 +5737,7 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
             len(ipv4_mapped_compact) // 18, client_is_ipv6,
             DEFAULT_INTERVAL
         )
-        protocol = 'https' if self.server.socket.__class__.__name__ == 'SSLSocket' else 'http'
+        protocol = 'https' if self._request_is_https() else 'http'
         STATS.record_announce(protocol, ip, client_is_ipv6)
         self._send_bencode(200, response)
 
