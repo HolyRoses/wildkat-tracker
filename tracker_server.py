@@ -15338,7 +15338,7 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
             )
 
             uname_js = uname.replace("'", "\\'")
-            reply_onclick = 'toggleReplyForm(' + str(cid) + ', \'' + uname_js + '\')'  
+            reply_onclick = 'toggleReplyForm(' + str(cid) + ', \'' + uname_js + '\')'
             action_btns = []
             if not locked:
                 action_btns.append(
@@ -15564,7 +15564,7 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
     compose_html = (
         f'<div style="max-width:600px">'
         f'<form method="POST" action="/manage/messages/send">'
-        
+
         f'<div style="margin-bottom:12px">'
         f'<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">To (username, or multiple separated by ;)</label>'
         f'<input type="text" name="recipient" required value="{_h(compose_to)}" placeholder="e.g. cathy; bob; john" style="width:100%;background:var(--card2);'
@@ -15596,7 +15596,7 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
             'padding:12px;margin-bottom:16px;font-size:0.85rem;color:var(--accent)">'
             '&#x1F4E2; Broadcast sends to ALL non-disabled users. No point cost.</div>'
             '<form method="POST" action="/manage/messages/broadcast">'
-            
+
             '<div style="margin-bottom:12px">'
             '<label style="display:block;margin-bottom:4px;color:var(--muted);font-size:0.85rem">Subject</label>'
             '<input type="text" name="subject" required maxlength="200" style="width:100%;background:var(--card2);'
@@ -15638,7 +15638,7 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
     toggle_html = (
         f'<form method="POST" action="/manage/messages/toggle-dms" style="margin-top:8px">'
         f'<input type="hidden" name="form_scope" value="messages_quick">'
-        
+
         f'<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
         f'<input type="checkbox" name="allow_dms" value="1" {allow_checked} onchange="_submitFormWithCsrf(this.form)">'
         f' Allow others to send me DMs</label></form>')
@@ -15646,7 +15646,7 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
     mark_all = ''
     if unread_count:
         mark_all = ('<form method="POST" action="/manage/messages/mark-read" style="display:inline;margin-top:4px">'
-                    
+
                     '<button class="btn btn-sm">&#x2713; Mark all read</button></form>')
 
     body = (
@@ -15686,7 +15686,7 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
                        ) if (m['is_broadcast'] if 'is_broadcast' in m.keys() else 0) else ''
         del_form = (
             f'<form method="POST" action="/manage/messages/delete" style="display:inline;margin-left:8px">'
-            
+
             f'<input type="hidden" name="msg_id" value="{m["id"]}">'
             f'<button class="btn btn-sm" style="font-size:0.7rem;background:var(--red)22;'
             f'color:var(--red);border-color:var(--red)" '
@@ -15708,7 +15708,7 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
         f'<div class="card" style="margin-top:16px">'
         f'<div class="card-title" style="font-size:0.9rem">Reply</div>'
         f'<form method="POST" action="/manage/messages/reply">'
-        
+
         f'<input type="hidden" name="reply_to_id" value="{last_msg["id"]}">'
         f'<textarea name="body" rows="4" maxlength="5000" placeholder="Write a reply..." '
         f'style="width:100%;background:var(--card2);border:1px solid var(--border);'
