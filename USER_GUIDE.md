@@ -211,6 +211,8 @@ In addition to comment notifications, the bell delivers bounty-related events:
 | ➕ | Someone added points to your bounty |
 | ⏰ | Your bounty expired without being fulfilled |
 | 💰 | Someone fulfilled a bounty using your upload |
+| 🛡 | Your bounty was removed by staff (includes reason) |
+| 💸 | Points were refunded to you after staff bounty removal |
 | 👥 | Someone started following you |
 | 📦 | Someone you follow uploaded a torrent |
 | ✅ | Someone you follow fulfilled a bounty |
@@ -513,6 +515,15 @@ The fulfilled bounty detail page shows the full breakdown with exact amounts and
 | Pending | Claim submitted, awaiting confirmation |
 | Fulfilled | Confirmed and paid out |
 | Expired | Pending window passed with no confirmation; bounty reopened |
+| Removed | Removed by Admin/Super moderation action |
+
+### Staff Moderation
+
+Admins and Super can remove spam/abusive bounties from the bounty detail page using the **Moderation** card. A reason can be provided (optional).
+
+- The bounty is marked **Removed** and no longer appears in normal board listings.
+- Affected users receive a removal notification including the moderation reason.
+- Any refundable escrow contributions are returned and separately notified.
 
 ---
 
