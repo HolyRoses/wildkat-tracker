@@ -5143,13 +5143,6 @@ class RegistrationDB:
         except Exception:
             return -1
 
-    def mark_user_tfa_totp_success(self, user_id: int, counter: int):
-        self._conn().execute(
-            'UPDATE users SET tfa_last_verified_at=?, tfa_last_counter=? WHERE id=?',
-            (self._ts(), int(counter), user_id)
-        )
-        self._conn().commit()
-
     def reserve_user_tfa_totp_counter(self, user_id: int, counter: int) -> bool:
         """Atomically reserve a strictly newer TOTP counter for this user."""
         cur = self._conn().execute(
@@ -5187,7 +5180,7 @@ class RegistrationDB:
         remaining = int(c.execute(
             "SELECT COUNT(*) FROM users WHERE tfa_secret_enc IS NOT NULL AND TRIM(tfa_secret_enc)<>'' AND tfa_secret_enc NOT LIKE 'enc:v2:%'"
         ).fetchone()[0])
-        if migrated > 0:
+        if migrated > 0 or remaining > 0:
             self._log(actor, 'tfa_secret_migration', '', f'migrated={migrated} remaining={remaining}')
         return migrated, remaining
 
@@ -8337,9 +8330,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                 msg_type='error'
             ))
         setup_counter, setup_offset = setup_match
-        # Avoid writing a future-window counter as "used" so next-period auth
-        # is not rejected after a +1 skew enrollment code.
-        persist_counter = int(setup_counter if setup_offset <= 0 else (setup_counter - 1))
+        # Persist the current time-step counter (not the raw matched skew window):
+        # - blocks same-window alternate-code reuse after a back-skew match
+        # - avoids next-step lockout after a +1 future-skew match
+        persist_counter = int(setup_counter - setup_offset)
         backup_count = int(REGISTRATION_DB.get_setting('tfa_backup_codes_count', '10') or 10)
         backup_codes = _tfa_generate_backup_codes(backup_count)
         REGISTRATION_DB.set_user_tfa_enrollment(int(user['id']), secret, backup_codes, method='totp')
@@ -8393,9 +8387,9 @@ class ManageHandler(BaseHTTPRequestHandler):
             used_match = _totp_verify_counter(secret, code, period=period, digits=digits, skew_steps=skew)
             if used_match is not None:
                 used_counter, used_offset = used_match
-                # Persist at most the current period for +1 skew matches to avoid
-                # blocking the next natural time-step login.
-                persist_counter = int(used_counter if used_offset <= 0 else (used_counter - 1))
+                # Persist current time-step counter (used_counter - offset).
+                # This blocks same-window alternate-code reuse and avoids +1 lockout.
+                persist_counter = int(used_counter - used_offset)
                 if REGISTRATION_DB.reserve_user_tfa_totp_counter(int(user['id']), persist_counter):
                     ok = True
                 else:
