@@ -8653,6 +8653,12 @@ class ManageHandler(BaseHTTPRequestHandler):
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
         tab      = qs.get('tab',      [''])[0]
+        if not tab:
+            # Keep Add User context if a create/validation message is present but tab was lost.
+            if qs.get('new_username', [''])[0]:
+                tab = 'adduser'
+            elif msg.startswith('User ') and ' created as ' in msg:
+                tab = 'adduser'
         self._send_html(_render_admin(user, all_torrents, all_users, events, trackers, settings,
                                       page=page, total_pages=total_pages, total=total,
                                       upage=upage, utotal_pages=utotal_pages, utotal=utotal,
@@ -9904,7 +9910,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         is_new_standard = role_choice in ('standard', 'admin')
         un_err = _validate_username(username)
         if un_err or not password:
-            return self._redirect('/manage/admin')
+            err = urllib.parse.quote(un_err or 'Password is required.')
+            un = urllib.parse.quote(username)
+            return self._redirect(f'/manage/admin?tab=adduser&msg={err}&msg_type=error&new_username={un}')
         pw_settings = REGISTRATION_DB.get_all_settings()
         pw_errors   = _validate_password(password, pw_settings)
         if pw_errors:
@@ -9912,9 +9920,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             un  = urllib.parse.quote(username)
             return self._redirect(f'/manage/admin?tab=adduser&msg={err}&msg_type=error&new_username={un}')
         ok = REGISTRATION_DB.create_user(username, password, is_new_admin, user['username'])
+        if not ok:
+            un = urllib.parse.quote(username)
+            return self._redirect(f'/manage/admin?tab=adduser&msg=Unable+to+create+user.+Username+may+already+exist.&msg_type=error&new_username={un}')
         if ok and is_new_standard and not is_new_admin:
             REGISTRATION_DB.set_standard(username, True, user['username'])
-        return self._redirect('/manage/admin?tab=users')
+        role_txt = 'admin' if is_new_admin else ('standard' if is_new_standard else 'basic')
+        msg = urllib.parse.quote(f'User {username} created as {role_txt}.')
+        return self._redirect(f'/manage/admin?tab=adduser&msg={msg}&msg_type=success')
 
     def _post_delete_user(self):
         user = self._get_session_user()
@@ -10639,7 +10652,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         url = fields.get('url', '').strip()
         if url:
             REGISTRATION_DB.add_magnet_tracker(url, user['username'])
-        self._redirect('/manage/admin')
+            return self._redirect('/manage/admin?tab=trackers&msg=Tracker+added.&msg_type=success')
+        self._redirect('/manage/admin?tab=trackers&msg=Tracker+URL+is+required.&msg_type=error')
 
     def _post_tracker_delete(self):
         user = self._get_session_user()
@@ -10649,10 +10663,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
-        tid = int(fields.get('tid', 0))
+        try:
+            tid = int(fields.get('tid', 0))
+        except (TypeError, ValueError):
+            tid = 0
         if tid:
             REGISTRATION_DB.delete_magnet_tracker(tid, user['username'])
-        self._redirect('/manage/admin')
+            return self._redirect('/manage/admin?tab=trackers&msg=Tracker+deleted.&msg_type=success')
+        self._redirect('/manage/admin?tab=trackers&msg=Invalid+tracker+id.&msg_type=error')
 
     def _post_tracker_toggle(self):
         user = self._get_session_user()
@@ -10662,10 +10680,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
-        tid = int(fields.get('tid', 0))
+        try:
+            tid = int(fields.get('tid', 0))
+        except (TypeError, ValueError):
+            tid = 0
         if tid:
             REGISTRATION_DB.toggle_magnet_tracker(tid, user['username'])
-        self._redirect('/manage/admin')
+            return self._redirect('/manage/admin?tab=trackers&msg=Tracker+status+updated.&msg_type=success')
+        self._redirect('/manage/admin?tab=trackers&msg=Invalid+tracker+id.&msg_type=error')
 
     def _post_tracker_move(self):
         user = self._get_session_user()
@@ -10675,11 +10697,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
-        tid = int(fields.get('tid', 0))
-        direction = int(fields.get('direction', 0))
+        try:
+            tid = int(fields.get('tid', 0))
+            direction = int(fields.get('direction', 0))
+        except (TypeError, ValueError):
+            tid = 0
+            direction = 0
         if tid and direction in (-1, 1):
             REGISTRATION_DB.move_magnet_tracker(tid, direction, user['username'])
-        self._redirect('/manage/admin')
+            return self._redirect('/manage/admin?tab=trackers&msg=Tracker+order+updated.&msg_type=success')
+        self._redirect('/manage/admin?tab=trackers&msg=Invalid+move+request.&msg_type=error')
 
     def _post_save_settings(self):
         user = self._get_session_user()
