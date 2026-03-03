@@ -973,6 +973,179 @@ def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, eve
         'peers_data': peers_data
     }
 
+def udp_scrape(sock, addr, connection_id, transaction_id, info_hash_list):
+    """Send UDP scrape request and return parsed torrent stats list."""
+    if not info_hash_list:
+        raise ValueError("UDP scrape requires at least one info_hash")
+
+    request = struct.pack('!QII', connection_id, UDP_ACTION_SCRAPE, transaction_id)
+    request += b''.join(info_hash_list)
+    sock.sendto(request, addr)
+
+    try:
+        response, _ = sock.recvfrom(65536)
+    except socket.timeout:
+        raise TimeoutError("UDP scrape request timed out")
+
+    if len(response) < 8:
+        raise ValueError(f"UDP scrape response too short: {len(response)} bytes")
+
+    action, resp_transaction_id = struct.unpack('!II', response[:8])
+
+    if action == 3:  # Error action
+        error_msg = response[8:].decode('utf-8', errors='replace')
+        raise ValueError(f"Tracker error: {error_msg}")
+
+    if action != UDP_ACTION_SCRAPE:
+        raise ValueError(f"Expected action {UDP_ACTION_SCRAPE}, got {action}")
+
+    if resp_transaction_id != transaction_id:
+        raise ValueError(f"Transaction ID mismatch: sent {transaction_id}, got {resp_transaction_id}")
+
+    expected_len = 8 + (12 * len(info_hash_list))
+    if len(response) < expected_len:
+        raise ValueError(
+            f"UDP scrape response too short for {len(info_hash_list)} hash(es): "
+            f"expected at least {expected_len} bytes, got {len(response)} bytes"
+        )
+
+    stats = []
+    offset = 8
+    for _ in info_hash_list:
+        seeders, completed, leechers = struct.unpack('!III', response[offset:offset + 12])
+        stats.append({
+            'complete': seeders,
+            'incomplete': leechers,
+            'downloaded': completed,
+        })
+        offset += 12
+
+    return stats
+
+def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent):
+    """Test UDP tracker scrape endpoint and return response time in milliseconds."""
+    start_time = time.time()
+
+    # UDP scrape requires explicit hash(es); full scrape is not part of BEP 15.
+    if info_hash_hex is None:
+        print("Error: Full scrape is not supported for UDP trackers. Provide --hash.", file=sys.stderr)
+        sys.exit(2)
+
+    # Normalize one or many hashes to bytes.
+    if isinstance(info_hash_hex, list):
+        hash_inputs = info_hash_hex
+    else:
+        hash_inputs = [info_hash_hex]
+
+    info_hash_list = []
+    for hash_hex in hash_inputs:
+        try:
+            hash_bytes = bytes.fromhex(hash_hex)
+            if len(hash_bytes) != 20:
+                raise ValueError(f"Info hash must be exactly 40 hex characters (20 bytes): {hash_hex}")
+            info_hash_list.append(hash_bytes)
+        except ValueError as e:
+            print(f"Error: Invalid info hash — {e}", file=sys.stderr)
+            sys.exit(2)
+
+    try:
+        hostname, port = parse_udp_url(tracker_url)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if output_format == 'table':
+        print(f"\n{'─' * 50}")
+        print(f"UDP SCRAPE → {tracker_url}")
+        print(f"{'─' * 50}")
+        print(f"Client: {user_agent}")
+        print(f"Scraping {len(info_hash_list)} torrent{'s' if len(info_hash_list) > 1 else ''}")
+        print(f"Connecting to: {hostname}:{port}")
+
+    try:
+        addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        if not addr_info:
+            if output_format == 'table':
+                print(f"DNS resolution failed: No address found for {hostname}")
+            sys.exit(1)
+        family, _, _, _, sockaddr = addr_info[0]
+        addr = sockaddr
+        if output_format == 'table':
+            print(f"Resolved to: {sockaddr[0]} ({'IPv6' if family == socket.AF_INET6 else 'IPv4'})")
+    except socket.gaierror as e:
+        if output_format == 'table':
+            print(f"DNS resolution failed: {e}")
+        sys.exit(1)
+
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    sock.settimeout(DEFAULT_TIMEOUT)
+
+    try:
+        # Step 1: Connect
+        transaction_id = random.randint(0, 0xFFFFFFFF)
+        if output_format == 'table':
+            print(f"Sending connect request (transaction_id: {transaction_id})...")
+        try:
+            connection_id = udp_connect(sock, addr, transaction_id)
+            if output_format == 'table':
+                print(f"Connected (connection_id: {connection_id})")
+        except (TimeoutError, ValueError) as e:
+            if output_format == 'table':
+                print(f"Connect failed: {e}")
+            sys.exit(1)
+
+        # Step 2: Scrape
+        transaction_id = random.randint(0, 0xFFFFFFFF)
+        if output_format == 'table':
+            print(f"Sending scrape request (transaction_id: {transaction_id})...")
+        try:
+            scrape_stats = udp_scrape(sock, addr, connection_id, transaction_id, info_hash_list)
+            response_time_ms = (time.time() - start_time) * 1000
+        except (TimeoutError, ValueError) as e:
+            if output_format == 'table':
+                print(f"Scrape failed: {e}")
+            sys.exit(1)
+
+        if output_format == 'table':
+            print(f"Scrape successful   Response time: {response_time_ms:.2f}ms")
+
+        torrents = []
+        for hash_bytes, stats in zip(info_hash_list, scrape_stats):
+            torrents.append({
+                'info_hash': hash_bytes.hex(),
+                'complete': stats['complete'],
+                'incomplete': stats['incomplete'],
+                'downloaded': stats['downloaded'],
+                'name': ''
+            })
+
+        data = {
+            'tracker': tracker_url,
+            'scrape_url': tracker_url,
+            'response_time_ms': round(response_time_ms, 2),
+            'failure_reason': None,
+            'min_request_interval': None,
+            'torrents': torrents,
+            'torrent_count': len(torrents)
+        }
+
+        if output_format == 'json':
+            print(json.dumps(data, indent=2))
+        elif output_format == 'csv':
+            print("info_hash,complete,incomplete,downloaded,name")
+            for torrent in torrents:
+                print(
+                    f"{torrent['info_hash']},{torrent['complete']},"
+                    f"{torrent['incomplete']},{torrent['downloaded']},{torrent['name']}"
+                )
+        else:  # table
+            format_scrape_table_output(data)
+
+    finally:
+        sock.close()
+
+    return round(response_time_ms, 2) if 'response_time_ms' in locals() else None
+
 def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=1000000000):
     """Test UDP tracker and return response time in milliseconds"""
     start_time = time.time()
@@ -1174,8 +1347,7 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
             return test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns, left)
     elif scheme == 'udp':
         if scrape:
-            print("Error: Scrape is only supported for HTTP/HTTPS trackers, not UDP.", file=sys.stderr)
-            sys.exit(2)
+            return test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent)
         return test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns, left)
     else:
         print(f"Error: Unsupported tracker scheme '{scheme}'. Only http, https, and udp are supported.", file=sys.stderr)
@@ -1384,7 +1556,7 @@ def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, sh
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers, as well as HTTP/HTTPS scrape requests.",
+        description="Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers, as well as scrape requests.",
         formatter_class=lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=32),
         add_help=True
     )
@@ -1483,7 +1655,7 @@ def main():
     parser.add_argument(
         '-s', '--scrape',
         action='store_true',
-        help="Use scrape endpoint instead of announce. Only works with HTTP/HTTPS trackers."
+        help="Use scrape endpoint instead of announce. Supports HTTP/HTTPS and UDP trackers (UDP requires --hash; no full scrape)."
     )
 
     parser.add_argument(

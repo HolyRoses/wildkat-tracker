@@ -2108,7 +2108,7 @@ class RegistrationDB:
             'topup_multiplier_bands_json':  '[{"min_usd":5,"multiplier_bp":10000},{"min_usd":10,"multiplier_bp":12500},{"min_usd":25,"multiplier_bp":14000},{"min_usd":50,"multiplier_bp":15500},{"min_usd":100,"multiplier_bp":17500}]',
             # ── Torrent peer scrape (manual refresh) ─────────
             'peer_query_enabled':           '0',
-            'peer_query_tracker':           'http://tracker.opentrackr.org:1337/announce',
+            'peer_query_tracker':           'udp://tracker.opentrackr.org:1337/announce',
             'peer_query_tool':              '/opt/tracker/tracker_query.py',
             'peer_query_args':              '-o json -s -r -H {hash} -t {tracker}',
             'peer_query_retries':           '3',
@@ -15374,7 +15374,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         _autotab_js = ''
 
     _peer_enabled = settings.get('peer_query_enabled', '0') == '1'
-    _peer_tracker = _h(settings.get('peer_query_tracker', 'http://tracker.opentrackr.org:1337/announce'))
+    _peer_tracker = _h(settings.get('peer_query_tracker', 'udp://tracker.opentrackr.org:1337/announce'))
     _peer_tool = _h(settings.get('peer_query_tool', '/opt/tracker/tracker_query.py'))
     _peer_args = _h(settings.get('peer_query_args', '-o json -s -r -H {hash} -t {tracker}'))
     _peer_retries = _h(settings.get('peer_query_retries', '3'))
