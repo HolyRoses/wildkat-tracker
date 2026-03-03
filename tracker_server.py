@@ -9076,11 +9076,15 @@ class ManageHandler(BaseHTTPRequestHandler):
         if user_probe and user_probe['is_locked'] and not user_probe['is_disabled']:
             # Only reveal lockout state when the submitted password is valid.
             # This avoids turning lockout messaging into broad username enumeration.
-            if _verify_password(password, user_probe['password_hash'], user_probe['salt']):
-                log.info('LOGIN blocked_locked user=%r ip=%s', username, client_ip)
-                REGISTRATION_DB._log(username, 'login_locked', client_ip)
-                self._send_html(_render_login(locked_login_msg))
-                return
+            if reveal_lockout_msg:
+                if _verify_password(password, user_probe['password_hash'], user_probe['salt']):
+                    log.info('LOGIN blocked_locked user=%r ip=%s', username, client_ip)
+                    REGISTRATION_DB._log(username, 'login_locked', client_ip)
+                    self._send_html(_render_login(locked_login_msg))
+                    return
+            else:
+                # Reveal flag disabled, skip bcrypt and let generic flow handle it.
+                pass
         if user_probe and not user_probe['is_disabled'] and not user_probe['is_locked']:
             policy = _auth_factor_policy_for_user(user_probe)
             if policy.get('password_blocked'):
