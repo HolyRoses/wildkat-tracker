@@ -6195,6 +6195,13 @@ class RegistrationDB:
         ).fetchone()[0]
         return [dict(r) for r in rows], total
 
+    def get_event(self, event_id: int):
+        row = self._conn().execute(
+            'SELECT * FROM events WHERE id=?',
+            (int(event_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
 
 
 
@@ -8473,6 +8480,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_dashboard()
         elif path == '/manage/admin':
             self._get_admin()
+        elif path.startswith('/manage/admin/event/'):
+            self._get_admin_event_detail(path[len('/manage/admin/event/'):])
         elif path == '/manage/password':
             self._get_password_page()
         elif path.startswith('/manage/admin/set-password/'):
@@ -8868,13 +8877,32 @@ class ManageHandler(BaseHTTPRequestHandler):
             all_users = REGISTRATION_DB.list_users(page=upage, per_page=users_pp)
         utotal_pages = max(1, (utotal + users_pp - 1) // users_pp)
         upage        = min(upage, utotal_pages)
+        # event log pagination + search
+        epage        = _get_named_page_param(self.path, 'epage')
+        events_pp    = 50
+        e_q_any      = qs.get('eq', [''])[0].strip()
+        e_q_actor    = qs.get('eactor', [''])[0].strip()
+        e_q_action   = qs.get('eaction', [''])[0].strip()
+        e_q_target   = qs.get('etarget', [''])[0].strip()
         events, ev_total = REGISTRATION_DB.list_events(
-            limit=200,
-            q_any=qs.get('eq', [''])[0].strip(),
-            q_actor=qs.get('eactor', [''])[0].strip(),
-            q_action=qs.get('eaction', [''])[0].strip(),
-            q_target=qs.get('etarget', [''])[0].strip(),
+            limit=events_pp,
+            offset=(epage - 1) * events_pp,
+            q_any=e_q_any,
+            q_actor=e_q_actor,
+            q_action=e_q_action,
+            q_target=e_q_target,
         )
+        ev_total_pages = max(1, (ev_total + events_pp - 1) // events_pp)
+        if epage > ev_total_pages:
+            epage = ev_total_pages
+            events, ev_total = REGISTRATION_DB.list_events(
+                limit=events_pp,
+                offset=(epage - 1) * events_pp,
+                q_any=e_q_any,
+                q_actor=e_q_actor,
+                q_action=e_q_action,
+                q_target=e_q_target,
+            )
         trackers     = REGISTRATION_DB.list_magnet_trackers()
         settings     = REGISTRATION_DB.get_all_settings()
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
@@ -8889,13 +8917,34 @@ class ManageHandler(BaseHTTPRequestHandler):
         self._send_html(_render_admin(user, all_torrents, all_users, events, trackers, settings,
                                       page=page, total_pages=total_pages, total=total,
                                       upage=upage, utotal_pages=utotal_pages, utotal=utotal,
+                                      epage=epage, ev_total_pages=ev_total_pages, events_pp=events_pp,
                                       uquery=uquery, msg=msg, msg_type=msg_type, tab=tab,
                                       new_username=urllib.parse.unquote(qs.get('new_username',[''])[0]),
                                       ev_total=ev_total,
-                                      eq=qs.get('eq',[''])[0],
-                                      eactor=qs.get('eactor',[''])[0],
-                                      eaction=qs.get('eaction',[''])[0],
-                                      etarget=qs.get('etarget',[''])[0]))
+                                      eq=qs.get('eq', [''])[0],
+                                      eactor=qs.get('eactor', [''])[0],
+                                      eaction=qs.get('eaction', [''])[0],
+                                      etarget=qs.get('etarget', [''])[0]))
+
+    def _get_admin_event_detail(self, event_id_raw: str):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        is_super = user['username'] == SUPER_USER
+        if not (user['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
+        event_id_str = (event_id_raw or '').strip('/')
+        if not event_id_str.isdigit():
+            return self._redirect('/manage/admin?tab=events&msg=Invalid+event+id.&msg_type=error')
+        event_id = int(event_id_str)
+        event = REGISTRATION_DB.get_event(event_id)
+        if not event:
+            return self._redirect('/manage/admin?tab=events&msg=Event+not+found.&msg_type=error')
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        back = urllib.parse.unquote(qs.get('back', [''])[0]).strip()
+        if not back.startswith('/manage/admin'):
+            back = '/manage/admin?tab=events'
+        self._send_html(_render_admin_event_detail(user, event, back_url=back))
 
     def _get_password_page(self):
         user = self._get_session_user()
@@ -12902,10 +12951,12 @@ _MANAGE_CSS = '''
 
   .hash { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
   .tabs { display: flex; gap: 4px; margin-bottom: 24px; background: var(--card);
-          border: 1px solid var(--border); border-radius: 10px; padding: 4px; width: fit-content; }
+          border: 1px solid var(--border); border-radius: 10px; padding: 4px; width: 100%;
+          overflow-x: auto; justify-content: center; }
   .tab { font-family: var(--mono); font-size: 0.75rem; letter-spacing: 0.1em; text-transform: uppercase;
          padding: 7px 20px; border-radius: 7px; border: none; background: transparent;
          color: var(--muted); cursor: pointer; transition: color 0.15s; }
+  .tabs .tab { flex: 0 0 auto; }
   .tab:hover { color: var(--accent); background: rgba(245,166,35,0.08); }
   .tab.tab-danger { color: var(--accent2); }
   .tab.tab-danger:hover { color: #ff7a55; background: rgba(224,91,48,0.12); }
@@ -14405,12 +14456,189 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
     return _manage_page('Dashboard', body, user=user, msg=msg, msg_type=msg_type)
 
 
+def _event_action_color(action: str) -> str:
+    action_l = (action or '').lower()
+    if ('delete' in action_l or 'ban' in action_l or 'lock' in action_l
+            or 'penalty' in action_l):
+        return 'var(--danger)'
+    if ('login' in action_l or 'register' in action_l or 'award' in action_l
+            or 'promote' in action_l):
+        return 'var(--green)'
+    if ('bounty' in action_l or 'points' in action_l or 'spend' in action_l
+            or 'topup' in action_l):
+        return 'var(--accent)'
+    return 'var(--text)'
+
+
+def _event_context_user_link(username: str, label: str | None = None) -> str | None:
+    uname = (username or '').strip()
+    if not uname or not REGISTRATION_DB:
+        return None
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', uname):
+        return None
+    row = REGISTRATION_DB.get_user(uname)
+    if not row:
+        return None
+    href = f'/manage/user/{urllib.parse.quote(uname, safe="")}'
+    text = _h(label if label is not None else uname)
+    return f'<a href="{href}" class="user-link">{text}</a>'
+
+
+def _event_context_torrent_link(info_hash: str, label: str | None = None) -> str | None:
+    ih = (info_hash or '').strip()
+    if not re.fullmatch(r'[A-Fa-f0-9]{40}', ih):
+        return None
+    if REGISTRATION_DB:
+        row = REGISTRATION_DB.get_torrent(ih)
+        if not row:
+            return None
+    ih_upper = ih.upper()
+    href = f'/manage/torrent/{ih_upper.lower()}'
+    text = _h(label if label is not None else ih_upper)
+    return (f'<a href="{href}" class="user-link hash" '
+            f'style="word-break:break-all;overflow-wrap:anywhere">{text}</a>')
+
+
+def _event_context_user_id_link(uid_raw: str) -> str | None:
+    if not uid_raw.isdigit() or not REGISTRATION_DB:
+        return None
+    user = REGISTRATION_DB.get_user_by_id(int(uid_raw))
+    if not user:
+        return None
+    uname = str(user['username'])
+    href = f'/manage/user/{urllib.parse.quote(uname, safe="")}'
+    return f'<a href="{href}" class="user-link">{_h(uid_raw)} ({_h(uname)})</a>'
+
+
+def _event_context_target_html(target_raw: str) -> str:
+    target = (target_raw or '').strip()
+    if not target:
+        return '<span style="color:var(--muted)">(none)</span>'
+    user_link = _event_context_user_link(target)
+    if user_link:
+        return user_link
+    torrent_link = _event_context_torrent_link(target)
+    if torrent_link:
+        return torrent_link
+    m = re.fullmatch(r'BOUNTY:(\d+)', target, flags=re.IGNORECASE)
+    if m:
+        bid = m.group(1)
+        return f'<a href="/manage/bounty/{bid}" class="user-link">{_h(target.upper())}</a>'
+    m = re.fullmatch(r'TOPUP:(\d+)', target, flags=re.IGNORECASE)
+    if m:
+        oid = m.group(1)
+        return f'<a href="/manage/admin?tab=topups#topup-order-{oid}" class="user-link">{_h(target.upper())}</a>'
+    return _h(target)
+
+
+def _event_context_detail_html(detail_raw: str) -> str:
+    detail = str(detail_raw or '')
+    if detail == '':
+        return _h('(empty)')
+    token_re = re.compile(
+        r'(@[A-Za-z0-9._-]{1,64}|'
+        r'(?:user_id|order_id|bounty_id|info_hash|target_username|username)=\S+|'
+        r'[A-Fa-f0-9]{40})'
+    )
+    out = []
+    pos = 0
+    for m in token_re.finditer(detail):
+        if m.start() > pos:
+            out.append(_h(detail[pos:m.start()]))
+        token = m.group(0)
+        repl = None
+        if token.startswith('@'):
+            uname = token[1:]
+            linked = _event_context_user_link(uname, label=uname)
+            if linked:
+                repl = '@' + linked
+        elif token.startswith('user_id='):
+            uid_raw = token.split('=', 1)[1]
+            linked = _event_context_user_id_link(uid_raw)
+            if linked:
+                repl = f'user_id={linked}'
+        elif token.startswith('order_id='):
+            oid = token.split('=', 1)[1]
+            if oid.isdigit():
+                repl = f'order_id=<a href="/manage/admin?tab=topups#topup-order-{oid}" class="user-link">{_h(oid)}</a>'
+        elif token.startswith('bounty_id='):
+            bid = token.split('=', 1)[1]
+            if bid.isdigit():
+                repl = f'bounty_id=<a href="/manage/bounty/{bid}" class="user-link">{_h(bid)}</a>'
+        elif token.startswith('info_hash='):
+            ih = token.split('=', 1)[1]
+            linked = _event_context_torrent_link(ih)
+            if linked:
+                repl = f'info_hash={linked}'
+        elif token.startswith('target_username=') or token.startswith('username='):
+            k, v = token.split('=', 1)
+            linked = _event_context_user_link(v)
+            if linked:
+                repl = f'{_h(k)}={linked}'
+        elif re.fullmatch(r'[A-Fa-f0-9]{40}', token):
+            repl = _event_context_torrent_link(token)
+        out.append(repl if repl else _h(token))
+        pos = m.end()
+    if pos < len(detail):
+        out.append(_h(detail[pos:]))
+    return ''.join(out)
+
+
+def _render_admin_event_detail(user, event: dict, back_url: str = '/manage/admin?tab=events') -> str:
+    event_id = int(event.get('id', 0))
+    event_time = _h(str((event.get('timestamp') or '')[:19]).replace('T', ' '))
+    actor_raw = str(event.get('actor', '') or '')
+    actor_html = _event_context_user_link(actor_raw, label=actor_raw) or _h(actor_raw)
+    action = _h(event.get('action', ''))
+    target_html = _event_context_target_html(event.get('target', ''))
+    detail_html = _event_context_detail_html(event.get('detail', ''))
+    action_color = _event_action_color(event.get('action', ''))
+    safe_back = back_url if (back_url or '').startswith('/manage/admin') else '/manage/admin?tab=events'
+    share_path = f'/manage/admin/event/{event_id}'
+    body = f'''
+  <div class="page-title">Event Detail</div>
+  <div class="page-sub">
+    Full activity record view &nbsp;·&nbsp;
+    <a href="{_h(safe_back)}" style="color:var(--muted);text-decoration:none;font-size:0.85rem">&#10094; Back to Event Log</a>
+  </div>
+  <div class="card" style="margin-bottom:14px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+      <div class="card-title" style="margin:0;border:0;padding:0">Event #{event_id}</div>
+      <div class="actions">
+        <button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(share_path)})">&#128279; Copy URL</button>
+        <a class="btn btn-sm" href="{_h(safe_back)}">&#10094; Back</a>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div style="display:grid;grid-template-columns:minmax(160px,220px) 1fr;gap:10px 14px;align-items:start">
+      <div style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;color:var(--muted);text-transform:uppercase">Event ID</div>
+      <div class="hash" style="font-size:0.85rem">{event_id}</div>
+      <div style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;color:var(--muted);text-transform:uppercase">Timestamp</div>
+      <div class="hash" style="font-size:0.85rem">{event_time}</div>
+      <div style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;color:var(--muted);text-transform:uppercase">Actor</div>
+      <div>{actor_html}</div>
+      <div style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;color:var(--muted);text-transform:uppercase">Action</div>
+      <div style="color:{action_color};font-family:var(--mono);font-size:0.84rem;word-break:break-word">{action}</div>
+      <div style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;color:var(--muted);text-transform:uppercase">Target</div>
+      <div style="color:var(--text);word-break:break-word;overflow-wrap:anywhere">{target_html}</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Detail</div>
+    <div style="font-family:var(--mono);font-size:0.84rem;line-height:1.65;color:var(--text);white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere">{detail_html}</div>
+  </div>
+'''
+    return _manage_page(f'Event #{event_id}', body, user=user)
+
+
 def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   trackers: list, settings: dict,
                   msg: str = '', msg_type: str = 'error',
                   page: int = 1, total_pages: int = 1, total: int = 0,
                   upage: int = 1, utotal_pages: int = 1, utotal: int = 0,
                   uquery: str = '', tab: str = '', new_username: str = '',
+                  epage: int = 1, ev_total_pages: int = 1, events_pp: int = 50,
                   ev_total: int = 0, eq: str = '', eactor: str = '',
                   eaction: str = '', etarget: str = '') -> str:
     is_super = user['username'] == SUPER_USER
@@ -15387,27 +15615,48 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         u_rows = '<tr><td colspan="5" class="empty">No users</td></tr>'
 
     # ── Event log ──────────────────────────────────────────────
+    ev_back_params = [('tab', 'events')]
+    if epage > 1:
+        ev_back_params.append(('epage', str(epage)))
+    if eq:
+        ev_back_params.append(('eq', eq))
+    if eactor:
+        ev_back_params.append(('eactor', eactor))
+    if eaction:
+        ev_back_params.append(('eaction', eaction))
+    if etarget:
+        ev_back_params.append(('etarget', etarget))
+    ev_back_url = '/manage/admin?' + urllib.parse.urlencode(ev_back_params)
+    ev_back_enc = urllib.parse.quote(ev_back_url, safe='')
+    ev_page_params = [('tab', 'events')]
+    if eq:
+        ev_page_params.append(('eq', eq))
+    if eactor:
+        ev_page_params.append(('eactor', eactor))
+    if eaction:
+        ev_page_params.append(('eaction', eaction))
+    if etarget:
+        ev_page_params.append(('etarget', etarget))
+    ev_page_base = '/manage/admin?' + urllib.parse.urlencode(ev_page_params)
+    ev_start = ((epage - 1) * events_pp) + 1 if ev_total else 0
+    ev_end = min(ev_total, epage * events_pp) if ev_total else 0
+    ev_range_label = f'{ev_start}-{ev_end}' if ev_total else '0'
     ev_rows = ''
     for e in events:
-        # Color-code by action type
         action = e['action']
-        if 'delete' in action or 'ban' in action or 'lock' in action or 'penalty' in action:
-            acolor = 'var(--danger)'
-        elif 'login' in action or 'register' in action or 'award' in action or 'promote' in action:
-            acolor = 'var(--green)'
-        elif 'bounty' in action or 'points' in action or 'spend' in action or 'topup' in action:
-            acolor = 'var(--accent)'
-        else:
-            acolor = 'var(--text)'
+        acolor = _event_action_color(action)
         actor_h  = _h(e['actor'])
-        target_h = _h(e['target'])
+        target_html = _event_context_target_html(e['target'])
+        detail_html = _event_context_detail_html(e['detail'])
+        event_link = f'/manage/admin/event/{int(e["id"])}?back={ev_back_enc}'
         ev_rows += (
             f'<tr>'
-            f'<td class="hash" style="white-space:nowrap">{e["timestamp"][:16].replace("T"," ")}</td>'
+            f'<td class="hash" style="white-space:nowrap"><a href="{event_link}" class="user-link">{e["timestamp"][:16].replace("T"," ")}</a></td>'
             f'<td><a href="/manage/user/{actor_h}" class="user-link">{actor_h}</a></td>'
-            f'<td style="color:{acolor};font-family:var(--mono);font-size:0.78rem">{_h(action)}</td>'
-            f'<td style="color:var(--muted)">{target_h}</td>'
-            f'<td class="hash" style="font-size:0.75rem">{_h(e["detail"])}</td>'
+            f'<td style="color:{acolor};font-family:var(--mono);font-size:0.78rem"><a href="{event_link}" class="user-link" style="color:{acolor}">{_h(action)}</a></td>'
+            f'<td style="color:var(--muted);word-break:break-word;overflow-wrap:anywhere">{target_html}</td>'
+            f'<td class="hash" style="font-size:0.75rem;word-break:break-word;overflow-wrap:anywhere">{detail_html}'
+            f' &nbsp;<a href="{event_link}" class="btn btn-sm" style="white-space:nowrap">View &#8594;</a></td>'
             f'</tr>'
         )
     if not ev_rows:
@@ -15441,6 +15690,13 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         _autotab_js = ('<script>window.addEventListener("DOMContentLoaded",function(){'
                        'var b=document.querySelector(".tab:nth-child(2)");'
                        'if(b){b.click();}})</script>')
+    elif epage > 1:
+        _autotab_js = ('<script>window.addEventListener("DOMContentLoaded",function(){'
+                       'var els=document.querySelectorAll(".tab");'
+                       'for(var i=0;i<els.length;i++){'
+                       'var oc=els[i].getAttribute("onclick")||"";'
+                       'if(oc.indexOf("showTab(\'events\'")!==-1){els[i].click();break;}'
+                       '}})</script>')
     else:
         _autotab_js = ''
 
@@ -15626,7 +15882,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     <div class="card">
       <div class="card-title">Event Log
         <span style="color:var(--muted);font-size:0.78rem;font-weight:400;margin-left:8px">
-          {ev_total} matching · showing up to 200
+          {ev_total} matching · showing {ev_range_label} · page {epage}/{ev_total_pages}
         </span>
       </div>
       <form method="GET" action="/manage/admin" style="margin-bottom:16px">
@@ -15662,14 +15918,15 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
       </form>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th scope="col" style="white-space:nowrap">Time</th>
-          <th scope="col">Actor</th>
-          <th scope="col">Action</th>
-          <th scope="col">Target</th>
+          <th scope="col" style="white-space:nowrap;width:130px">Time</th>
+          <th scope="col" style="width:140px">Actor</th>
+          <th scope="col" style="width:170px">Action</th>
+          <th scope="col" style="width:220px">Target</th>
           <th scope="col">Detail</th>
         </tr></thead>
         <tbody>{ev_rows}</tbody>
       </table></div>
+      {_pagination_html(epage, ev_total_pages, ev_page_base, page_param='epage')}
     </div>
   </div>'''
     return _manage_page('Admin Panel', body, user=user, msg=msg, msg_type=msg_type)
