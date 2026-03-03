@@ -183,6 +183,7 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 | `--max-scrape-hashes` | 5 | Maximum info_hashes allowed per scrape request |
 | `--full-scrape` | off | Allow scrape with no info_hash |
 | `--verbose` | off | Enable debug logging |
+| `--trusted-proxy-cidr` | none | Comma-separated proxy CIDRs trusted for `X-Forwarded-For` (strict mode; ignored if not set) |
 
 ### Registration Mode
 
@@ -190,7 +191,7 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 |------|---------|-------------|
 | `--registration` | off | Enable registration mode and the `/manage` web interface |
 | `--super-user` | — | Superuser username (required with `--registration`) |
-| `--super-user-password` | — | Set or reset the superuser password (process exits after setting) |
+| `--super-user-password` | off | Set or reset the superuser password (reads `WK_SUPER_USER_PASSWORD` or prompts interactively; process exits after setting) |
 | `--super-user-reset-passkeys` | off | Reset superuser passkeys and passkey-required flags, then exit |
 | `--super-user-reset-tfa` | off | Reset superuser TFA secret/backup codes and TFA-required flag, then exit |
 | `--auth-break-glass` | off | Temporary startup override that bypasses passkey enforcement gates |
@@ -205,3 +206,7 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 - Optional auth packages:
   - Passkeys (WebAuthn): `python3-fido2`
   - TFA QR rendering on setup page: `python3-qrcode`
+
+## Proxy IP Trust (`X-Forwarded-For`)
+
+Use `--trusted-proxy-cidr` when deploying behind reverse proxies. Detailed trust-model behavior and examples are documented in `INSTALL.md` and `USER_GUIDE.md`.

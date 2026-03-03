@@ -324,9 +324,11 @@ systemctl stop tracker
 python3 /opt/tracker/tracker_server.py \
   --registration \
   --super-user super \
-  --super-user-password 'YourStrongP@ssw0rd!' \
+  --super-user-password \
   --db /opt/tracker/tracker.db
 ```
+
+The command reads `WK_SUPER_USER_PASSWORD` if set; otherwise it prompts interactively.
 
 The server sets the password and exits immediately. Then restart:
 
@@ -399,7 +401,7 @@ systemctl stop tracker
 python3 /opt/tracker/tracker_server.py \
   --registration \
   --super-user super \
-  --super-user-password 'NewStrongP@ssw0rd!' \
+  --super-user-password \
   --db /opt/tracker/tracker.db
 systemctl start tracker
 ```
@@ -429,6 +431,7 @@ systemctl start tracker
 | `--max-scrape-hashes` | 5 | Maximum info_hashes per scrape request |
 | `--full-scrape` | off | Allow scrape with no info_hash (exposes all torrents) |
 | `--verbose` | off | Enable debug logging |
+| `--trusted-proxy-cidr` | none | Comma-separated proxy CIDRs trusted for `X-Forwarded-For` (strict mode; ignored if not set) |
 
 ### Registration Mode
 
@@ -436,13 +439,35 @@ systemctl start tracker
 |------|---------|-------------|
 | `--registration` | off | Enable registration mode and the `/manage` web interface |
 | `--super-user` | — | Superuser username — required when `--registration` is set |
-| `--super-user-password` | — | Set or reset the superuser password (process exits after setting) |
+| `--super-user-password` | off | Set or reset the superuser password (reads `WK_SUPER_USER_PASSWORD` or prompts interactively; process exits after setting) |
 | `--super-user-reset-passkeys` | off | Reset superuser passkeys and passkey-required flags, then exit |
 | `--super-user-reset-tfa` | off | Reset superuser TFA secret/backup codes and TFA-required flag, then exit |
 | `--auth-break-glass` | off | Temporary startup override that bypasses passkey enforcement gates |
 | `--db` | `/opt/tracker/tracker.db` | Path to the SQLite database file |
 | `--manage-port` | same as `--web-https-port` | HTTPS port for the management interface if different from stats port |
 | `--manage-http-port` | 80 | HTTP redirect port for management interface (0 to disable) |
+
+---
+
+### Proxy Trust Modes (`X-Forwarded-For`)
+
+The server uses strict proxy trust behavior: `X-Forwarded-For` is ignored unless the request comes from a trusted proxy CIDR set with `--trusted-proxy-cidr`.
+
+Use these `--trusted-proxy-cidr` examples:
+
+- Direct internet-facing tracker (no reverse proxy):
+  - Do not set `--trusted-proxy-cidr` (or set an empty value)
+- Local reverse proxy on same host (Nginx/HAProxy):
+  - `--trusted-proxy-cidr 127.0.0.1/32,::1/128`
+- HAProxy on a private LAN subnet:
+  - `--trusted-proxy-cidr 10.0.0.0/24`
+- Cloudflare in front of your tracker:
+  - Example format (subset): `--trusted-proxy-cidr 173.245.48.0/20,103.21.244.0/22,2400:cb00::/32,2606:4700::/32`
+  - Use Cloudflare's published IPv4/IPv6 list for a complete, current value
+- Unsafe trust-all mode (not recommended):
+  - `--trusted-proxy-cidr 0.0.0.0/0,::/0`
+
+If you use the trust-all example, any source can influence client-IP resolution through `X-Forwarded-For`.
 
 ---
 

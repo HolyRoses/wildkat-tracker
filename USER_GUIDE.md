@@ -757,6 +757,35 @@ Behavior notes:
   - older rows are kept as historical daily totals
 - The **All Time** unique IP metric is a high-water value (highest unique IP count observed in a single day), not a stored all-time deduplicated IP identity set.
 
+### Trusted Proxy IP Handling (`X-Forwarded-For`)
+
+When the tracker receives web or tracker requests, it determines client IP using strict proxy trust rules.
+
+Behavior:
+
+- If `--trusted-proxy-cidr` is not set, `X-Forwarded-For` is ignored.
+- If `--trusted-proxy-cidr` is set, `X-Forwarded-For` is used only when the direct socket peer IP is inside one of those trusted CIDRs.
+- If a request does not come from a trusted proxy CIDR, the socket source IP is used.
+
+Use these startup patterns:
+
+- Direct internet-facing deployment (no reverse proxy):
+  - Do not set `--trusted-proxy-cidr`
+- Local reverse proxy on same host (Nginx/HAProxy):
+  - `--trusted-proxy-cidr 127.0.0.1/32,::1/128`
+- HAProxy on private LAN:
+  - `--trusted-proxy-cidr 10.0.0.0/24`
+- Cloudflare fronted deployment:
+  - Example format (subset): `--trusted-proxy-cidr 173.245.48.0/20,103.21.244.0/22,2400:cb00::/32,2606:4700::/32`
+  - Use Cloudflare's published IPv4/IPv6 list for full, current coverage
+- Unsafe trust-all mode (not recommended):
+  - `--trusted-proxy-cidr 0.0.0.0/0,::/0`
+
+Operational note:
+
+- Trust-all mode trusts forwarded IP headers from any source and weakens security posture.
+- Use trust-all only for temporary debugging, not normal production operation.
+
 ### Gravatar Integration
 
 | Setting | Default | Description |
@@ -808,8 +837,10 @@ sudo -u tracker /opt/tracker/tracker_server.py \
   --db /opt/tracker/tracker.db \
   --super-user super \
   --manage-port 443 \
-  --super-user-password 'NEW_STRONG_PASSWORD'
+  --super-user-password
 ```
+
+The command reads `WK_SUPER_USER_PASSWORD` if set; otherwise it prompts interactively.
 
 If your deployment uses a separate management TLS configuration, include the same TLS flags used by your service startup command.
 

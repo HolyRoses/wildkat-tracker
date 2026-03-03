@@ -122,6 +122,8 @@ MAX_PEERS_PER_REPLY  = 200
 MAX_SCRAPE_HASHES    = 5      # max info_hashes per scrape request
 ALLOW_FULL_SCRAPE    = False  # allow scrape with no info_hash (exposes all torrents)
 DEFAULT_TRACKER_ID  = 'Wildkat'
+TRUSTED_PROXY_CIDRS_RAW = ''
+TRUSTED_PROXY_NETWORKS: list = []
 
 logging.basicConfig(
     level=logging.INFO,
@@ -184,6 +186,46 @@ def bencode(obj) -> bytes:
         )
         return b'd' + b''.join(bencode(k) + bencode(v) for k, v in items) + b'e'
     raise TypeError(f'Cannot bencode type {type(obj)}')
+
+
+def _parse_trusted_proxy_cidrs(raw: str) -> list:
+    """Parse comma-separated CIDRs into network objects."""
+    nets = []
+    for item in (raw or '').split(','):
+        token = item.strip()
+        if not token:
+            continue
+        nets.append(ipaddress.ip_network(token, strict=False))
+    return nets
+
+
+def _first_valid_xff_ip(xff_header: str) -> str | None:
+    """Return first syntactically valid IP from X-Forwarded-For chain."""
+    # Assumes single trusted edge proxy inserts XFF as "client_ip[, ...]".
+    # For multi-hop trusted proxy chains, evolve this to right-to-left
+    # trusted-hop stripping and pick the first untrusted IP.
+    if not xff_header:
+        return None
+    for part in xff_header.split(','):
+        candidate = part.strip()
+        if not candidate:
+            continue
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    return None
+
+
+def _ip_is_trusted_proxy(addr: str) -> bool:
+    """Whether a remote socket IP is inside configured trusted proxy CIDRs."""
+    if not TRUSTED_PROXY_NETWORKS:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip_obj in net for net in TRUSTED_PROXY_NETWORKS)
 
 # ─────────────────────────────────────────────────────────────
 # Peer registry  (thread-safe in-memory store)
@@ -6232,8 +6274,19 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
         if event not in ('started', 'completed', 'stopped', 'none', ''):
             event = 'none'
 
-        # Determine client IP: prefer X-Forwarded-For for reverse-proxy setups
-        ip = self.headers.get('X-Forwarded-For', self.client_address[0]).split(',')[0].strip()
+        socket_ip = self.client_address[0]
+        xff_header = self.headers.get('X-Forwarded-For', '')
+        ip = socket_ip
+        ip_source = 'socket'
+        if xff_header and _ip_is_trusted_proxy(socket_ip):
+            forwarded = _first_valid_xff_ip(xff_header)
+            if forwarded:
+                ip = forwarded
+                ip_source = 'xff_trusted_proxy'
+        log.debug(
+            'HTTP ANNOUNCE IP source=%s socket_ip=%s xff=%r resolved_ip=%s',
+            ip_source, socket_ip, xff_header[:120], ip
+        )
         ih_hex = raw_ih.hex().upper()
         user_agent = self.headers.get('User-Agent', 'unknown')
 
@@ -6449,7 +6502,7 @@ _UDP_CONN_TTL  = 120  # seconds
 
 
 def _gen_connection_id() -> int:
-    cid = random.getrandbits(64)
+    cid = int.from_bytes(os.urandom(8), 'big')
     with _udp_conn_lock:
         _udp_conn_ids[cid] = time.time() + _UDP_CONN_TTL
     return cid
@@ -6605,7 +6658,8 @@ def _handle_udp_packet(sock: socket.socket, data: bytes, addr):
         # ── Scrape ───────────────────────────────────────────
         if action == UDP_ACT_SCRAPE:
             # Each info_hash is 20 bytes, starting at offset 16
-            num_hashes = (len(data) - 16) // 20
+            num_hashes_raw = (len(data) - 16) // 20
+            num_hashes = min(num_hashes_raw, MAX_SCRAPE_HASHES)
             if num_hashes == 0:
                 _udp_send_error(sock, addr, transaction_id, b'no info_hash in scrape')
                 return
@@ -6619,6 +6673,9 @@ def _handle_udp_packet(sock: socket.socket, data: bytes, addr):
                 resp += struct.pack('!III', complete, downloaded, incomplete)
 
             sock.sendto(resp, addr)
+            if num_hashes_raw > MAX_SCRAPE_HASHES:
+                log.warning('UDP scrape hash count capped from %d to %d from %s',
+                            num_hashes_raw, MAX_SCRAPE_HASHES, client_ip)
             log.info('UDP scrape from %s  %d hashes', client_ip, num_hashes)
             log.debug('UDP SCRAPE  from=%s  transaction_id=%d  hashes=%d',
                       client_ip, transaction_id, num_hashes)
@@ -9978,6 +10035,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         fields, _ = _parse_multipart(self.headers, body)
         ih = fields.get('info_hash', '').strip().upper()
         if not ih:
+            return self._redirect('/manage/dashboard')
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
             return self._redirect('/manage/dashboard')
         t = REGISTRATION_DB.get_torrent(ih)
         if not t:
@@ -18085,7 +18144,8 @@ def main():
            DEFAULT_TRACKER_ID, MAX_SCRAPE_HASHES, ALLOW_FULL_SCRAPE, \
            REGISTRATION_MODE, REGISTRATION_DB, OPEN_TRACKER, \
            REWARD_ENABLED, REWARD_THRESHOLD, SUPER_USER, _MANAGE_HTTPS_PORT, \
-           AUTH_BREAK_GLASS, AUTH_BREAK_GLASS_UNTIL_TS
+           AUTH_BREAK_GLASS, AUTH_BREAK_GLASS_UNTIL_TS, \
+           TRUSTED_PROXY_CIDRS_RAW, TRUSTED_PROXY_NETWORKS
 
     parser = argparse.ArgumentParser(
         description='BitTorrent Tracker Server (HTTP + HTTPS + UDP)',
@@ -18119,6 +18179,8 @@ def main():
                         help='Tracker ID string returned in HTTP announce responses')
     parser.add_argument('--max-scrape-hashes', type=int, default=MAX_SCRAPE_HASHES,
                         help='Maximum number of info_hashes allowed per scrape request')
+    parser.add_argument('--trusted-proxy-cidr', default='',
+                        help='Comma-separated trusted proxy CIDRs for X-Forwarded-For trust (e.g. 127.0.0.1/32,::1/128)')
     parser.add_argument('--full-scrape', action='store_true',
                         help='Allow full scrape (no info_hash returns all torrents). Disabled by default.')
     parser.add_argument('--web-http-port', type=int, default=80,
@@ -18137,8 +18199,9 @@ def main():
                         help='Path to SQLite database for registration mode')
     parser.add_argument('--super-user', default='',
                         help='Superuser username (required with --registration)')
-    parser.add_argument('--super-user-password', default='',
-                        help='Set/reset superuser password (service must be stopped)')
+    parser.add_argument('--super-user-password', action='store_true',
+                        help=('Set/reset superuser password (reads WK_SUPER_USER_PASSWORD '
+                              'env var, or prompts interactively)'))
     parser.add_argument('--super-user-reset-passkeys', action='store_true',
                         help='Reset super-user passkeys and passkey-required flags, then exit')
     parser.add_argument('--super-user-reset-tfa', action='store_true',
@@ -18169,6 +18232,20 @@ def main():
     DEFAULT_MIN_INTERVAL = args.min_interval
     PEER_TTL            = args.peer_ttl
     MAX_PEERS_PER_REPLY = args.max_peers
+    TRUSTED_PROXY_CIDRS_RAW = (args.trusted_proxy_cidr or '').strip()
+    try:
+        TRUSTED_PROXY_NETWORKS = _parse_trusted_proxy_cidrs(TRUSTED_PROXY_CIDRS_RAW)
+    except ValueError as e:
+        print(f'Error: invalid --trusted-proxy-cidr value: {e}', file=sys.stderr)
+        sys.exit(1)
+    if TRUSTED_PROXY_NETWORKS:
+        log.info('XFF trust mode: strict (trusted proxy CIDRs configured: %d)', len(TRUSTED_PROXY_NETWORKS))
+    else:
+        log.warning(
+            'XFF trust mode: strict with no trusted proxy CIDRs configured. '
+            'X-Forwarded-For will be ignored. If this tracker is behind a reverse '
+            'proxy, set --trusted-proxy-cidr.'
+        )
 
     servers = []
 
@@ -18214,8 +18291,18 @@ def main():
         if not args.super_user:
             print('Error: --super-user-password requires --super-user', file=sys.stderr)
             sys.exit(1)
-        db = RegistrationDB(args.db)
-        ph, salt = _hash_password(args.super_user_password)
+        pw = (os.environ.get('WK_SUPER_USER_PASSWORD') or '').strip()
+        if not pw:
+            try:
+                import getpass
+                pw = getpass.getpass('New superuser password: ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print('Error: super-user password entry aborted', file=sys.stderr)
+                sys.exit(1)
+        if not pw:
+            print('Error: empty super-user password is not allowed', file=sys.stderr)
+            sys.exit(1)
+        ph, salt = _hash_password(pw)
         conn = sqlite3.connect(args.db)
         conn.execute('INSERT OR REPLACE INTO users '
                      '(username,password_hash,salt,is_admin,created_by,created_at) '
