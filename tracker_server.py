@@ -66,7 +66,17 @@ from typing import Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-_BENIGN_SOCKET_EXC = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
+_BENIGN_SOCKET_EXC = (
+    ConnectionResetError,
+    BrokenPipeError,
+    ConnectionAbortedError,
+    ssl.SSLEOFError,
+)
+
+
+def _sanitize_log_text(value: str) -> str:
+    """Make log text printable for journald/syslog while preserving content."""
+    return ''.join(ch if 32 <= ord(ch) <= 126 else f'\\x{ord(ch):02x}' for ch in value)
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -6199,12 +6209,12 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         path = getattr(self, 'path', '?').split('?')[0]
         cmd  = getattr(self, 'command', '?')
-        log.info('%s %s %s', self.client_address[0], cmd, path)
+        log.info('%s %s %s', _sanitize_log_text(self.client_address[0]), cmd, _sanitize_log_text(path))
 
     def log_error(self, fmt, *args):
         # Downgrade bad-request noise (garbage TLS probes etc.) to DEBUG
         msg = fmt % args if args else str(fmt)
-        log.debug('WEB %s %s', self.client_address[0], msg)
+        log.debug('WEB %s %s', _sanitize_log_text(self.client_address[0]), _sanitize_log_text(msg))
 
     def _request_is_https(self) -> bool:
         # In this server design, TLS is applied to accepted connections, not
@@ -8412,7 +8422,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         return max_content_mb, max_files, max_file_mb
 
     def log_message(self, fmt, *args):
-        log.debug('MANAGE %s %s', self.address_string(), fmt % args)
+        msg = fmt % args if args else str(fmt)
+        log.debug('MANAGE %s %s', _sanitize_log_text(self.address_string()), _sanitize_log_text(msg))
 
     # ── Routing ──────────────────────────────────────────────
 
@@ -12728,7 +12739,8 @@ class StatsWebHandler(ManageHandler):
             self.end_headers()
 
     def log_message(self, fmt, *args):
-        log.debug('WEB %s %s', self.address_string(), fmt % args)
+        msg = fmt % args if args else str(fmt)
+        log.debug('WEB %s %s', _sanitize_log_text(self.address_string()), _sanitize_log_text(msg))
 
 
 class IPv6StatsWebServer(ThreadingMixIn, HTTPServer):
