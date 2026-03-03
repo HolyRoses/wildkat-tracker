@@ -183,6 +183,7 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 | `--max-scrape-hashes` | 5 | Maximum info_hashes allowed per scrape request |
 | `--full-scrape` | off | Allow scrape with no info_hash |
 | `--verbose` | off | Enable debug logging |
+| `--trusted-proxy-cidr` | none | Comma-separated proxy CIDRs trusted for `X-Forwarded-For` (strict mode; ignored if not set) |
 
 ### Registration Mode
 
@@ -205,3 +206,7 @@ See [INSTALL.md](INSTALL.md) for the full guide including TLS certificate setup 
 - Optional auth packages:
   - Passkeys (WebAuthn): `python3-fido2`
   - TFA QR rendering on setup page: `python3-qrcode`
+
+## Proxy IP Trust (`X-Forwarded-For`)
+
+Use `--trusted-proxy-cidr` when deploying behind reverse proxies. Detailed trust-model behavior and examples are documented in `INSTALL.md` and `USER_GUIDE.md`.

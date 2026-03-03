@@ -429,6 +429,7 @@ systemctl start tracker
 | `--max-scrape-hashes` | 5 | Maximum info_hashes per scrape request |
 | `--full-scrape` | off | Allow scrape with no info_hash (exposes all torrents) |
 | `--verbose` | off | Enable debug logging |
+| `--trusted-proxy-cidr` | none | Comma-separated proxy CIDRs trusted for `X-Forwarded-For` (strict mode; ignored if not set) |
 
 ### Registration Mode
 
@@ -443,6 +444,28 @@ systemctl start tracker
 | `--db` | `/opt/tracker/tracker.db` | Path to the SQLite database file |
 | `--manage-port` | same as `--web-https-port` | HTTPS port for the management interface if different from stats port |
 | `--manage-http-port` | 80 | HTTP redirect port for management interface (0 to disable) |
+
+---
+
+### Proxy Trust Modes (`X-Forwarded-For`)
+
+The server uses strict proxy trust behavior: `X-Forwarded-For` is ignored unless the request comes from a trusted proxy CIDR set with `--trusted-proxy-cidr`.
+
+Use these `--trusted-proxy-cidr` examples:
+
+- Direct internet-facing tracker (no reverse proxy):
+  - Do not set `--trusted-proxy-cidr` (or set an empty value)
+- Local reverse proxy on same host (Nginx/HAProxy):
+  - `--trusted-proxy-cidr 127.0.0.1/32,::1/128`
+- HAProxy on a private LAN subnet:
+  - `--trusted-proxy-cidr 10.0.0.0/24`
+- Cloudflare in front of your tracker:
+  - Example format (subset): `--trusted-proxy-cidr 173.245.48.0/20,103.21.244.0/22,2400:cb00::/32,2606:4700::/32`
+  - Use Cloudflare's published IPv4/IPv6 list for a complete, current value
+- Unsafe trust-all mode (not recommended):
+  - `--trusted-proxy-cidr 0.0.0.0/0,::/0`
+
+If you use the trust-all example, any source can influence client-IP resolution through `X-Forwarded-For`.
 
 ---
 
