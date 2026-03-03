@@ -18199,8 +18199,9 @@ def main():
                         help='Path to SQLite database for registration mode')
     parser.add_argument('--super-user', default='',
                         help='Superuser username (required with --registration)')
-    parser.add_argument('--super-user-password', default='',
-                        help='Set/reset superuser password (service must be stopped)')
+    parser.add_argument('--super-user-password', action='store_true',
+                        help=('Set/reset superuser password (reads WK_SUPER_USER_PASSWORD '
+                              'env var, or prompts interactively)'))
     parser.add_argument('--super-user-reset-passkeys', action='store_true',
                         help='Reset super-user passkeys and passkey-required flags, then exit')
     parser.add_argument('--super-user-reset-tfa', action='store_true',
@@ -18290,8 +18291,18 @@ def main():
         if not args.super_user:
             print('Error: --super-user-password requires --super-user', file=sys.stderr)
             sys.exit(1)
-        db = RegistrationDB(args.db)
-        ph, salt = _hash_password(args.super_user_password)
+        pw = (os.environ.get('WK_SUPER_USER_PASSWORD') or '').strip()
+        if not pw:
+            try:
+                import getpass
+                pw = getpass.getpass('New superuser password: ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print('Error: super-user password entry aborted', file=sys.stderr)
+                sys.exit(1)
+        if not pw:
+            print('Error: empty super-user password is not allowed', file=sys.stderr)
+            sys.exit(1)
+        ph, salt = _hash_password(pw)
         conn = sqlite3.connect(args.db)
         conn.execute('INSERT OR REPLACE INTO users '
                      '(username,password_hash,salt,is_admin,created_by,created_at) '

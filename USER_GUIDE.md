@@ -837,8 +837,10 @@ sudo -u tracker /opt/tracker/tracker_server.py \
   --db /opt/tracker/tracker.db \
   --super-user super \
   --manage-port 443 \
-  --super-user-password 'NEW_STRONG_PASSWORD'
+  --super-user-password
 ```
+
+The command reads `WK_SUPER_USER_PASSWORD` if set; otherwise it prompts interactively.
 
 If your deployment uses a separate management TLS configuration, include the same TLS flags used by your service startup command.
 

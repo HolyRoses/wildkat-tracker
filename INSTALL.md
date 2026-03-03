@@ -324,9 +324,11 @@ systemctl stop tracker
 python3 /opt/tracker/tracker_server.py \
   --registration \
   --super-user super \
-  --super-user-password 'YourStrongP@ssw0rd!' \
+  --super-user-password \
   --db /opt/tracker/tracker.db
 ```
+
+The command reads `WK_SUPER_USER_PASSWORD` if set; otherwise it prompts interactively.
 
 The server sets the password and exits immediately. Then restart:
 
@@ -399,7 +401,7 @@ systemctl stop tracker
 python3 /opt/tracker/tracker_server.py \
   --registration \
   --super-user super \
-  --super-user-password 'NewStrongP@ssw0rd!' \
+  --super-user-password \
   --db /opt/tracker/tracker.db
 systemctl start tracker
 ```
@@ -437,7 +439,7 @@ systemctl start tracker
 |------|---------|-------------|
 | `--registration` | off | Enable registration mode and the `/manage` web interface |
 | `--super-user` | — | Superuser username — required when `--registration` is set |
-| `--super-user-password` | — | Set or reset the superuser password (process exits after setting) |
+| `--super-user-password` | off | Set or reset the superuser password (reads `WK_SUPER_USER_PASSWORD` or prompts interactively; process exits after setting) |
 | `--super-user-reset-passkeys` | off | Reset superuser passkeys and passkey-required flags, then exit |
 | `--super-user-reset-tfa` | off | Reset superuser TFA secret/backup codes and TFA-required flag, then exit |
 | `--auth-break-glass` | off | Temporary startup override that bypasses passkey enforcement gates |
