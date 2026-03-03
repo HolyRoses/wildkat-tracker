@@ -16807,8 +16807,8 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + row('Login Count',    str(lc))
         + row('Password Changed', lpc[:16] if lpc else 'Never recorded')
         + row('Failed Attempts', str(target_user['failed_attempts']))
-        + row('Locked At',      (target_user['locked_at'] or '--')[:16] if ('locked_at' in target_user.keys()) else '--')
-        + (row('Unlocks At', _unlock_at_value(target_user)) if target_user['is_locked'] else '')
+        + ((row('Locked At',      (target_user['locked_at'] or '--')[:16] if ('locked_at' in target_user.keys()) else '--')
+            + row('Unlocks At', _unlock_at_value(target_user))) if target_user['is_locked'] else '')
         + row('Points',         f'<span style="color:{pts_color};font-weight:bold">{pts_val}</span>'
                                 + (f' <span style="color:var(--muted);font-size:0.8rem">(🔥 {streak_val}-day streak)</span>'
                                    if streak_val > 1 else ''))
