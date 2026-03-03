@@ -1449,6 +1449,7 @@ class RegistrationDB:
                 created_at  TEXT    NOT NULL,
                 expires_at  TEXT    NOT NULL,
                 must_enroll_passkey INTEGER NOT NULL DEFAULT 0,
+                allow_locked_passkey INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS events (
@@ -2000,6 +2001,9 @@ class RegistrationDB:
         if 'pending_tfa_challenge_id' not in scols:
             c.execute('ALTER TABLE sessions ADD COLUMN pending_tfa_challenge_id INTEGER')
             c.commit()
+        if 'allow_locked_passkey' not in scols:
+            c.execute('ALTER TABLE sessions ADD COLUMN allow_locked_passkey INTEGER NOT NULL DEFAULT 0')
+            c.commit()
         wcols = [r[1] for r in c.execute('PRAGMA table_info(webauthn_credentials)').fetchall()]
         if 'is_primary' not in wcols:
             c.execute('ALTER TABLE webauthn_credentials ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0')
@@ -2037,6 +2041,7 @@ class RegistrationDB:
             'login_auto_unlock_enabled': '0',
             'login_auto_unlock_hours': '24',
             'login_reveal_lockout_message': '0',
+            'login_allow_passkey_when_locked': '1',
             'open_tracker':       '0',
             'comments_enabled':   '1',
             # ── Points economy ────────────────────────────────
@@ -5159,19 +5164,21 @@ class RegistrationDB:
 
     def create_session(self, user_id: int, must_enroll_passkey: bool = False,
                        primary_auth_ok: bool = True, must_enroll_tfa: bool = False,
-                       pending_tfa_challenge_id: int | None = None) -> str:
+                       pending_tfa_challenge_id: int | None = None,
+                       allow_locked_passkey: bool = False) -> str:
         token      = secrets.token_hex(32)
         now        = datetime.datetime.now()
         expires_at = (now + datetime.timedelta(hours=48)).isoformat(timespec='seconds')
         self._conn().execute(
             '''INSERT INTO sessions
-               (user_id,token,created_at,expires_at,must_enroll_passkey,primary_auth_ok,must_enroll_tfa,pending_tfa_challenge_id)
-               VALUES (?,?,?,?,?,?,?,?)''',
+               (user_id,token,created_at,expires_at,must_enroll_passkey,primary_auth_ok,must_enroll_tfa,pending_tfa_challenge_id,allow_locked_passkey)
+               VALUES (?,?,?,?,?,?,?,?,?)''',
             (user_id, token, now.isoformat(timespec='seconds'), expires_at,
              1 if must_enroll_passkey else 0,
              1 if primary_auth_ok else 0,
              1 if must_enroll_tfa else 0,
-             pending_tfa_challenge_id)
+             pending_tfa_challenge_id,
+             1 if allow_locked_passkey else 0)
         )
         self._conn().commit()
         return token
@@ -5180,7 +5187,7 @@ class RegistrationDB:
         """Return user row if session token is valid and not expired."""
         now = datetime.datetime.now().isoformat(timespec='seconds')
         row = self._conn().execute(
-            'SELECT user_id,created_at FROM sessions WHERE token=? AND expires_at>?',
+            'SELECT user_id,created_at,allow_locked_passkey FROM sessions WHERE token=? AND expires_at>?',
             (token, now)
         ).fetchone()
         if row is None:
@@ -5189,9 +5196,14 @@ class RegistrationDB:
         if user is None:
             return None
         # Disabled/locked users must not keep using existing sessions.
-        if user['is_disabled'] or user['is_locked']:
+        if user['is_disabled']:
             self.delete_session(token)
             return None
+        if user['is_locked']:
+            allow_locked = int(row['allow_locked_passkey'] or 0) == 1
+            if (not allow_locked) or (not _webauthn_allow_locked_accounts()):
+                self.delete_session(token)
+                return None
         # Sessions created before TFA enrollment should not remain valid once
         # TFA is required+configured (prevents stale pre-MFA sessions).
         if not _auth_break_glass_active():
@@ -7632,6 +7644,13 @@ def _tfa_login_enabled() -> bool:
     return REGISTRATION_DB.get_setting('tfa_login_enabled', '0') == '1'
 
 
+def _webauthn_allow_locked_accounts() -> bool:
+    """Whether passkey auth is allowed while password lockout is active."""
+    if not REGISTRATION_DB:
+        return False
+    return REGISTRATION_DB.get_setting('login_allow_passkey_when_locked', '1') == '1'
+
+
 def _flag_true(val) -> bool:
     """Normalize DB/UI flags stored as int/bool/string."""
     if isinstance(val, bool):
@@ -9197,7 +9216,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._send_json({'ok': False, 'error': 'Username is required.'}, 400)
         generic_fail = {'ok': False, 'error': 'Invalid credentials.'}
         user = REGISTRATION_DB.get_user(username)
-        if not user or user['is_disabled'] or user['is_locked']:
+        lock_allows_passkey = _webauthn_allow_locked_accounts()
+        if not user or user['is_disabled'] or (user['is_locked'] and not lock_allows_passkey):
             return self._send_json(generic_fail, 403)
         policy = _auth_factor_policy_for_user(user)
         user_enabled = _flag_true(user['webauthn_enabled']) if ('webauthn_enabled' in user.keys()) else False
@@ -9302,7 +9322,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         user = REGISTRATION_DB.get_user_by_id(int(ch['user_id'])) if ch['user_id'] else None
         if not user:
             return self._send_json({'ok': False, 'error': 'Account not found.'}, 404)
-        if user['is_disabled'] or user['is_locked']:
+        lock_allows_passkey = _webauthn_allow_locked_accounts()
+        if user['is_disabled'] or (user['is_locked'] and not lock_allows_passkey):
             return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 403)
         client_ip = self.client_address[0] if self.client_address else ''
         if not REGISTRATION_DB.is_ip_allowed(user['id'], client_ip):
@@ -9355,6 +9376,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                 must_enroll_passkey=bool(policy.get('must_enroll_passkey')),
                 primary_auth_ok=not needs_tfa_challenge,
                 must_enroll_tfa=bool(policy.get('must_enroll_tfa')),
+                allow_locked_passkey=bool(user['is_locked'] and _webauthn_allow_locked_accounts()),
             )
             REGISTRATION_DB.record_login_ip(user['id'], client_ip)
             REGISTRATION_DB.daily_login_check(user['id'])
@@ -10893,6 +10915,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         elif form_id == 'account_lockout':
             enabled = '1' if fields.get('login_auto_unlock_enabled') == '1' else '0'
             reveal_lockout_message = '1' if fields.get('login_reveal_lockout_message') == '1' else '0'
+            allow_passkey_when_locked = '1' if fields.get('login_allow_passkey_when_locked') == '1' else '0'
             try:
                 threshold = str(max(1, min(50, int(fields.get('login_lockout_threshold', '5')))))
             except (TypeError, ValueError):
@@ -10905,6 +10928,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.set_setting('login_auto_unlock_enabled', enabled, user['username'])
             REGISTRATION_DB.set_setting('login_auto_unlock_hours', hours, user['username'])
             REGISTRATION_DB.set_setting('login_reveal_lockout_message', reveal_lockout_message, user['username'])
+            REGISTRATION_DB.set_setting('login_allow_passkey_when_locked', allow_passkey_when_locked, user['username'])
         elif form_id == 'free_signup':
             val = '1' if fields.get('free_signup') == '1' else '0'
             REGISTRATION_DB.set_setting('free_signup', val, user['username'])
@@ -13790,7 +13814,7 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
     body = '''
   <div style="max-width:380px;margin:60px auto">
     <div class="page-title">Sign In</div>
-    <div class="page-sub">Wildkat Tracker Management</div>
+    <div class="page-sub">Wildkat Tracker Management System</div>
     <div class="card">
       <form method="POST" action="/manage/login">
         <div class="form-group">
@@ -14372,6 +14396,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     login_auto_unlock_enabled = settings.get('login_auto_unlock_enabled', '0') == '1'
     login_auto_unlock_hours = settings.get('login_auto_unlock_hours', '24')
     login_reveal_lockout_message = settings.get('login_reveal_lockout_message', '0') == '1'
+    login_allow_passkey_when_locked = settings.get('login_allow_passkey_when_locked', '1') == '1'
     robots_txt_val = settings.get('robots_txt', 'User-agent: *\nDisallow: /')
     settings_html = f'''
     <div class="two-col">
@@ -14424,9 +14449,10 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             <input id="login-reveal-lockout-message" type="checkbox" name="login_reveal_lockout_message" value="1" {'checked' if login_reveal_lockout_message else ''}>
             <span>Show lockout-specific message on login page (weaker security posture)</span>
           </label>
-          <div style="font-size:0.8rem;color:var(--muted);margin-bottom:10px">
-            Disabled (recommended): locked users receive the same generic sign-in error as other failures.
-          </div>
+          <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;margin-bottom:12px">
+            <input type="checkbox" name="login_allow_passkey_when_locked" value="1" {'checked' if login_allow_passkey_when_locked else ''}>
+            <span>Allow passkey sign-in for password-locked accounts (recommended)</span>
+          </label>
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
         <script>
