@@ -1375,6 +1375,7 @@ class RegistrationDB:
                 is_admin        INTEGER NOT NULL DEFAULT 0,
                 is_standard     INTEGER NOT NULL DEFAULT 0,
                 is_locked       INTEGER NOT NULL DEFAULT 0,
+                locked_at       TEXT,
                 is_disabled     INTEGER NOT NULL DEFAULT 0,
                 failed_attempts INTEGER NOT NULL DEFAULT 0,
                 created_by      TEXT    NOT NULL DEFAULT '',
@@ -1629,6 +1630,10 @@ class RegistrationDB:
             c.execute('ALTER TABLE users ADD COLUMN comment_pts_date TEXT')
         if 'comment_pts_today' not in ucols:
             c.execute('ALTER TABLE users ADD COLUMN comment_pts_today INTEGER NOT NULL DEFAULT 0')
+        if 'locked_at' not in ucols:
+            c.execute('ALTER TABLE users ADD COLUMN locked_at TEXT')
+            # Existing locked accounts get a baseline lock timestamp from migration time.
+            c.execute("UPDATE users SET locked_at=? WHERE is_locked=1 AND (locked_at IS NULL OR locked_at='')", (self._ts(),))
         # comments_locked column (may not exist on older installs)
         tcols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
         if 'comments_locked' not in tcols:
@@ -2028,6 +2033,10 @@ class RegistrationDB:
             'pw_require_lower':  '1',
             'pw_require_digit':  '1',
             'pw_require_symbol': '1',
+            'login_lockout_threshold': '5',
+            'login_auto_unlock_enabled': '0',
+            'login_auto_unlock_hours': '24',
+            'login_reveal_lockout_message': '0',
             'open_tracker':       '0',
             'comments_enabled':   '1',
             # ── Points economy ────────────────────────────────
@@ -3667,25 +3676,72 @@ class RegistrationDB:
             return None
         if user['is_locked'] or user['is_disabled']:
             return None
+        lock_threshold = self.get_login_lockout_threshold()
         if not _verify_password(password, user['password_hash'], user['salt']):
             attempts = user['failed_attempts'] + 1
-            locked   = 1 if attempts >= 5 else 0
+            locked = 1 if attempts >= lock_threshold else 0
+            lock_ts = self._ts() if locked else None
             self._conn().execute(
-                'UPDATE users SET failed_attempts=?, is_locked=? WHERE id=?',
-                (attempts, locked, user['id'])
+                'UPDATE users SET failed_attempts=?, is_locked=?, locked_at=? WHERE id=?',
+                (attempts, locked, lock_ts, user['id'])
             )
             self._conn().commit()
             if locked:
-                self._log('system', 'lock_user', username, f'locked after {attempts} failed attempts')
+                self._log('system', 'lock_user', username, f'locked after {attempts} failed attempts (threshold={lock_threshold})')
             return None
         # Success -- reset failed attempts, record login
         ts = self._ts()
         self._conn().execute(
-            'UPDATE users SET failed_attempts=0, last_login=?, login_count=login_count+1 WHERE id=?',
+            'UPDATE users SET failed_attempts=0, is_locked=0, locked_at=NULL, last_login=?, login_count=login_count+1 WHERE id=?',
             (ts, user['id'])
         )
         self._conn().commit()
         return self.get_user(username)
+
+    def get_login_lockout_threshold(self) -> int:
+        try:
+            threshold = int(self.get_setting('login_lockout_threshold', '5') or '5')
+        except (TypeError, ValueError):
+            threshold = 5
+        return max(1, min(50, threshold))
+
+    def get_login_auto_unlock_config(self) -> dict:
+        enabled = self.get_setting('login_auto_unlock_enabled', '0') == '1'
+        try:
+            hours = int(self.get_setting('login_auto_unlock_hours', '24') or '24')
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(720, hours))
+        return {'enabled': enabled, 'hours': hours}
+
+    def auto_unlock_locked_users(self) -> int:
+        cfg = self.get_login_auto_unlock_config()
+        if not cfg.get('enabled'):
+            return 0
+        cutoff = (datetime.datetime.now() - datetime.timedelta(hours=cfg.get('hours', 24))).isoformat(timespec='seconds')
+        c = self._conn()
+        rows = c.execute(
+            '''SELECT id, username
+               FROM users
+               WHERE is_locked=1
+                 AND COALESCE(locked_at, '') != ''
+                 AND locked_at <= ?''',
+            (cutoff,)
+        ).fetchall()
+        if not rows:
+            return 0
+        now = self._ts()
+        ids = [r['id'] for r in rows]
+        placeholders = ','.join('?' for _ in ids)
+        c.execute(
+            f'UPDATE users SET is_locked=0, failed_attempts=0, locked_at=NULL WHERE id IN ({placeholders})',
+            ids
+        )
+        c.commit()
+        for r in rows:
+            self._log('system', 'unlock_user_auto', r['username'],
+                      f'auto-unlocked after {cfg.get("hours", 24)} hour(s); unlocked_at={now}')
+        return len(rows)
 
     def record_login_ip(self, user_id: int, ip: str):
         ts = self._ts()
@@ -3842,7 +3898,7 @@ class RegistrationDB:
         ph, salt = _hash_password(new_password)
         c = self._conn()
         c.execute(
-            'UPDATE users SET password_hash=?, salt=?, failed_attempts=0, is_locked=0, '
+            'UPDATE users SET password_hash=?, salt=?, failed_attempts=0, is_locked=0, locked_at=NULL, '
             'last_password_change=? WHERE username=?',
             (ph, salt, self._ts(), username)
         )
@@ -3869,9 +3925,10 @@ class RegistrationDB:
         self._log(actor, 'set_admin', username, str(is_admin))
 
     def set_locked(self, username: str, locked: bool, actor: str):
+        locked_at = self._ts() if locked else None
         self._conn().execute(
-            'UPDATE users SET is_locked=?, failed_attempts=0 WHERE username=?',
-            (1 if locked else 0, username)
+            'UPDATE users SET is_locked=?, failed_attempts=0, locked_at=? WHERE username=?',
+            (1 if locked else 0, locked_at, username)
         )
         self._conn().commit()
         self._log(actor, 'unlock_user' if not locked else 'lock_user', username)
@@ -5045,6 +5102,7 @@ class RegistrationDB:
         c.execute(
             '''UPDATE users
                SET is_locked=0,
+                   locked_at=NULL,
                    is_disabled=0,
                    failed_attempts=0,
                    last_login=NULL,
@@ -8314,6 +8372,8 @@ class ManageHandler(BaseHTTPRequestHandler):
                     self._redirect('/manage/dashboard')
             else:
                 self._send_html(_render_login(msg, msg_type=msg_type))
+        elif path == '/manage/help/signin':
+            self._send_html(_render_signin_help_page())
         elif path == '/manage/dashboard':
             self._get_dashboard()
         elif path == '/manage/admin':
@@ -8999,6 +9059,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         fields, _ = _parse_multipart(self.headers, body)
         username = fields.get('username', '').strip()
         password = fields.get('password', '')
+        invalid_login_msg = 'Invalid credentials.'
+        reveal_lockout_msg = REGISTRATION_DB.get_setting('login_reveal_lockout_message', '0') == '1'
+        locked_login_msg = (
+            '⚠️ This account is temporarily locked due to failed sign-in attempts. '
+            'Please try again later or contact an administrator.'
+            if reveal_lockout_msg else invalid_login_msg
+        )
         client_ip = self.client_address[0]
         if not _auth_rate_limit_allow('login', client_ip):
             log.warning('LOGIN rate_limited ip=%s user=%r', client_ip, username)
@@ -9006,6 +9073,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             return
         log.debug('LOGIN attempt user=%r ip=%s', username, client_ip)
         user_probe = REGISTRATION_DB.get_user(username) if username else None
+        if user_probe and user_probe['is_locked'] and not user_probe['is_disabled']:
+            # Only reveal lockout state when the submitted password is valid.
+            # This avoids turning lockout messaging into broad username enumeration.
+            if _verify_password(password, user_probe['password_hash'], user_probe['salt']):
+                log.info('LOGIN blocked_locked user=%r ip=%s', username, client_ip)
+                REGISTRATION_DB._log(username, 'login_locked', client_ip)
+                self._send_html(_render_login(locked_login_msg))
+                return
         if user_probe and not user_probe['is_disabled'] and not user_probe['is_locked']:
             policy = _auth_factor_policy_for_user(user_probe)
             if policy.get('password_blocked'):
@@ -9019,12 +9094,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             log.debug('LOGIN failed user=%r', username)
             REGISTRATION_DB._log(username or '(unknown)', 'login_failed',
                                  client_ip)
-            self._send_html(_render_login('Invalid credentials.'))
+            self._send_html(_render_login(invalid_login_msg))
             return
         if not REGISTRATION_DB.is_ip_allowed(user['id'], client_ip):
             log.warning('LOGIN blocked by IP allowlist user=%r ip=%s', username, client_ip)
             REGISTRATION_DB._log(username, 'login_ip_blocked', client_ip)
-            self._send_html(_render_login('Invalid credentials.'))
+            self._send_html(_render_login(invalid_login_msg))
             return
         policy = _auth_factor_policy_for_user(user)
         needs_tfa_challenge = bool(policy.get('tfa_challenge_required'))
@@ -10803,6 +10878,21 @@ class ManageHandler(BaseHTTPRequestHandler):
                 else:
                     val = '1' if fields.get(key) == '1' else '0'
                 REGISTRATION_DB.set_setting(key, val, user['username'])
+        elif form_id == 'account_lockout':
+            enabled = '1' if fields.get('login_auto_unlock_enabled') == '1' else '0'
+            reveal_lockout_message = '1' if fields.get('login_reveal_lockout_message') == '1' else '0'
+            try:
+                threshold = str(max(1, min(50, int(fields.get('login_lockout_threshold', '5')))))
+            except (TypeError, ValueError):
+                threshold = '5'
+            try:
+                hours = str(max(1, min(720, int(fields.get('login_auto_unlock_hours', '24')))))
+            except (TypeError, ValueError):
+                hours = '24'
+            REGISTRATION_DB.set_setting('login_lockout_threshold', threshold, user['username'])
+            REGISTRATION_DB.set_setting('login_auto_unlock_enabled', enabled, user['username'])
+            REGISTRATION_DB.set_setting('login_auto_unlock_hours', hours, user['username'])
+            REGISTRATION_DB.set_setting('login_reveal_lockout_message', reveal_lockout_message, user['username'])
         elif form_id == 'free_signup':
             val = '1' if fields.get('free_signup') == '1' else '0'
             REGISTRATION_DB.set_setting('free_signup', val, user['username'])
@@ -11153,7 +11243,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             'admin_grant_settings', 'dm_settings',
         }
         settings_forms = {
-            'complexity', 'free_signup', 'open_tracker', 'comments_enabled',
+            'complexity', 'account_lockout', 'free_signup', 'open_tracker', 'comments_enabled',
             'robots_txt', 'torrents_per_page', 'upload_limits', 'stats_persistence',
             'gravatar_settings', 'webauthn_settings', 'tfa_settings',
         }
@@ -13694,8 +13784,39 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
       })();
       </script>
     </div>
+    <div style="margin-top:10px;text-align:center">
+      <a href="/manage/help/signin" style="color:var(--muted);font-size:0.84rem;text-decoration:none">Trouble signing in?</a>
+    </div>
   </div>'''
     return _manage_page('Login', body, msg=msg, msg_type=msg_type)
+
+
+def _render_signin_help_page() -> str:
+    body = (
+        '<div style="max-width:700px;margin:44px auto">'
+        '<div class="page-title">Sign-in Help</div>'
+        '<div class="page-sub">Authentication troubleshooting</div>'
+        '<div class="card">'
+        '<p style="color:var(--muted);font-size:0.92rem;line-height:1.6">'
+        'At Wildkat we take pride in our security posture. If you are experiencing sign-in issues, '
+        'you may be entering the wrong password or your account may be temporarily locked due to repeated '
+        'failed attempts.'
+        '</p>'
+        '<p style="color:var(--muted);font-size:0.92rem;line-height:1.6">'
+        'For security reasons, the sign-in page uses generic failure messages and may not explain the exact cause.'
+        ' If you believe your password is correct and access still fails, try again later.'
+        '</p>'
+        '<p style="color:var(--muted);font-size:0.92rem;line-height:1.6;margin-bottom:0">'
+        'For the best experience and stronger account security, enable passkey and/or two-factor authentication (TFA) '
+        'from your profile after you sign in.'
+        '</p>'
+        '<div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">'
+        '<a href="/manage" class="btn btn-primary">Back to Sign In</a>'
+        '</div>'
+        '</div>'
+        '</div>'
+    )
+    return _manage_page('Sign-in Help', body)
 
 
 def _render_passkey_enroll_page(user, msg: str = '', msg_type: str = 'error') -> str:
@@ -14215,6 +14336,10 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     upload_max_file_mb = settings.get('upload_max_file_mb', '10')
     stats_persist_enabled = settings.get('stats_persist_enabled', '0') == '1'
     stats_persist_interval = settings.get('stats_persist_interval_sec', '300')
+    login_lockout_threshold = settings.get('login_lockout_threshold', '5')
+    login_auto_unlock_enabled = settings.get('login_auto_unlock_enabled', '0') == '1'
+    login_auto_unlock_hours = settings.get('login_auto_unlock_hours', '24')
+    login_reveal_lockout_message = settings.get('login_reveal_lockout_message', '0') == '1'
     robots_txt_val = settings.get('robots_txt', 'User-agent: *\nDisallow: /')
     settings_html = f'''
     <div class="two-col">
@@ -14243,6 +14368,48 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           </div>
           <button type="submit" class="btn btn-primary">Save</button>
         </form>
+      </div>
+      <div class="card">
+        <div class="card-title">Account Lockout</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Controls failed sign-in lockout threshold and optional automatic unlock timing.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="account_lockout">
+          <div class="form-group">
+            <label>Failed attempts before lock</label>
+            <input type="number" name="login_lockout_threshold" value="{login_lockout_threshold}"
+                   min="1" max="50" style="width:120px">
+          </div>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+            <input type="checkbox" name="login_auto_unlock_enabled" value="1" {'checked' if login_auto_unlock_enabled else ''}> Enable automatic unlock
+          </label>
+          <div class="form-group">
+            <label>Auto-unlock after (hours)</label>
+            <input type="number" name="login_auto_unlock_hours" value="{login_auto_unlock_hours}" min="1" max="720" style="width:120px">
+          </div>
+          <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;margin-bottom:12px">
+            <input id="login-reveal-lockout-message" type="checkbox" name="login_reveal_lockout_message" value="1" {'checked' if login_reveal_lockout_message else ''}>
+            <span>Show lockout-specific message on login page (weaker security posture)</span>
+          </label>
+          <div style="font-size:0.8rem;color:var(--muted);margin-bottom:10px">
+            Disabled (recommended): locked users receive the same generic sign-in error as other failures.
+          </div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+        <script>
+          (function(){{
+            var cb = document.getElementById('login-reveal-lockout-message');
+            if(!cb) return;
+            cb.addEventListener('change', async function(){{
+              if(!cb.checked) return;
+              var ok = await confirmAction(
+                'Enabling lockout-specific login messages weakens security posture by revealing account lock state. Continue?'
+              );
+              if(!ok) cb.checked = false;
+            }});
+          }})();
+        </script>
       </div>
       <div class="card">
         <div class="card-title">Open Tracker</div>
@@ -16566,6 +16733,23 @@ def _render_public_profile(viewer, target_user, torrents: list,
     return _manage_page(uname_h, body, user=viewer, msg=msg, msg_type=msg_type)
 
 
+def _unlock_at_value(target_user) -> str:
+    if not target_user['is_locked']:
+        return ''
+    locked_at = (target_user['locked_at'] or '').strip() if 'locked_at' in target_user.keys() else ''
+    if not locked_at:
+        return 'Manual unlock required'
+    cfg = REGISTRATION_DB.get_login_auto_unlock_config() if REGISTRATION_DB else {'enabled': False, 'hours': 24}
+    if not cfg.get('enabled'):
+        return 'Manual unlock required'
+    try:
+        locked_dt = datetime.datetime.fromisoformat(locked_at)
+        unlock_dt = locked_dt + datetime.timedelta(hours=cfg.get('hours', 24))
+        return unlock_dt.strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        return 'Manual unlock required'
+
+
 def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                         allowlist=None, is_own_profile=False,
                         page: int = 1, total_pages: int = 1, total: int = 0, base_url: str = '',
@@ -16623,6 +16807,8 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + row('Login Count',    str(lc))
         + row('Password Changed', lpc[:16] if lpc else 'Never recorded')
         + row('Failed Attempts', str(target_user['failed_attempts']))
+        + row('Locked At',      (target_user['locked_at'] or '--')[:16] if ('locked_at' in target_user.keys()) else '--')
+        + (row('Unlocks At', _unlock_at_value(target_user)) if target_user['is_locked'] else '')
         + row('Points',         f'<span style="color:{pts_color};font-weight:bold">{pts_val}</span>'
                                 + (f' <span style="color:var(--muted);font-size:0.8rem">(🔥 {streak_val}-day streak)</span>'
                                    if streak_val > 1 else ''))
@@ -18126,6 +18312,12 @@ def main():
                     REGISTRATION_DB.purge_expired_sessions()
                 except Exception as _e:
                     log.warning('purge_expired_sessions failed (non-fatal): %s', _e)
+                try:
+                    unlocked = REGISTRATION_DB.auto_unlock_locked_users()
+                    if unlocked:
+                        log.info('login lockout reconcile: auto-unlocked %d account(s)', unlocked)
+                except Exception as _e:
+                    log.warning('auto_unlock_locked_users failed (non-fatal): %s', _e)
                 try:
                     REGISTRATION_DB.expire_bounties()
                 except Exception as _e:
