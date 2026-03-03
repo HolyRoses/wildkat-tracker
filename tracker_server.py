@@ -1862,14 +1862,6 @@ class RegistrationDB:
                 UNIQUE(bounty_id, username),
                 FOREIGN KEY (bounty_id) REFERENCES bounties(id) ON DELETE CASCADE
             );
-            CREATE TABLE IF NOT EXISTS bounty_comments (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                bounty_id  INTEGER NOT NULL,
-                username   TEXT    NOT NULL,
-                body       TEXT    NOT NULL,
-                created_at TEXT    NOT NULL,
-                FOREIGN KEY (bounty_id) REFERENCES bounties(id) ON DELETE CASCADE
-            );
             CREATE TABLE IF NOT EXISTS direct_messages (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 sender         TEXT    NOT NULL,
@@ -4737,6 +4729,8 @@ class RegistrationDB:
         if claimer:
             self._notify_bounty(claimer, 'bounty_fulfilled', b['created_by'], bounty_id,
                                 b['description'], claimer_pay, ih)
+            self._notify_bounty(claimer, 'bounty_claimer_payout', b['created_by'], bounty_id,
+                                b['description'], claimer_pay, ih)
             self.notify_followers_bounty_fulfilled(claimer, bounty_id, b['description'])
         for uid in promoted_user_ids:
             self.check_auto_promote(uid)
@@ -4797,21 +4791,6 @@ class RegistrationDB:
             'SELECT * FROM bounty_votes WHERE bounty_id=? ORDER BY voted_at',
             (bounty_id,)
         ).fetchall()
-
-    def get_bounty_comments(self, bounty_id: int) -> list:
-        return self._conn().execute(
-            'SELECT * FROM bounty_comments WHERE bounty_id=? ORDER BY created_at',
-            (bounty_id,)
-        ).fetchall()
-
-    def add_bounty_comment(self, bounty_id: int, username: str, body: str) -> int:
-        c = self._conn()
-        cur = c.execute(
-            'INSERT INTO bounty_comments (bounty_id,username,body,created_at) VALUES (?,?,?,?)',
-            (bounty_id, username, body, self._ts())
-        )
-        c.commit()
-        return cur.lastrowid
 
     def get_leaderboard(self, top_n: int = 10) -> dict:
         """Return ranked lists for each leaderboard category."""
@@ -5149,7 +5128,6 @@ class RegistrationDB:
         c.execute('DELETE FROM bounties')
         c.execute('DELETE FROM bounty_contributions')
         c.execute('DELETE FROM bounty_votes')
-        c.execute('DELETE FROM bounty_comments')
         c.execute('DELETE FROM direct_messages')
         c.execute('DELETE FROM dm_blocklist')
         c.execute('DELETE FROM ip_allowlist')
@@ -8807,8 +8785,6 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_bounty_vote()
         elif path == '/manage/bounty/remove':
             self._post_bounty_remove()
-        elif path == '/manage/bounty/comment':
-            self._post_bounty_comment()
         elif path == '/manage/points/transfer':
             self._post_points_transfer()
         elif path == '/manage/follow':
@@ -9903,15 +9879,25 @@ class ManageHandler(BaseHTTPRequestHandler):
         msg_type = qs.get('msg_type', ['error'])[0]
         contributions = REGISTRATION_DB.get_bounty_contributions(bounty_id)
         votes         = REGISTRATION_DB.get_bounty_votes(bounty_id)
-        comments      = REGISTRATION_DB.get_bounty_comments(bounty_id)
         torrent = None
         if bounty['claimed_infohash']:
             torrent = REGISTRATION_DB.get_torrent(bounty['claimed_infohash'])
         threshold = int(REGISTRATION_DB.get_setting('bounty_confirm_votes', '3'))
         self._send_html(_render_bounty_detail(user, bounty, contributions, votes,
-                                              comments, torrent, threshold,
+                                              torrent, threshold,
                                               msg=msg, msg_type=msg_type))
 
+
+    @staticmethod
+    def _comment_route_meta(thread_key: str) -> tuple[str, str]:
+        """Return (base_url, anchor_prefix) for comment threads."""
+        key = (thread_key or '').strip().upper()
+        if key.startswith('BOUNTY:'):
+            bid = key.split(':', 1)[1].strip()
+            if bid.isdigit():
+                return f'/manage/bounty/{bid}', 'bcmt'
+            return '/manage/bounty', 'bcmt'
+        return f'/manage/torrent/{key.lower()}', 'comment'
 
     def _post_comment(self):
         user = self._get_session_user()
@@ -9923,19 +9909,35 @@ class ManageHandler(BaseHTTPRequestHandler):
         text   = fields.get('body', '').strip()[:2000]
         parent = fields.get('parent_id', '').strip()
         parent_id = int(parent) if parent.isdigit() else None
+        base_url, anchor_prefix = self._comment_route_meta(ih)
         if not ih or not text:
-            return self._redirect(f'/manage/torrent/{ih.lower()}')
-        t = REGISTRATION_DB.get_torrent(ih)
-        if not t:
-            return self._redirect('/manage/dashboard')
+            return self._redirect(base_url)
+        is_bounty_thread = ih.startswith('BOUNTY:')
+        bounty = None
+        t = None
+        if is_bounty_thread:
+            if _user_role(user) == 'basic':
+                return self._redirect('/manage/dashboard')
+            bid_raw = ih.split(':', 1)[1].strip()
+            if not bid_raw.isdigit():
+                return self._redirect('/manage/bounty')
+            bounty = REGISTRATION_DB.get_bounty(int(bid_raw))
+            if not bounty:
+                return self._redirect('/manage/bounty?msg=Bounty+not+found.&msg_type=error')
+            if bounty['status'] in ('expired', 'removed'):
+                return self._redirect(f'/manage/bounty/{int(bid_raw)}?msg=Bounty+is+closed+for+comments.&msg_type=error')
+        else:
+            t = REGISTRATION_DB.get_torrent(ih)
+            if not t:
+                return self._redirect('/manage/dashboard')
         # Block if comments system is disabled globally
         if REGISTRATION_DB.get_setting('comments_enabled', '1') != '1':
-            return self._redirect(f'/manage/torrent/{ih.lower()}')
+            return self._redirect(base_url)
         # Block posting if comments are locked on this torrent
-        if t['comments_locked']:
-            return self._redirect(f'/manage/torrent/{ih.lower()}?msg=locked')
+        if (not is_bounty_thread) and t['comments_locked']:
+            return self._redirect(f'{base_url}?msg=locked')
         uname = user['username']
-        tname = t['name']
+        tname = bounty['description'] if is_bounty_thread else t['name']
         # Validate @mentions — warn on unknowns but still post
         mentioned = set(_MENTION_RE.findall(text))
         unknown = [m for m in mentioned
@@ -9948,11 +9950,11 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.award_comment_points(user['id'], cid)
             _deliver_notifications(cid, ih, tname, uname, text, parent_id)
             return self._redirect(
-                f'/manage/torrent/{ih.lower()}?warn={warn_param}#comment-{cid}')
+                f'{base_url}?warn={warn_param}#{anchor_prefix}-{cid}')
         cid = REGISTRATION_DB.add_comment(ih, user['id'], uname, text, parent_id)
         REGISTRATION_DB.award_comment_points(user['id'], cid)
         _deliver_notifications(cid, ih, tname, uname, text, parent_id)
-        self._redirect(f'/manage/torrent/{ih.lower()}#comment-{cid}')
+        self._redirect(f'{base_url}#{anchor_prefix}-{cid}')
 
     def _post_comment_edit(self):
         user = self._get_session_user()
@@ -9963,8 +9965,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         cid    = fields.get('comment_id', '').strip()
         ih     = fields.get('info_hash', '').strip().upper()
         text   = fields.get('body', '').strip()[:2000]
+        base_url, anchor_prefix = self._comment_route_meta(ih)
         if not cid.isdigit() or not text:
-            return self._redirect(f'/manage/torrent/{ih.lower()}')
+            return self._redirect(base_url)
         role = _user_role(user)
         REGISTRATION_DB.edit_comment(int(cid), user['id'], text, role in ('super','admin'))
         # Validate @mentions — warn on unknowns the same as post
@@ -9976,8 +9979,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             unknown_list = ', '.join(f'@{u}' for u in sorted(unknown))
             warn_param = urllib.parse.quote(unknown_list)
             return self._redirect(
-                f'/manage/torrent/{ih.lower()}?warn={warn_param}#comment-{cid}')
-        self._redirect(f'/manage/torrent/{ih.lower()}#comment-{cid}')
+                f'{base_url}?warn={warn_param}#{anchor_prefix}-{cid}')
+        self._redirect(f'{base_url}#{anchor_prefix}-{cid}')
 
     def _post_comment_delete(self):
         user = self._get_session_user()
@@ -9987,11 +9990,12 @@ class ManageHandler(BaseHTTPRequestHandler):
         fields, _ = _parse_multipart(self.headers, body)
         cid    = fields.get('comment_id', '').strip()
         ih     = fields.get('info_hash', '').strip().upper()
+        base_url, _ = self._comment_route_meta(ih)
         if not cid.isdigit():
-            return self._redirect(f'/manage/torrent/{ih.lower()}')
+            return self._redirect(base_url)
         role = _user_role(user)
         REGISTRATION_DB.delete_comment(int(cid), user['id'], role in ('super','admin'))
-        self._redirect(f'/manage/torrent/{ih.lower()}')
+        self._redirect(base_url)
 
     def _post_notification_read(self, nid_str: str):
         user = self._get_session_user()
@@ -11576,30 +11580,6 @@ class ManageHandler(BaseHTTPRequestHandler):
         q = urllib.parse.quote(msg)
         self._redirect(f'/manage/bounty/{bounty_id}?msg={q}&msg_type={"success" if ok else "error"}')
 
-    def _post_bounty_comment(self):
-        user = self._get_session_user()
-        if not user:
-            return self._redirect('/manage')
-        if _user_role(user) == 'basic':
-            return self._redirect('/manage/dashboard')
-        body = self._read_body()
-        fields, _ = _parse_multipart(self.headers, body)
-        try:
-            bounty_id = int(fields.get('bounty_id', '0'))
-        except ValueError:
-            return self._redirect('/manage/bounty')
-        bounty = REGISTRATION_DB.get_bounty(bounty_id)
-        if not bounty or bounty['status'] in ('expired', 'removed'):
-            return self._redirect(f'/manage/bounty/{bounty_id}?msg=Bounty+is+closed+for+comments.&msg_type=error')
-        text = fields.get('body', '').strip()[:2000]
-        if text:
-            cid = REGISTRATION_DB.add_bounty_comment(bounty_id, user['username'], text)
-            REGISTRATION_DB.award_comment_points(user['id'], cid)
-            _deliver_bounty_comment_notifications(
-                cid, bounty_id, bounty['description'], user['username'], text
-            )
-        self._redirect(f'/manage/bounty/{bounty_id}#bc-{bounty_id}')
-
     def _post_points_transfer(self):
         user = self._get_session_user()
         if not user:
@@ -12030,10 +12010,12 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ntype = n['type']
                 icons = {
                     'bounty_new':             ('📣', 'has posted a bounty for'),
-                    'bounty_mention':         ('@',  'mentioned you in bounty'),
+                    'mention':                ('@',  'mentioned you in bounty'),
+                    'reply':                  ('💬', 'replied to your comment on bounty'),
                     'bounty_claimed':         ('🎯', 'claimed your bounty'),
                     'bounty_rejected':        ('✗',  'rejected your claim on'),
                     'bounty_fulfilled':       ('✅', 'has accepted your claim for bounty'),
+                    'bounty_claimer_payout':  ('💰', 'you received a bounty payout for'),
                     'bounty_contribution':    ('➕', 'added points to your bounty'),
                     'bounty_expired':         ('⏰', 'bounty expired:'),
                     'bounty_uploader_payout': ('💰', 'fulfilled a bounty using your upload:'),
@@ -12042,11 +12024,14 @@ class ManageHandler(BaseHTTPRequestHandler):
                     'followed_bounty_fulfilled': ('✅', 'fulfilled a bounty:'),
                 }
                 icon, label = icons.get(ntype, ('🔔', 'bounty update on'))
+                if ntype == 'bounty_claimer_payout':
+                    pts = max(0, int(n['comment_id'] or 0))
+                    label = f'paid you {pts} pts for bounty'
                 if ntype in ('bounty_removed', 'bounty_refund_admin'):
                     anchor = ''
                     url = '/manage/bounty'
                 else:
-                    anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
+                    anchor = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply') and n['comment_id']) else ''
                     url = f'/manage/bounty/{bid}{anchor}'
             elif is_topup:
                 oid = str(n['info_hash']).split(':', 1)[1]
@@ -12970,8 +12955,18 @@ _MANAGE_CSS = '''
   .page-title { font-family: var(--display); font-size: 1.1rem; color: var(--text);
                 letter-spacing: 0.08em; margin-bottom: 4px; }
   .page-sub { font-size: 0.85rem; color: var(--muted); margin-bottom: 28px; }
+  .bounty-hero { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; gap:12px; }
+  .bounty-hero-left { min-width:0; }
+  .bounty-hero-title { font-size:1.1rem; margin-bottom:8px; word-break:break-word; overflow-wrap:anywhere; }
+  .bounty-hero-right { text-align:right; white-space:nowrap; }
+  .bounty-hero-policy { color:var(--muted); font-size:0.78rem; margin-top:2px; white-space:normal; max-width:320px; text-align:right; }
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
   @media (max-width: 640px) { .two-col { grid-template-columns: 1fr; } }
+  @media (max-width: 900px) {
+    .bounty-hero { grid-template-columns: 1fr; }
+    .bounty-hero-right { text-align:left; white-space:normal; justify-self:start; }
+    .bounty-hero-policy { text-align:left; max-width:none; }
+  }
   @media (max-width: 900px) { .lb-grid { grid-template-columns: 1fr 1fr !important; } }
   @media (max-width: 560px) { .lb-grid { grid-template-columns: 1fr !important; } }
   /* ── Comments ── */
@@ -13295,8 +13290,7 @@ function _submitFormWithCsrf(form){
 }
 function _bindEnterToSendComments(){
   var selectors = [
-    'form[action="/manage/comment/post"] textarea[name="body"]',
-    'form[action="/manage/bounty/comment"] textarea[name="body"]'
+    'form[action="/manage/comment/post"] textarea[name="body"]'
   ];
   selectors.forEach(function(sel){
     document.querySelectorAll(sel).forEach(function(ta){
@@ -13597,10 +13591,12 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 ntype = n['type']
                 icon, label = {
                     'bounty_new':              ('📣', 'has posted a bounty for'),
-                    'bounty_mention':          ('@',  'mentioned you in bounty'),
+                    'mention':                 ('@',  'mentioned you in bounty'),
+                    'reply':                   ('💬', 'replied to your comment on bounty'),
                     'bounty_claimed':          ('🎯', 'claimed your bounty'),
                     'bounty_rejected':         ('✗',  'rejected your claim on'),
                     'bounty_fulfilled':        ('✅', 'has accepted your claim for bounty'),
+                    'bounty_claimer_payout':   ('💰', 'you received a bounty payout for'),
                     'bounty_contribution':     ('➕', 'added points to your bounty'),
                     'bounty_expired':          ('⏰', 'bounty expired:'),
                     'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
@@ -13608,6 +13604,9 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     'bounty_refund_admin':     ('💸', 'refunded points from removed bounty:'),
                     'followed_bounty_fulfilled': ('✅', 'fulfilled a bounty:'),
                 }.get(ntype, ('🔔', 'bounty update on'))
+                if ntype == 'bounty_claimer_payout':
+                    pts = max(0, int(n['comment_id'] or 0))
+                    label = f'paid you {pts} pts for bounty'
                 tname_h = _h(n['torrent_name'][:40] + ('…' if len(n['torrent_name']) > 40 else ''))
                 from_h  = _h(n['from_username'])
                 ts_h    = _h((n['created_at'] or '')[:16].replace('T', ' '))
@@ -13615,7 +13614,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 if ntype in ('bounty_removed', 'bounty_refund_admin'):
                     target = '/manage/bounty'
                 else:
-                    anchor  = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
+                    anchor  = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply') and n['comment_id']) else ''
                     target = f'/manage/bounty/{bid}{anchor}'
                 dropdown_items += (
                     f'<button class="notif-item" '
@@ -15953,23 +15952,6 @@ def _deliver_notifications(cid: int, ih: str, tname: str,
             REGISTRATION_DB.add_notification(
                 muser['id'], 'mention', uname, ih, tname, cid)
 
-def _deliver_bounty_comment_notifications(comment_id: int, bounty_id: int,
-                                          bounty_desc: str, uname: str, text: str):
-    """Send @mention notifications for bounty comments."""
-    if not REGISTRATION_DB:
-        return
-    mentioned = set(_MENTION_RE.findall(text))
-    poster = REGISTRATION_DB.get_user(uname)
-    poster_id = poster['id'] if poster else -1
-    for mname in mentioned:
-        if mname == uname:
-            continue
-        muser = REGISTRATION_DB.get_user(mname)
-        if muser and muser['id'] != poster_id and not muser['is_disabled']:
-            REGISTRATION_DB._notify_bounty(
-                mname, 'bounty_mention', uname, bounty_id, bounty_desc, comment_id
-            )
-
 _MENTION_RE = re.compile(r'@([a-zA-Z0-9._-]+)')
 
 def _render_comment_body(body: str) -> str:
@@ -15981,7 +15963,11 @@ def _render_comment_body(body: str) -> str:
     return _MENTION_RE.sub(_linkify, escaped)
 
 
-def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = False) -> str:
+def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = False,
+                     anchor_prefix: str = 'comment',
+                     section_id: str = 'comments-section',
+                     title: str = 'Comments',
+                     lock_subject: str = 'this item') -> str:
     if not REGISTRATION_DB:
         return ''
     all_comments = REGISTRATION_DB.get_comments(info_hash)
@@ -16096,7 +16082,7 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
 
         depth_cls = f'comment-depth-{min(depth, 3)}'
         return (
-            f'<div class="comment-node {depth_cls}" id="comment-{cid}">'
+            f'<div class="comment-node {depth_cls}" id="{anchor_prefix}-{cid}">'
             f'<div class="comment-inner">'
             f'{header}{body_html}{edit_form}{actions_html}{reply_form}'
             f'</div>'
@@ -16117,7 +16103,7 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
             '<div role="status" aria-live="polite"'
             ' style="display:flex;align-items:center;gap:10px;color:var(--muted);'
             'font-family:var(--mono);font-size:0.82rem">'
-            '&#x1F512; Comments are locked for this torrent.'
+            f'&#x1F512; Comments are locked for {_h(lock_subject)}.'
             '</div></div>'
         )
     else:
@@ -16148,9 +16134,9 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
         if count else ''
     )
     return (
-        f'<div id="comments-section">'
+        f'<div id="{_h(section_id)}">'
         f'<div class="card-title" style="margin-bottom:20px">'
-        f'Comments{count_html}{lock_badge}'
+        f'{_h(title)}{count_html}{lock_badge}'
         f'</div>'
         f'{cards_html}{add_form}'
         f'</div>'
@@ -16632,10 +16618,12 @@ def _render_notifications_page(viewer) -> str:
             ntype = n['type']
             icon, label = {
                 'bounty_new':              ('📣', 'has posted a bounty for'),
-                'bounty_mention':          ('@',  'mentioned you in bounty'),
+                'mention':                 ('@',  'mentioned you in bounty'),
+                'reply':                   ('💬', 'replied to your comment on bounty'),
                 'bounty_claimed':          ('🎯', 'claimed your bounty'),
                 'bounty_rejected':         ('✗',  'rejected your claim on'),
                 'bounty_fulfilled':        ('✅', 'has accepted your claim for bounty'),
+                'bounty_claimer_payout':   ('💰', 'you received a bounty payout for'),
                 'bounty_contribution':     ('➕', 'added points to your bounty'),
                 'bounty_expired':          ('⏰', 'bounty expired:'),
                 'bounty_uploader_payout':  ('💰', 'fulfilled a bounty using your upload:'),
@@ -16643,10 +16631,13 @@ def _render_notifications_page(viewer) -> str:
                 'bounty_refund_admin':     ('💸', 'refunded points from removed bounty:'),
                 'followed_bounty_fulfilled': ('✅', 'fulfilled a bounty:'),
             }.get(ntype, ('🔔', 'bounty update on'))
+            if ntype == 'bounty_claimer_payout':
+                pts = max(0, int(n['comment_id'] or 0))
+                label = f'paid you {pts} pts for bounty'
             if ntype in ('bounty_removed', 'bounty_refund_admin'):
                 url = '/manage/bounty'
             else:
-                anchor = f'#bcmt-{n["comment_id"]}' if (ntype == 'bounty_mention' and n['comment_id']) else ''
+                anchor = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply') and n['comment_id']) else ''
                 url = f'/manage/bounty/{bid}{anchor}'
             read_js = f"readNotif({n_id},'{url}')"
             rows += (
@@ -19053,7 +19044,7 @@ def _render_bounty_board(viewer, bounties: list, total: int, page: int, total_pa
 
 
 def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
-                           comments: list, torrent, threshold: int,
+                           torrent, threshold: int,
                            msg: str = '', msg_type: str = 'error') -> str:
     if not REGISTRATION_DB:
         return _manage_page('Bounty', '<p>Unavailable</p>', user=viewer)
@@ -19270,21 +19261,6 @@ def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
       </table></div>
     </div>'''
 
-    # Comments
-    comment_rows = ''
-    for c in comments:
-        un_h = _h(c['username'])
-        bd_h = _render_comment_body(c['body'])
-        at_h = _h((c['created_at'] or '')[:16])
-        comment_rows += f'''
-      <div id="bcmt-{c['id']}" style="padding:12px 0;border-top:1px solid var(--border)">
-        <div style="display:flex;gap:12px;align-items:baseline;margin-bottom:4px">
-          <a href="/manage/user/{un_h}" class="user-link" style="font-weight:600">{un_h}</a>
-          <span class="hash" style="font-size:0.78rem">{at_h}</span>
-        </div>
-        <div style="white-space:pre-wrap;word-break:break-word">{bd_h}</div>
-      </div>'''
-
     moderation_html = ''
     if role in ('super', 'admin') and status in ('open', 'pending'):
         moderation_html = f'''
@@ -19307,27 +19283,16 @@ def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
       </form>
     </div>'''
 
-    comment_form = ''
-    if status not in ('expired', 'removed') and role != 'basic':
-        comment_form = f'''
-      <form method="POST" action="/manage/bounty/comment" style="margin-top:12px">
-        <input type="hidden" name="bounty_id" value="{bid}">
-        <div class="form-group">
-          <textarea name="body" rows="3" maxlength="2000" required
-            placeholder="Ask for clarification, discuss details..."
-            style="width:100%;background:var(--card2);border:1px solid var(--border);
-                   border-radius:6px;color:var(--text);padding:10px;resize:vertical;
-                   font-family:inherit;font-size:0.9rem"></textarea>
-        </div>
-        <button type="submit" class="btn btn-primary">Post Comment</button>
-      </form>'''
-
-    comments_html = f'''
-    <div class="card" id="bc-{bid}">
-      <div class="card-title">Discussion ({len(comments)})</div>
-      {comment_rows or '<p style="color:var(--muted);font-size:0.88rem">No comments yet.</p>'}
-      {comment_form}
-    </div>'''
+    comments_html = _render_comments(
+        f'BOUNTY:{bid}',
+        viewer,
+        bounty['description'],
+        locked=(status in ('expired', 'removed')),
+        anchor_prefix='bcmt',
+        section_id=f'bc-{bid}',
+        title='Comments',
+        lock_subject='this bounty',
+    )
 
     # Info card
     by_h  = _h(bounty['created_by'])
@@ -19340,9 +19305,9 @@ def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
 
     info_card = f'''
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
-        <div>
-          <div class="card-title" style="font-size:1.1rem;margin-bottom:8px">
+      <div class="bounty-hero">
+        <div class="bounty-hero-left">
+          <div class="card-title bounty-hero-title">
             {_h(bounty["description"])}
           </div>
           <div style="color:var(--muted);font-size:0.85rem;display:flex;gap:16px;flex-wrap:wrap">
@@ -19351,12 +19316,12 @@ def _render_bounty_detail(viewer, bounty, contributions: list, votes: list,
             <span>Expires {exp_h}</span>
           </div>
         </div>
-        <div style="text-align:right">
+        <div class="bounty-hero-right">
           {_bounty_status_badge(status)}
           <div style="color:var(--accent);font-size:1.4rem;font-weight:700;margin-top:4px">
             {escrow} pts
           </div>
-          <div style="color:var(--muted);font-size:0.78rem;margin-top:2px">
+          <div class="bounty-hero-policy">
             Claimer: {payout_pct}% · Uploader: {upload_pct}% · Requestor refund: {refund_pct}% of initial
           </div>
         </div>

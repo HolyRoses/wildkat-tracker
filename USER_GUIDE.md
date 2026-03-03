@@ -204,10 +204,11 @@ In addition to comment notifications, the bell delivers bounty-related events:
 | Icon | Event |
 |------|-------|
 | 📣 | Someone posted a new bounty |
-| @ | Someone @mentioned you in bounty discussion |
+| @ | Someone @mentioned you in a bounty comment |
 | 🎯 | Someone claimed your bounty |
 | ✗ | Your claim was rejected |
 | ✅ | Your bounty claim was accepted |
+| 💰 | You received a bounty payout as the claimer |
 | ➕ | Someone added points to your bounty |
 | ⏰ | Your bounty expired without being fulfilled |
 | 💰 | Someone fulfilled a bounty using your upload |
@@ -451,7 +452,7 @@ Streaks reset if you miss a day. The current streak is shown on your profile and
 | Activity | Cost |
 |----------|------|
 | Purchasing an invite code | 1,000 pts (default, configurable by admin) |
-| Creating a bounty | Variable — you set the initial escrow amount |
+| Creating a bounty | Minimum bounty creation cost (default: 50 pts, configurable) |
 | Contributing to a bounty | Variable — you choose how much to add |
 | Sending a direct message | Configurable per-recipient cost (default 5 pts). Exempt for Admin/Super |
 | Sending points to another user | Amount + transfer fee % |
@@ -473,7 +474,7 @@ The Bounty Board lets users post point-backed requests for specific content. Nav
 
 ### Creating a Bounty
 
-Click **+ Post Bounty**. Fill in a description of what you are looking for and set an initial escrow amount (the points you are committing from your balance). The points are held in escrow immediately — they do not leave until the bounty is fulfilled, expired, or refunded.
+Click **+ Post Bounty** and enter a description of what you are looking for. A minimum creation cost (default: 50 points, configurable) is charged immediately and added to the bounty escrow.
 
 ### Contributing to a Bounty
 
@@ -491,7 +492,6 @@ The requestor receives a notification and can **Confirm** or **Reject** the clai
 
 - **Confirm** — triggers the payout (see below) and marks the bounty Fulfilled
 - **Reject** — bounty returns to Open and can be claimed again
-- **No action** — after the pending window expires (configurable, default 48 hours), the bounty automatically reopens
 - **Community vote** — if enough Standard+ users vote the claim legitimate, it auto-confirms without the requestor
 
 ### Payout Breakdown
@@ -503,7 +503,6 @@ When a bounty is fulfilled, the escrow is distributed as follows (all percentage
 | Claimer | Primary payout — majority of escrow |
 | Uploader | Bonus if the claimer used someone else's registered torrent |
 | Requestor refund | Partial return of the requestor's initial escrow cost |
-| House cut | Percentage destroyed — deflationary |
 
 The fulfilled bounty detail page shows the full breakdown with exact amounts and percentages.
 
@@ -514,7 +513,7 @@ The fulfilled bounty detail page shows the full breakdown with exact amounts and
 | Open | Accepting claims |
 | Pending | Claim submitted, awaiting confirmation |
 | Fulfilled | Confirmed and paid out |
-| Expired | Pending window passed with no confirmation; bounty reopened |
+| Expired | Bounty reached its expiry date without being fulfilled |
 | Removed | Removed by Admin/Super moderation action |
 
 ### Staff Moderation
@@ -928,12 +927,10 @@ Controls how points are awarded:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Minimum bounty escrow | 50 pts | Minimum initial escrow to create a bounty |
+| Minimum bounty creation cost | 50 pts | Minimum points charged when posting a new bounty |
 | Claimer payout % | 70% | Percentage of escrow paid to the claimer |
 | Uploader bonus % | 15% | Additional bonus if claimer ≠ uploader |
-| House cut % | 5% | Percentage destroyed |
 | Requestor refund % | 25% | Partial refund of initial cost to requestor |
-| Pending confirmation window | 48 hrs | Hours before an unconfirmed claim auto-expires |
 | Auto-confirm vote threshold | 3 | Community votes needed to auto-confirm a claim |
 
 ### Leaderboard Settings
