@@ -4289,6 +4289,14 @@ class RegistrationDB:
         self.award_points(recipient['id'], received,
                           f'transfer from @{from_username} ({fee} pts fee deducted)',
                           'transfer', from_username)
+        self.add_notification(
+            recipient['id'],
+            'points_received',
+            from_username,
+            'POINTS:TRANSFER',
+            f'{received} pts',
+            0
+        )
         self._log(from_username, 'transfer_points', to_username,
                   f'sent={amount} fee={fee} received={received}')
         self.check_auto_promote(recipient['id'])
@@ -11873,6 +11881,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
             is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
             is_follow = str(n['info_hash']).upper().startswith('FOLLOW:')
+            is_points = str(n['info_hash']).upper().startswith('POINTS:')
             if is_bounty:
                 bid   = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
@@ -11920,6 +11929,10 @@ class ManageHandler(BaseHTTPRequestHandler):
                     fu = REGISTRATION_DB.get_user_by_id(follow_uid)
                     if fu:
                         url = f'/manage/user/{urllib.parse.quote(fu["username"])}'
+            elif is_points:
+                icon = '💵'
+                label = 'sent you points'
+                url = '/manage/profile'
             else:
                 if n['type'] == 'followed_upload':
                     icon = '📦'
@@ -13432,6 +13445,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
             is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
             is_follow = str(n['info_hash']).upper().startswith('FOLLOW:')
+            is_points = str(n['info_hash']).upper().startswith('POINTS:')
             if is_bounty:
                 bid = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
@@ -13497,6 +13511,20 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     f' aria-label="follow notification from {from_h}">'
                     f'<div class="notif-item-type">👥 <strong>{from_h}</strong> is now following you!</div>'
                     f'<div class="notif-item-text"><em>{_h(n["torrent_name"] or "")}</em></div>'
+                    f'<div class="notif-item-ts">{ts_h}</div>'
+                    f'</button>'
+                )
+            elif is_points:
+                from_h = _h(n['from_username'])
+                ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
+                n_id = n['id']
+                amount_h = _h(n['torrent_name'] or '')
+                dropdown_items += (
+                    f'<button class="notif-item" '
+                    f'onclick="readNotif({n_id},\'/manage/profile\')"'
+                    f' aria-label="points transfer from {from_h}">'
+                    f'<div class="notif-item-type">💵 <strong>{from_h}</strong> sent you points</div>'
+                    f'<div class="notif-item-text"><em>{amount_h}</em></div>'
                     f'<div class="notif-item-ts">{ts_h}</div>'
                     f'</button>'
                 )
@@ -16238,6 +16266,7 @@ def _render_notifications_page(viewer) -> str:
         is_bounty = str(n['info_hash']).upper().startswith('BOUNTY:')
         is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
         is_follow = str(n['info_hash']).upper().startswith('FOLLOW:')
+        is_points = str(n['info_hash']).upper().startswith('POINTS:')
         ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
         from_h = _h(n['from_username'])
         tname_h = _h(n['torrent_name'])
@@ -16317,6 +16346,21 @@ def _render_notifications_page(viewer) -> str:
                 f'<div style="font-size:0.9rem"><span style="margin-right:6px">👥</span>'
                 f'<a href="{target_url}" class="user-link">{from_h}</a>'
                 f' is now following you!</div>'
+                f'<div class="notif-page-meta">{ts_h}</div>'
+                f'</div>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
+                f'</div>'
+            )
+        elif is_points:
+            url = '/manage/profile'
+            read_js = f"readNotif({n_id},'{url}')"
+            rows += (
+                f'<div class="notif-page-item{unread_cls}">'
+                f'<div>'
+                f'<div style="font-size:0.9rem"><span style="margin-right:6px">💵</span>'
+                f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                f' sent you points: '
+                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                 f'<div class="notif-page-meta">{ts_h}</div>'
                 f'</div>'
                 f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
