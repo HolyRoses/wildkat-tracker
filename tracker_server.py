@@ -12399,7 +12399,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                     url = f'/manage/torrent/{n["info_hash"].lower()}'
                 elif n['type'] in ('comment_vote_up', 'comment_vote_down'):
                     icon = '👍' if n['type'] == 'comment_vote_up' else '👎'
-                    label = 'voted on your comment'
+                    label = 'upvoted your comment' if n['type'] == 'comment_vote_up' else 'downvoted your comment'
                     anchor = f'#comment-{n["comment_id"]}' if int(n['comment_id'] or 0) > 0 else ''
                     url = f'/manage/torrent/{n["info_hash"].lower()}{anchor}'
                 elif n['type'] == 'followed_upload':
@@ -13353,12 +13353,14 @@ _MANAGE_CSS = '''
                   word-break:break-word; }
   .comment-deleted { font-size:0.9rem; color:var(--muted); font-style:italic; }
   .comment-actions { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; align-items:center; }
-  .comment-vote-bar { display:inline-flex; align-items:center; gap:4px; margin-right:8px; }
+  .comment-vote-bar { --cv-h:22px; display:inline-flex; align-items:stretch; gap:4px; margin-right:8px; }
+  .comment-vote-form { display:inline-flex; height:var(--cv-h); margin:0; }
   .comment-vote-btn {
     border:1px solid var(--border); background:var(--card2); color:var(--muted); cursor:pointer;
     border-radius:6px; font-family:var(--mono); font-size:0.62rem; line-height:1;
-    padding:2px 6px; min-width:28px; height:22px; display:inline-flex; align-items:center; justify-content:center;
+    padding:0 6px; min-width:28px; height:100%; display:inline-flex; align-items:center; justify-content:center;
     transition:color .15s,border-color .15s,background .15s;
+    box-sizing:border-box; appearance:none; -webkit-appearance:none;
   }
   .comment-vote-btn:hover { color:var(--accent); border-color:rgba(245,166,35,0.45); }
   .comment-vote-btn.active-up { color:var(--green); border-color:rgba(56,214,140,0.6); background:rgba(56,214,140,0.12); }
@@ -13370,7 +13372,8 @@ _MANAGE_CSS = '''
     text-align:center; letter-spacing:0.04em; font-weight:700;
     border:1px solid rgba(245,166,35,0.45); background:rgba(245,166,35,0.10);
     border-radius:6px; padding:0 6px; line-height:1;
-    height:22px; display:inline-flex; align-items:center; justify-content:center;
+    height:var(--cv-h); display:inline-flex; align-items:center; justify-content:center;
+    box-sizing:border-box;
   }
   .comment-vote-score.score-positive {
     color:var(--green); border-color:rgba(56,214,140,0.55); background:rgba(56,214,140,0.12);
@@ -13378,6 +13381,7 @@ _MANAGE_CSS = '''
   .comment-vote-score.score-negative {
     color:var(--red); border-color:rgba(224,91,48,0.55); background:rgba(224,91,48,0.12);
   }
+  .vote-glyph { display:inline-block; line-height:1; transform:translateY(-0.5px); }
   .comment-reply-form { margin-top:10px; display:none; }
   .comment-reply-form.open { display:block; }
   .comment-edit-form { display:none; margin-top:10px; }
@@ -16438,15 +16442,15 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
             vote_bar = (
                 '<span class="comment-vote-bar">'
                 + f'<span class="{score_cls}" title="Score {score_str} ({up_count} up / {down_count} down)">{score_str}</span>'
-                + '<form method="POST" action="/manage/comment/vote" style="display:inline">'
+                + '<form method="POST" action="/manage/comment/vote" class="comment-vote-form">'
                 + f'<input type="hidden" name="comment_id" value="{cid}">'
                 + '<input type="hidden" name="vote" value="up">'
-                + f'<button type="submit" class="{up_cls}" aria-label="Upvote comment" title="{up_count} up"{up_disabled}>&#128077;</button>'
+                + f'<button type="submit" class="{up_cls}" aria-label="Upvote comment" title="{up_count} up"{up_disabled}><span class="vote-glyph">&#128077;</span></button>'
                 + '</form>'
-                + '<form method="POST" action="/manage/comment/vote" style="display:inline">'
+                + '<form method="POST" action="/manage/comment/vote" class="comment-vote-form">'
                 + f'<input type="hidden" name="comment_id" value="{cid}">'
                 + '<input type="hidden" name="vote" value="down">'
-                + f'<button type="submit" class="{down_cls}" aria-label="Downvote comment" title="{down_count} down"{down_disabled}>&#128078;</button>'
+                + f'<button type="submit" class="{down_cls}" aria-label="Downvote comment" title="{down_count} down"{down_disabled}><span class="vote-glyph">&#128078;</span></button>'
                 + '</form>'
                 + '</span>'
             )
