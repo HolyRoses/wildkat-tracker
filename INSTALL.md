@@ -3,6 +3,8 @@
 This document covers deployment, TLS, service setup, and first-run configuration.
 For day-to-day operation and UI workflows, use `USER_GUIDE.md`.
 
+For pre-production setup and testing with self-signed certificates, use `SANDBOX_GUIDE.md` first. Validate there before promoting changes to a live environment.
+
 ## Requirements
 
 - Ubuntu 24.04 (or any modern Linux with systemd)
@@ -219,6 +221,8 @@ systemctl start tracker
 systemctl status tracker
 journalctl -u tracker -f
 ```
+
+If you prefer dedicated file logging with daily compression/rotation instead of journald-only logs, see `ALT_LOGGING.md`.
 
 Test the tracker with the query tool:
 
