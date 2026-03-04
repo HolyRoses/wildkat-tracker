@@ -828,6 +828,23 @@ What this does:
 - Clears active sessions for that account
 - Allows fresh password login and re-enrollment of passkeys
 
+If the super account was IP-locked to an inaccessible address, clear IP allowlist entries:
+
+```bash
+sudo -u tracker /opt/tracker/tracker_server.py \
+  --registration \
+  --db /opt/tracker/tracker.db \
+  --super-user super \
+  --manage-port 443 \
+  --super-user-reset-ip-lock
+```
+
+What this does:
+
+- Removes all IP allowlist entries for the super account
+- Clears active sessions for that account
+- Allows login from the current source IP so allowlist entries can be reconfigured safely
+
 To reset only the super password:
 
 ```bash

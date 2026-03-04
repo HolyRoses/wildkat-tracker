@@ -446,6 +446,7 @@ systemctl start tracker
 | `--super-user-password` | off | Set or reset the superuser password (reads `WK_SUPER_USER_PASSWORD` or prompts interactively; process exits after setting) |
 | `--super-user-reset-passkeys` | off | Reset superuser passkeys and passkey-required flags, then exit |
 | `--super-user-reset-tfa` | off | Reset superuser TFA secret/backup codes and TFA-required flag, then exit |
+| `--super-user-reset-ip-lock` | off | Clear superuser IP allowlist entries and sessions, then exit |
 | `--auth-break-glass` | off | Temporary startup override that bypasses passkey enforcement gates |
 | `--db` | `/opt/tracker/tracker.db` | Path to the SQLite database file |
 | `--manage-port` | same as `--web-https-port` | HTTPS port for the management interface if different from stats port |
