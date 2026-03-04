@@ -1830,6 +1830,21 @@ class RegistrationDB:
               ON torrent_votes(info_hash, vote);
             CREATE INDEX IF NOT EXISTS idx_torrent_votes_user
               ON torrent_votes(user_id, info_hash);
+            CREATE TABLE IF NOT EXISTS comment_votes (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                comment_id    INTEGER NOT NULL,
+                voter_user_id INTEGER NOT NULL,
+                vote          INTEGER NOT NULL,
+                created_at    TEXT    NOT NULL,
+                updated_at    TEXT    NOT NULL,
+                UNIQUE(comment_id, voter_user_id),
+                FOREIGN KEY (comment_id) REFERENCES comments(id) ON DELETE CASCADE,
+                FOREIGN KEY (voter_user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_comment_votes_comment_vote
+              ON comment_votes(comment_id, vote);
+            CREATE INDEX IF NOT EXISTS idx_comment_votes_voter_comment
+              ON comment_votes(voter_user_id, comment_id);
             CREATE TABLE IF NOT EXISTS user_follows (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 follower_user_id  INTEGER NOT NULL,
@@ -1950,6 +1965,11 @@ class RegistrationDB:
             pass  # column already exists
         try:
             self._conn().execute('ALTER TABLE users ADD COLUMN vote_alerts INTEGER NOT NULL DEFAULT 0')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN comment_vote_alerts INTEGER NOT NULL DEFAULT 0')
             self._conn().commit()
         except Exception:
             pass  # column already exists
@@ -5222,6 +5242,84 @@ class RegistrationDB:
             'SELECT * FROM torrents WHERE info_hash=?', (ih.upper(),)
         ).fetchone()
 
+    def get_comment_vote_summaries(self, comment_ids: list[int],
+                                   viewer_user_id: int | None = None) -> dict[int, dict]:
+        cids = [int(cid) for cid in (comment_ids or []) if int(cid) > 0]
+        if not cids:
+            return {}
+        c = self._conn()
+        placeholders = ','.join('?' for _ in cids)
+        rows = c.execute(
+            f'''SELECT
+                    comment_id,
+                    SUM(CASE WHEN vote=1 THEN 1 ELSE 0 END) AS up_count,
+                    SUM(CASE WHEN vote=-1 THEN 1 ELSE 0 END) AS down_count
+                FROM comment_votes
+                WHERE comment_id IN ({placeholders})
+                GROUP BY comment_id''',
+            cids
+        ).fetchall()
+        out = {
+            int(cid): {'up': 0, 'down': 0, 'my_vote': 0}
+            for cid in cids
+        }
+        for r in rows:
+            cid = int(r['comment_id'])
+            out[cid] = {
+                'up': int((r['up_count'] if r['up_count'] is not None else 0) or 0),
+                'down': int((r['down_count'] if r['down_count'] is not None else 0) or 0),
+                'my_vote': 0,
+            }
+        if viewer_user_id is not None:
+            my_rows = c.execute(
+                f'''SELECT comment_id, vote
+                    FROM comment_votes
+                    WHERE voter_user_id=? AND comment_id IN ({placeholders})''',
+                [int(viewer_user_id)] + cids
+            ).fetchall()
+            for mr in my_rows:
+                cid = int(mr['comment_id'])
+                if cid in out:
+                    out[cid]['my_vote'] = int(mr['vote'] or 0)
+        return out
+
+    def set_comment_vote(self, comment_id: int, voter_user_id: int, vote: int) -> dict:
+        cid = int(comment_id)
+        uid = int(voter_user_id)
+        vote_val = 1 if int(vote) > 0 else -1
+        c = self._conn()
+        row = c.execute(
+            'SELECT id, vote FROM comment_votes WHERE comment_id=? AND voter_user_id=?',
+            (cid, uid)
+        ).fetchone()
+        old_vote = int(row['vote']) if row else 0
+        action = 'added'
+        final_vote = vote_val
+        now_ts = self._ts()
+        if row and old_vote == vote_val:
+            c.execute('DELETE FROM comment_votes WHERE id=?', (row['id'],))
+            action = 'removed'
+            final_vote = 0
+        elif row:
+            c.execute(
+                'UPDATE comment_votes SET vote=?, updated_at=? WHERE id=?',
+                (vote_val, now_ts, row['id'])
+            )
+            action = 'switched'
+        else:
+            c.execute(
+                'INSERT INTO comment_votes (comment_id,voter_user_id,vote,created_at,updated_at) VALUES (?,?,?,?,?)',
+                (cid, uid, vote_val, now_ts, now_ts)
+            )
+        c.commit()
+        summary = self.get_comment_vote_summaries([cid], viewer_user_id=uid).get(
+            cid, {'up': 0, 'down': 0, 'my_vote': 0}
+        )
+        summary['action'] = action
+        summary['old_vote'] = old_vote
+        summary['final_vote'] = final_vote
+        return summary
+
     def get_torrent_vote_summary(self, ih: str, user_id: int | None = None) -> dict:
         ih_upper = (ih or '').upper()
         c = self._conn()
@@ -6176,6 +6274,15 @@ class RegistrationDB:
         ntype = 'torrent_vote_up' if int(vote) > 0 else 'torrent_vote_down'
         self.add_notification(
             recipient_user_id, ntype, voter_username, info_hash.upper(), torrent_name, 0
+        )
+
+    def notify_comment_vote(self, recipient_user_id: int, voter_username: str,
+                            info_hash: str, torrent_name: str, comment_id: int,
+                            vote: int) -> None:
+        ntype = 'comment_vote_up' if int(vote) > 0 else 'comment_vote_down'
+        self.add_notification(
+            recipient_user_id, ntype, voter_username, info_hash.upper(),
+            torrent_name, int(comment_id)
         )
 
     def notify_followers_bounty_fulfilled(self, actor_username: str,
@@ -8822,6 +8929,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_comment_edit()
         elif path == '/manage/comment/delete':
             self._post_comment_delete()
+        elif path == '/manage/comment/vote':
+            self._post_comment_vote()
         elif path.startswith('/manage/notifications/read/'):
             nid = path[len('/manage/notifications/read/'):]
             self._post_notification_read(nid)
@@ -10109,6 +10218,78 @@ class ManageHandler(BaseHTTPRequestHandler):
         role = _user_role(user)
         REGISTRATION_DB.delete_comment(int(cid), user['id'], role in ('super','admin'))
         self._redirect(base_url)
+
+    def _post_comment_vote(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        cid_raw = fields.get('comment_id', '').strip()
+        vote_raw = fields.get('vote', '').strip().lower()
+        if not cid_raw.isdigit() or vote_raw not in ('up', 'down'):
+            return self._redirect('/manage/dashboard')
+        cid = int(cid_raw)
+        row = REGISTRATION_DB.get_comment(cid)
+        if not row or int(row['is_deleted'] or 0) == 1:
+            return self._redirect('/manage/dashboard')
+
+        info_hash = (row['info_hash'] or '').upper()
+        base_url, anchor_prefix = self._comment_route_meta(info_hash)
+        if REGISTRATION_DB.get_setting('comments_enabled', '1') != '1':
+            return self._redirect(base_url)
+        role = _user_role(user)
+        is_bounty_thread = info_hash.startswith('BOUNTY:')
+        bounty = None
+        torrent = None
+        if is_bounty_thread:
+            if role == 'basic':
+                return self._redirect('/manage/dashboard')
+            bid_raw = info_hash.split(':', 1)[1].strip() if ':' in info_hash else ''
+            if not bid_raw.isdigit():
+                return self._redirect('/manage/bounty')
+            bounty = REGISTRATION_DB.get_bounty(int(bid_raw))
+            if not bounty:
+                return self._redirect('/manage/bounty?msg=Bounty+not+found.&msg_type=error')
+            if bounty['status'] == 'removed' and role not in ('super', 'admin'):
+                return self._redirect('/manage/bounty?msg=Bounty+not+found.&msg_type=error')
+            thread_name = bounty['description'][:120]
+        else:
+            torrent = REGISTRATION_DB.get_torrent(info_hash)
+            if not torrent:
+                return self._redirect('/manage/dashboard')
+            thread_name = torrent['name'][:120]
+
+        comment_author_id = int(row['user_id'])
+        if int(user['id']) == comment_author_id:
+            return self._redirect(f'{base_url}#{anchor_prefix}-{cid}')
+
+        vote_val = 1 if vote_raw == 'up' else -1
+        result = REGISTRATION_DB.set_comment_vote(cid, int(user['id']), vote_val)
+        final_vote = int(result.get('my_vote', 0))
+        old_vote = int(result.get('old_vote', 0))
+        if final_vote == 1:
+            REGISTRATION_DB._log(user['username'], 'comment_vote_up', info_hash, f'comment_id={cid}')
+        elif final_vote == -1:
+            REGISTRATION_DB._log(user['username'], 'comment_vote_down', info_hash, f'comment_id={cid}')
+        else:
+            cleared = 'up' if old_vote > 0 else ('down' if old_vote < 0 else 'none')
+            REGISTRATION_DB._log(user['username'], 'comment_vote_clear', info_hash,
+                                 f'comment_id={cid} cleared={cleared}')
+
+        target_user = REGISTRATION_DB.get_user_by_id(comment_author_id)
+        if (final_vote != 0 and target_user and int(target_user['id']) != int(user['id'])
+                and ('comment_vote_alerts' in target_user.keys())
+                and int(target_user['comment_vote_alerts'] or 0) == 1):
+            REGISTRATION_DB.notify_comment_vote(
+                int(target_user['id']),
+                user['username'],
+                info_hash,
+                thread_name,
+                cid,
+                final_vote
+            )
+        return self._redirect(f'{base_url}#{anchor_prefix}-{cid}')
 
     def _post_notification_read(self, nid_str: str):
         user = self._get_session_user()
@@ -12160,6 +12341,8 @@ class ManageHandler(BaseHTTPRequestHandler):
                     'bounty_new':             ('📣', 'has posted a bounty for'),
                     'mention':                ('@',  'mentioned you in bounty'),
                     'reply':                  ('💬', 'replied to your comment on bounty'),
+                    'comment_vote_up':        ('👍', 'upvoted your comment on bounty'),
+                    'comment_vote_down':      ('👎', 'downvoted your comment on bounty'),
                     'bounty_claimed':         ('🎯', 'claimed your bounty'),
                     'bounty_rejected':        ('✗',  'rejected your claim on'),
                     'bounty_fulfilled':       ('✅', 'has accepted your claim for bounty'),
@@ -12179,7 +12362,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                     anchor = ''
                     url = '/manage/bounty'
                 else:
-                    anchor = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply') and n['comment_id']) else ''
+                    anchor = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply', 'comment_vote_up', 'comment_vote_down') and n['comment_id']) else ''
                     url = f'/manage/bounty/{bid}{anchor}'
             elif is_topup:
                 oid = str(n['info_hash']).split(':', 1)[1]
@@ -12214,6 +12397,11 @@ class ManageHandler(BaseHTTPRequestHandler):
                     icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
                     label = 'reacted to your torrent'
                     url = f'/manage/torrent/{n["info_hash"].lower()}'
+                elif n['type'] in ('comment_vote_up', 'comment_vote_down'):
+                    icon = '👍' if n['type'] == 'comment_vote_up' else '👎'
+                    label = 'voted on your comment'
+                    anchor = f'#comment-{n["comment_id"]}' if int(n['comment_id'] or 0) > 0 else ''
+                    url = f'/manage/torrent/{n["info_hash"].lower()}{anchor}'
                 elif n['type'] == 'followed_upload':
                     icon = '📦'
                     label = 'uploaded a new torrent'
@@ -12600,6 +12788,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             show_online = fields.get('show_online', '0') == '1'
             bounty_alerts = fields.get('bounty_alerts', '0') == '1'
             vote_alerts = fields.get('vote_alerts', '0') == '1'
+            comment_vote_alerts = fields.get('comment_vote_alerts', '0') == '1'
             link_torrent_activity = fields.get('link_torrent_activity', '0') == '1'
             allow_follow_visibility = fields.get('allow_follow_visibility', '0') == '1'
             gravatar_opt_in = fields.get('gravatar_opt_in', '0') == '1'
@@ -12609,6 +12798,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             show_online = ('show_online' not in user.keys() or user['show_online'])
             bounty_alerts = ('bounty_alerts' not in user.keys() or user['bounty_alerts'])
             vote_alerts = (('vote_alerts' in user.keys()) and user['vote_alerts'])
+            comment_vote_alerts = (('comment_vote_alerts' in user.keys()) and user['comment_vote_alerts'])
             link_torrent_activity = ('link_torrent_activity' not in user.keys() or user['link_torrent_activity'])
             allow_follow_visibility = ('allow_follow_visibility' not in user.keys() or user['allow_follow_visibility'])
             gravatar_opt_in = ('gravatar_opt_in' in user.keys() and user['gravatar_opt_in'])
@@ -12625,12 +12815,13 @@ class ManageHandler(BaseHTTPRequestHandler):
                 gravatar_hash = parsed_hash
             c.execute(
                 '''UPDATE users
-                   SET show_online=?, bounty_alerts=?, vote_alerts=?, link_torrent_activity=?,
+                   SET show_online=?, bounty_alerts=?, vote_alerts=?, comment_vote_alerts=?, link_torrent_activity=?,
                        allow_follow_visibility=?, gravatar_opt_in=?, gravatar_hash=?
                    WHERE id=?''',
                 (1 if show_online else 0,
                  1 if bounty_alerts else 0,
                  1 if vote_alerts else 0,
+                 1 if comment_vote_alerts else 0,
                  1 if link_torrent_activity else 0,
                  1 if allow_follow_visibility else 0,
                  1 if gravatar_opt_in else 0,
@@ -12640,12 +12831,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         else:
             c.execute(
                 '''UPDATE users
-                   SET show_online=?, bounty_alerts=?, vote_alerts=?, link_torrent_activity=?,
+                   SET show_online=?, bounty_alerts=?, vote_alerts=?, comment_vote_alerts=?, link_torrent_activity=?,
                        allow_follow_visibility=?
                    WHERE id=?''',
                 (1 if show_online else 0,
                  1 if bounty_alerts else 0,
                  1 if vote_alerts else 0,
+                 1 if comment_vote_alerts else 0,
                  1 if link_torrent_activity else 0,
                  1 if allow_follow_visibility else 0,
                  user['id'])
@@ -13161,6 +13353,31 @@ _MANAGE_CSS = '''
                   word-break:break-word; }
   .comment-deleted { font-size:0.9rem; color:var(--muted); font-style:italic; }
   .comment-actions { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; align-items:center; }
+  .comment-vote-bar { display:inline-flex; align-items:center; gap:4px; margin-right:8px; }
+  .comment-vote-btn {
+    border:1px solid var(--border); background:var(--card2); color:var(--muted); cursor:pointer;
+    border-radius:6px; font-family:var(--mono); font-size:0.62rem; line-height:1;
+    padding:2px 6px; min-width:28px; height:22px; display:inline-flex; align-items:center; justify-content:center;
+    transition:color .15s,border-color .15s,background .15s;
+  }
+  .comment-vote-btn:hover { color:var(--accent); border-color:rgba(245,166,35,0.45); }
+  .comment-vote-btn.active-up { color:var(--green); border-color:rgba(56,214,140,0.6); background:rgba(56,214,140,0.12); }
+  .comment-vote-btn.active-down { color:var(--red); border-color:rgba(224,91,48,0.6); background:rgba(224,91,48,0.12); }
+  .comment-vote-btn:disabled { opacity:0.55; cursor:default; }
+  .comment-vote-btn:disabled:hover { color:var(--muted); border-color:var(--border); }
+  .comment-vote-score {
+    font-family:var(--mono); font-size:0.68rem; color:var(--accent); min-width:30px;
+    text-align:center; letter-spacing:0.04em; font-weight:700;
+    border:1px solid rgba(245,166,35,0.45); background:rgba(245,166,35,0.10);
+    border-radius:6px; padding:0 6px; line-height:1;
+    height:22px; display:inline-flex; align-items:center; justify-content:center;
+  }
+  .comment-vote-score.score-positive {
+    color:var(--green); border-color:rgba(56,214,140,0.55); background:rgba(56,214,140,0.12);
+  }
+  .comment-vote-score.score-negative {
+    color:var(--red); border-color:rgba(224,91,48,0.55); background:rgba(224,91,48,0.12);
+  }
   .comment-reply-form { margin-top:10px; display:none; }
   .comment-reply-form.open { display:block; }
   .comment-edit-form { display:none; margin-top:10px; }
@@ -13750,6 +13967,8 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     'bounty_new':              ('📣', 'has posted a bounty for'),
                     'mention':                 ('@',  'mentioned you in bounty'),
                     'reply':                   ('💬', 'replied to your comment on bounty'),
+                    'comment_vote_up':         ('👍', 'upvoted your comment on bounty'),
+                    'comment_vote_down':       ('👎', 'downvoted your comment on bounty'),
                     'bounty_claimed':          ('🎯', 'claimed your bounty'),
                     'bounty_rejected':         ('✗',  'rejected your claim on'),
                     'bounty_fulfilled':        ('✅', 'has accepted your claim for bounty'),
@@ -13771,7 +13990,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 if ntype in ('bounty_removed', 'bounty_refund_admin'):
                     target = '/manage/bounty'
                 else:
-                    anchor  = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply') and n['comment_id']) else ''
+                    anchor  = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply', 'comment_vote_up', 'comment_vote_down') and n['comment_id']) else ''
                     target = f'/manage/bounty/{bid}{anchor}'
                 dropdown_items += (
                     f'<button class="notif-item" '
@@ -13843,6 +14062,19 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                         f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}\')"'
                         f' aria-label="torrent vote by {from_h}">'
                         f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> reacted to your torrent</div>'
+                        f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
+                elif n['type'] in ('comment_vote_up', 'comment_vote_down'):
+                    icon = '👍' if n['type'] == 'comment_vote_up' else '👎'
+                    n_cid = n['comment_id']
+                    label = 'upvoted your comment' if n['type'] == 'comment_vote_up' else 'downvoted your comment'
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}#comment-{n_cid}\')"'
+                        f' aria-label="comment vote by {from_h}">'
+                        f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
                         f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
                         f'<div class="notif-item-ts">{ts_h}</div>'
                         f'</button>'
@@ -16140,6 +16372,10 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
     if not REGISTRATION_DB:
         return ''
     all_comments = REGISTRATION_DB.get_comments(info_hash)
+    vote_summaries = REGISTRATION_DB.get_comment_vote_summaries(
+        [int(c['id']) for c in all_comments],
+        viewer_user_id=int(viewer['id'])
+    )
     role   = _user_role(viewer)
     is_mod = role in ('super', 'admin')
     ih_h   = _h(info_hash)
@@ -16184,6 +16420,36 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
 
             uname_js = uname.replace("'", "\\'")
             reply_onclick = 'toggleReplyForm(' + str(cid) + ', \'' + uname_js + '\')'
+            vm = vote_summaries.get(int(cid), {'up': 0, 'down': 0, 'my_vote': 0})
+            up_count = int(vm.get('up', 0) or 0)
+            down_count = int(vm.get('down', 0) or 0)
+            my_vote = int(vm.get('my_vote', 0) or 0)
+            score = up_count - down_count
+            score_str = f'+{score}' if score > 0 else str(score)
+            score_cls = 'comment-vote-score'
+            if score > 0:
+                score_cls += ' score-positive'
+            elif score < 0:
+                score_cls += ' score-negative'
+            up_cls = 'comment-vote-btn active-up' if my_vote > 0 else 'comment-vote-btn'
+            down_cls = 'comment-vote-btn active-down' if my_vote < 0 else 'comment-vote-btn'
+            up_disabled = ' disabled' if is_own else ''
+            down_disabled = ' disabled' if is_own else ''
+            vote_bar = (
+                '<span class="comment-vote-bar">'
+                + f'<span class="{score_cls}" title="Score {score_str} ({up_count} up / {down_count} down)">{score_str}</span>'
+                + '<form method="POST" action="/manage/comment/vote" style="display:inline">'
+                + f'<input type="hidden" name="comment_id" value="{cid}">'
+                + '<input type="hidden" name="vote" value="up">'
+                + f'<button type="submit" class="{up_cls}" aria-label="Upvote comment" title="{up_count} up"{up_disabled}>&#128077;</button>'
+                + '</form>'
+                + '<form method="POST" action="/manage/comment/vote" style="display:inline">'
+                + f'<input type="hidden" name="comment_id" value="{cid}">'
+                + '<input type="hidden" name="vote" value="down">'
+                + f'<button type="submit" class="{down_cls}" aria-label="Downvote comment" title="{down_count} down"{down_disabled}>&#128078;</button>'
+                + '</form>'
+                + '</span>'
+            )
             action_btns = []
             if not locked:
                 action_btns.append(
@@ -16207,7 +16473,7 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
                     f'</form>'
                 )
             actions_html = (
-                f'<div class="comment-actions">{"".join(action_btns)}</div>'
+                f'<div class="comment-actions">{vote_bar}{"".join(action_btns)}</div>'
             )
 
             edit_form = (
@@ -16789,6 +17055,8 @@ def _render_notifications_page(viewer) -> str:
                 'bounty_new':              ('📣', 'has posted a bounty for'),
                 'mention':                 ('@',  'mentioned you in bounty'),
                 'reply':                   ('💬', 'replied to your comment on bounty'),
+                'comment_vote_up':         ('👍', 'upvoted your comment on bounty'),
+                'comment_vote_down':       ('👎', 'downvoted your comment on bounty'),
                 'bounty_claimed':          ('🎯', 'claimed your bounty'),
                 'bounty_rejected':         ('✗',  'rejected your claim on'),
                 'bounty_fulfilled':        ('✅', 'has accepted your claim for bounty'),
@@ -16806,7 +17074,7 @@ def _render_notifications_page(viewer) -> str:
             if ntype in ('bounty_removed', 'bounty_refund_admin'):
                 url = '/manage/bounty'
             else:
-                anchor = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply') and n['comment_id']) else ''
+                anchor = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply', 'comment_vote_up', 'comment_vote_down') and n['comment_id']) else ''
                 url = f'/manage/bounty/{bid}{anchor}'
             read_js = f"readNotif({n_id},'{url}')"
             rows += (
@@ -16891,6 +17159,23 @@ def _render_notifications_page(viewer) -> str:
                     f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
                     f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                     f' reacted to your torrent: '
+                    f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                    f'</div>'
+                )
+            elif n['type'] in ('comment_vote_up', 'comment_vote_down'):
+                icon = '👍' if n['type'] == 'comment_vote_up' else '👎'
+                label = 'upvoted your comment' if n['type'] == 'comment_vote_up' else 'downvoted your comment'
+                url = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
+                read_js = f"readNotif({n_id},'{url}')"
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' {label} on '
                     f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                     f'<div class="notif-page-meta">{ts_h}</div>'
                     f'</div>'
@@ -17803,6 +18088,10 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<input type="checkbox" name="vote_alerts" value="1" '
             + ('checked' if (('vote_alerts' in viewer.keys()) and viewer['vote_alerts']) else '')
             + '> Torrent vote alerts (when others vote on my uploads)</label>'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            '<input type="checkbox" name="comment_vote_alerts" value="1" '
+            + ('checked' if (('comment_vote_alerts' in viewer.keys()) and viewer['comment_vote_alerts']) else '')
+            + '> Comment vote alerts (when others vote on my comments)</label>'
             '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
             '<input type="checkbox" name="link_torrent_activity" value="1" '
             + ('checked' if ('link_torrent_activity' not in viewer.keys() or viewer['link_torrent_activity']) else '')
