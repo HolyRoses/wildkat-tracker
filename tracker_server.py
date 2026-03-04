@@ -9322,7 +9322,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not REGISTRATION_DB.is_ip_allowed(user['id'], client_ip):
             log.warning('LOGIN blocked by IP allowlist user=%r ip=%s', username, client_ip)
             REGISTRATION_DB._log(username, 'login_ip_blocked', client_ip)
-            self._send_html(_render_login(invalid_login_msg))
+            self._send_html(_render_login(
+                f'Sign-in denied from this IP address ({client_ip}). '
+                'This account is restricted to allowed IP addresses.'
+            ))
             return
         policy = _auth_factor_policy_for_user(user)
         needs_tfa_challenge = bool(policy.get('tfa_challenge_required'))
@@ -9521,7 +9524,18 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not REGISTRATION_DB.is_ip_allowed(user['id'], client_ip):
             log.warning('WEBAUTHN auth blocked by IP allowlist user=%r ip=%s', user['username'], client_ip)
             REGISTRATION_DB._log(user['username'], 'webauthn_auth_ip_blocked', client_ip)
-            return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 403)
+            ip_msg = urllib.parse.quote_plus(
+                f'Sign-in denied from this IP address ({client_ip}). '
+                'This account is restricted to allowed IP addresses.'
+            )
+            return self._send_json(
+                {
+                    'ok': False,
+                    'error': f'Sign-in denied from this IP address ({client_ip}).',
+                    'redirect': f'/manage?msg={ip_msg}&msg_type=error',
+                },
+                403
+            )
         rows = REGISTRATION_DB.list_webauthn_credentials(user['id'])
         stored = []
         by_cred_id = {}
@@ -10843,6 +10857,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         msg_type = qs.get('msg_type', ['error'])[0]
         self._send_html(_render_user_detail(user, user, torrents, history, is_super,
                                             allowlist=allowlist, is_own_profile=True,
+                                            current_ip=(self.client_address[0] if self.client_address else ''),
                                             page=page, total_pages=total_pages,
                                             total=total, base_url='/manage/profile',
                                             ledger=ledger, bounty_data=bounty_data, topup_orders=topup_orders,
@@ -12740,6 +12755,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         base_url  = f'/manage/admin/user/{username}'
         self._send_html(_render_user_detail(viewer, target, torrents, history, is_super,
                                             allowlist=allowlist,
+                                            current_ip=(self.client_address[0] if self.client_address else ''),
                                             page=page, total_pages=total_pages,
                                             total=total, base_url=base_url,
                                             topup_orders=topup_orders,
@@ -14066,6 +14082,7 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
             'var f=await fetch(\"/manage/webauthn/auth/finish\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(payload)});'
             'var fj={};try{fj=await f.json();}catch(_e){fj={ok:false,error:\"Passkey finish failed (invalid server response).\"};}'
             'if(!fj.ok){'
+            'if(fj.redirect){window.location.href=fj.redirect;return;}'
             'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return window.startPasskeyLogin(true,true);}'
             'if(m)m.textContent=fj.error||\"Passkey authentication failed.\";if(canTryAll)showAlt(true);return;}'
             'window.location.href=fj.redirect||\"/manage/dashboard\";'
@@ -17343,7 +17360,7 @@ def _unlock_at_value(target_user) -> str:
 
 
 def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
-                        allowlist=None, is_own_profile=False,
+                        allowlist=None, is_own_profile=False, current_ip='',
                         page: int = 1, total_pages: int = 1, total: int = 0, base_url: str = '',
                         ledger=None, bounty_data=None, topup_orders=None,
                         msg: str = '', msg_type: str = 'error'):
@@ -17419,12 +17436,22 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         if login_history:
             for h in login_history:
                 ip_h = _h(h['ip_address'])
+                is_current = bool(current_ip and h['ip_address'] == current_ip)
+                tr_style = (
+                    'border:1px solid rgba(245,166,35,0.45);'
+                    'box-shadow:inset 0 0 0 1px rgba(245,166,35,0.2);'
+                    'background:rgba(245,166,35,0.10);'
+                    if is_current else ''
+                )
                 ip_rows += (
-                    '<tr>'
+                    '<tr style="' + tr_style + '">'
                     + '<td style="padding:6px 8px"><input type="checkbox" name="ip_check" value="'
                     + ip_h + '"></td>'
                     + '<td class="hash" style="padding:6px 8px">' + h['logged_in_at'][:16] + '</td>'
-                    + '<td class="hash" style="word-break:break-all;padding:6px 8px;font-size:0.78rem">' + ip_h + '</td>'
+                    + '<td class="hash" style="word-break:break-all;padding:6px 8px;font-size:0.78rem">'
+                    + ip_h
+                    + (' <span class="pill" style="margin-left:8px">Current</span>' if is_current else '')
+                    + '</td>'
                     + '</tr>'
                 )
         else:
@@ -17433,9 +17460,10 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         allowlist = allowlist or (REGISTRATION_DB.get_ip_allowlist(target_user['id']) if REGISTRATION_DB else [])
         al_rows = ''
         for entry in allowlist:
+            entry_ip = _h(entry['ip_address'])
             al_rows += (
                 '<tr>'
-                + '<td class="hash" style="word-break:break-all;padding:6px 8px;font-size:0.78rem">' + _h(entry['ip_address']) + '</td>'
+                + '<td class="hash" style="padding:6px 8px;font-size:0.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + entry_ip + '">' + entry_ip + '</td>'
                 + '<td class="hash" style="padding:6px 8px">' + entry['added_at'][:16] + '</td>'
                 + '<td style="padding:6px 8px; white-space:nowrap;">'
                 + '<form method="POST" action="/manage/admin/ip-lock-remove" style="display:inline">'
@@ -17490,9 +17518,10 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + '<div class="card" style="overflow:hidden">'
             + '<div class="card-title">IP Allowlist</div>'
             + '<div style="overflow-x:auto"><table style="table-layout:fixed;width:100%;border-collapse:collapse">'
+            + '<colgroup><col style="width:62%"><col style="width:26%"><col style="width:120px"></colgroup>'
             + '<tr>'
             + '<th scope="col" style="padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">IP ADDRESS</th>'
-            + '<th scope="col" style="width:50%;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">ADDED</th>'
+            + '<th scope="col" style="width:26%;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">ADDED</th>'
             + '<th scope="col" style="width:120px;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">ACTION</th>'
             + '</tr>'
             + al_rows
@@ -18360,24 +18389,36 @@ def _render_points_section(viewer, target_user, is_own_profile: bool,
             desc = _h(b['description'][:60] + ('\u2026' if len(b['description']) > 60 else ''))
             badge = _bounty_status_badge(b['status'])
             p    = f'<span style="color:var(--accent)">{b["total_escrow"]} pts</span>'
-            return (f'<tr><td><a href="/manage/bounty/{bid}">{desc}</a></td>'
-                    f'<td style="text-align:center">{badge}</td>'
-                    f'<td style="text-align:center">{p}</td></tr>')
+            return (
+                '<tr>'
+                f'<td style="padding:10px 12px 10px 0;vertical-align:top;white-space:normal;overflow-wrap:anywhere;word-break:break-word;line-height:1.35">'
+                f'<a href="/manage/bounty/{bid}">{desc}</a></td>'
+                f'<td style="padding:10px 12px;text-align:center;vertical-align:middle;white-space:nowrap">{badge}</td>'
+                f'<td style="padding:10px 0;text-align:center;vertical-align:middle;white-space:nowrap">{p}</td>'
+                '</tr>'
+            )
 
         cr = ''.join(_brow(b) for b in bounty_data['created'][:10])
         ff = ''.join(_brow(b) for b in bounty_data['fulfilled'][:10])
-        hdr = '<thead><tr><th>Description</th><th>Status</th><th>Points</th></tr></thead>'
+        hdr = (
+            '<colgroup><col style="width:64%"><col style="width:18%"><col style="width:18%"></colgroup>'
+            '<thead><tr>'
+            '<th style="text-align:left;padding:6px 12px 6px 0;white-space:nowrap">Description</th>'
+            '<th style="text-align:center;padding:6px 12px;white-space:nowrap">Status</th>'
+            '<th style="text-align:center;padding:6px 0;white-space:nowrap">Points</th>'
+            '</tr></thead>'
+        )
         if cr or ff:
             if cr and ff:
                 out += '<div class="two-col">'
             if cr:
                 out += ('<div class="card"><div class="card-title">My Bounties</div>'
-                        + '<div class="table-wrap"><table class="torrent-table">'
+                        + '<div class="table-wrap"><table class="torrent-table" style="table-layout:fixed;width:100%">'
                         + hdr + f'<tbody>{cr}</tbody></table></div>'
                         + '<a href="/manage/bounty" class="btn btn-sm" style="margin-top:8px">View All →</a></div>')
             if ff:
                 out += ('<div class="card"><div class="card-title">Bounties I Fulfilled</div>'
-                        + '<div class="table-wrap"><table class="torrent-table">'
+                        + '<div class="table-wrap"><table class="torrent-table" style="table-layout:fixed;width:100%">'
                         + hdr + f'<tbody>{ff}</tbody></table></div></div>')
             if cr and ff:
                 out += '</div>'
@@ -18669,6 +18710,8 @@ def main():
                         help='Reset super-user passkeys and passkey-required flags, then exit')
     parser.add_argument('--super-user-reset-tfa', action='store_true',
                         help='Reset super-user TFA secret/backup-codes and TFA-required flag, then exit')
+    parser.add_argument('--super-user-reset-ip-lock', action='store_true',
+                        help='Clear super-user IP allowlist entries, then exit')
     parser.add_argument('--auth-break-glass', action='store_true',
                         help='Temporary startup override to bypass passkey enforcement gates')
     parser.add_argument('--auth-break-glass-ttl-minutes', type=int, default=0,
@@ -18804,6 +18847,21 @@ def main():
         db.reset_user_tfa(int(u['id']), actor='cli')
         db.delete_sessions_for_user(int(u['id']))
         print(f"Superuser {args.super_user!r} TFA reset. Sessions cleared.")
+        sys.exit(0)
+
+    # ── Super-user IP lock reset (run offline, exits) ─────────
+    if args.super_user_reset_ip_lock:
+        if not args.super_user:
+            print('Error: --super-user-reset-ip-lock requires --super-user', file=sys.stderr)
+            sys.exit(1)
+        db = RegistrationDB(args.db)
+        u = db.get_user(args.super_user)
+        if not u:
+            print(f'Error: super user {args.super_user!r} not found in {args.db}', file=sys.stderr)
+            sys.exit(1)
+        db.clear_ip_allowlist(int(u['id']), actor='cli')
+        db.delete_sessions_for_user(int(u['id']))
+        print(f"Superuser {args.super_user!r} IP allowlist cleared. Sessions cleared.")
         sys.exit(0)
 
     # ── TLS / HTTPS ──────────────────────────────────────────
