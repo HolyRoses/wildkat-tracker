@@ -27,14 +27,14 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Account onboarding** — admin-created users, invite links, or open signup (configurable)
 - **Torrent management UI** — upload `.torrent` files, browse/search listings, inspect detail pages, copy hashes/magnets
 - **Upload safety limits** — request-size, file-count, and per-file caps with partial-success batch handling
-- **Profile and privacy controls** — DM opt-in, online status visibility, bounty alerts, torrent activity linking, optional Gravatar
+- **Profile and privacy controls** — DM opt-in, online status visibility, bounty alerts, torrent vote alerts, comment vote alerts (opt-in), torrent activity linking, optional Gravatar
 - **Passkey authentication (WebAuthn)** — optional passkey login with Touch ID / Face ID / security-key support, profile enrollment, and policy enforcement controls
 - **TFA (TOTP) authentication** — optional Google Authenticator-compatible second factor with backup codes and admin enforcement/reset controls
 - **Self-service account deletion** — multi-step forced logout + fresh login + final phrase/password confirmation flow
 - **Followers system** — follow/unfollow members, follower activity notifications, and Most Followed leaderboard category
 - **Torrent peer snapshots** — manual Seeds/Peers refresh from torrent detail pages (3-hour cooldown) plus optional auto-queued refresh after upload with configurable cap
 - **Direct messages** — threaded inbox/sent/compose/blocked flow with optional point cost and daily limits
-- **Comments and notifications** — threaded comments, @mentions, bell dropdown, and full notifications page
+- **Comments and notifications** — threaded torrent/bounty comments, comment upvote/downvote controls, @mentions, bell dropdown, and full notifications page
 - **Points economy** — earning, spending, transfers, streaks, and ledger-backed accounting
 - **Points top-ups** — fixed-amount purchases with provider-based checkout and order tracking
 - **Bounty board** — posting, claiming, confirming, contributing, voting, and payout splitting
