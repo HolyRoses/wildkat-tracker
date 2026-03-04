@@ -1816,6 +1816,20 @@ class RegistrationDB:
                 created_at     TEXT    NOT NULL,
                 is_read        INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS torrent_votes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash   TEXT    NOT NULL,
+                user_id     INTEGER NOT NULL,
+                vote        INTEGER NOT NULL,
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL,
+                UNIQUE(info_hash, user_id),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_torrent_votes_infohash_vote
+              ON torrent_votes(info_hash, vote);
+            CREATE INDEX IF NOT EXISTS idx_torrent_votes_user
+              ON torrent_votes(user_id, info_hash);
             CREATE TABLE IF NOT EXISTS user_follows (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 follower_user_id  INTEGER NOT NULL,
@@ -1931,6 +1945,11 @@ class RegistrationDB:
             pass  # column already exists
         try:
             self._conn().execute('ALTER TABLE users ADD COLUMN bounty_alerts INTEGER NOT NULL DEFAULT 1')
+            self._conn().commit()
+        except Exception:
+            pass  # column already exists
+        try:
+            self._conn().execute('ALTER TABLE users ADD COLUMN vote_alerts INTEGER NOT NULL DEFAULT 0')
             self._conn().commit()
         except Exception:
             pass  # column already exists
@@ -3915,14 +3934,25 @@ class RegistrationDB:
 
     def delete_all_torrents_for_user(self, user_id: int, actor: str,
                                       target_username: str = ''):
-        self._conn().execute('DELETE FROM torrents WHERE uploaded_by_id=?', (user_id,))
+        c = self._conn()
+        rows = c.execute('SELECT info_hash FROM torrents WHERE uploaded_by_id=?', (user_id,)).fetchall()
+        hashes = [str(r['info_hash'] or '').upper() for r in rows]
+        c.execute('DELETE FROM torrents WHERE uploaded_by_id=?', (user_id,))
+        if hashes:
+            c.executemany('DELETE FROM comments WHERE info_hash=?', [(h,) for h in hashes])
+            c.executemany('DELETE FROM notifications WHERE info_hash=?', [(h,) for h in hashes])
+            c.executemany('DELETE FROM torrent_votes WHERE info_hash=?', [(h,) for h in hashes])
         self._conn().commit()
         detail = f'deleted all torrents for {target_username}' if target_username else f'deleted all torrents for user_id={user_id}'
         self._log(actor, 'delete_all_torrents_user', target_username or str(user_id), detail)
 
     def delete_all_torrents(self, actor: str):
-        self._conn().execute('DELETE FROM torrents')
-        self._conn().commit()
+        c = self._conn()
+        c.execute('DELETE FROM torrents')
+        c.execute('DELETE FROM comments')
+        c.execute('DELETE FROM notifications')
+        c.execute('DELETE FROM torrent_votes')
+        c.commit()
         self._log(actor, 'delete_all_torrents', 'ALL', 'deleted entire torrent database')
 
     def check_auto_promote(self, user_id: int) -> bool:
@@ -5027,6 +5057,7 @@ class RegistrationDB:
                 # Expunge all comments and notifications tied to this torrent
                 c.execute('DELETE FROM comments WHERE info_hash=?', (ih_upper,))
                 c.execute('DELETE FROM notifications WHERE info_hash=?', (ih_upper,))
+                c.execute('DELETE FROM torrent_votes WHERE info_hash=?', (ih_upper,))
                 c.execute('DELETE FROM torrents WHERE info_hash=?', (ih_upper,))
                 c.commit()
                 self._log(actor, 'delete_torrent', ih_upper, torrent_name)
@@ -5123,6 +5154,7 @@ class RegistrationDB:
         c.execute('DELETE FROM torrents')
         c.execute('DELETE FROM comments')
         c.execute('DELETE FROM notifications')
+        c.execute('DELETE FROM torrent_votes')
         c.execute('DELETE FROM invite_codes')
         c.execute('DELETE FROM points_ledger')
         c.execute('DELETE FROM bounties')
@@ -5189,6 +5221,64 @@ class RegistrationDB:
         return self._conn().execute(
             'SELECT * FROM torrents WHERE info_hash=?', (ih.upper(),)
         ).fetchone()
+
+    def get_torrent_vote_summary(self, ih: str, user_id: int | None = None) -> dict:
+        ih_upper = (ih or '').upper()
+        c = self._conn()
+        row = c.execute(
+            '''SELECT
+                   SUM(CASE WHEN vote=1 THEN 1 ELSE 0 END) AS up_count,
+                   SUM(CASE WHEN vote=-1 THEN 1 ELSE 0 END) AS down_count
+               FROM torrent_votes
+               WHERE info_hash=?''',
+            (ih_upper,)
+        ).fetchone()
+        my_vote = 0
+        if user_id is not None:
+            mine = c.execute(
+                'SELECT vote FROM torrent_votes WHERE info_hash=? AND user_id=?',
+                (ih_upper, user_id)
+            ).fetchone()
+            if mine:
+                my_vote = int(mine['vote'] or 0)
+        return {
+            'up': int((row['up_count'] if row and row['up_count'] is not None else 0) or 0),
+            'down': int((row['down_count'] if row and row['down_count'] is not None else 0) or 0),
+            'my_vote': my_vote,
+        }
+
+    def set_torrent_vote(self, ih: str, user_id: int, vote: int) -> dict:
+        ih_upper = (ih or '').upper()
+        vote_val = 1 if int(vote) > 0 else -1
+        c = self._conn()
+        row = c.execute(
+            'SELECT id, vote FROM torrent_votes WHERE info_hash=? AND user_id=?',
+            (ih_upper, user_id)
+        ).fetchone()
+        old_vote = int(row['vote']) if row else 0
+        action = 'added'
+        final_vote = vote_val
+        now_ts = self._ts()
+        if row and old_vote == vote_val:
+            c.execute('DELETE FROM torrent_votes WHERE id=?', (row['id'],))
+            action = 'removed'
+            final_vote = 0
+        elif row:
+            c.execute(
+                'UPDATE torrent_votes SET vote=?, updated_at=? WHERE id=?',
+                (vote_val, now_ts, row['id'])
+            )
+            action = 'switched'
+        else:
+            c.execute(
+                'INSERT INTO torrent_votes (info_hash,user_id,vote,created_at,updated_at) VALUES (?,?,?,?,?)',
+                (ih_upper, user_id, vote_val, now_ts, now_ts)
+            )
+        c.commit()
+        summary = self.get_torrent_vote_summary(ih_upper, user_id=user_id)
+        summary['action'] = action
+        summary['old_vote'] = old_vote
+        return summary
 
     # ── Sessions ───────────────────────────────────────────────
 
@@ -6080,6 +6170,13 @@ class RegistrationDB:
             )
             sent += 1
         return sent
+
+    def notify_torrent_vote(self, recipient_user_id: int, voter_username: str,
+                            info_hash: str, torrent_name: str, vote: int) -> None:
+        ntype = 'torrent_vote_up' if int(vote) > 0 else 'torrent_vote_down'
+        self.add_notification(
+            recipient_user_id, ntype, voter_username, info_hash.upper(), torrent_name, 0
+        )
 
     def notify_followers_bounty_fulfilled(self, actor_username: str,
                                           bounty_id: int,
@@ -8679,6 +8776,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_toggle_comments_lock(False)
         elif path == '/manage/torrent/update-peers':
             self._post_torrent_update_peers()
+        elif path == '/manage/torrent/vote':
+            self._post_torrent_vote()
         elif path == '/manage/password':
             self._post_change_password()
         elif path == '/manage/admin/add-user':
@@ -10129,6 +10228,40 @@ class ManageHandler(BaseHTTPRequestHandler):
         )
         q = urllib.parse.quote(f'Peer stats updated: seeds={details["seeds"]}, peers={details["peers"]}.')
         return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
+
+    def _post_torrent_vote(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        vote_raw = fields.get('vote', '').strip().lower()
+        if not ih or vote_raw not in ('up', 'down'):
+            return self._redirect('/manage/dashboard')
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not t:
+            return self._redirect('/manage/dashboard')
+        vote_val = 1 if vote_raw == 'up' else -1
+        result = REGISTRATION_DB.set_torrent_vote(ih, int(user['id']), vote_val)
+        final_vote = int(result.get('my_vote', 0))
+        old_vote = int(result.get('old_vote', 0))
+        if final_vote == 1:
+            REGISTRATION_DB._log(user['username'], 'torrent_vote_up', ih, t['name'][:120])
+        elif final_vote == -1:
+            REGISTRATION_DB._log(user['username'], 'torrent_vote_down', ih, t['name'][:120])
+        else:
+            cleared = 'up' if old_vote > 0 else ('down' if old_vote < 0 else 'none')
+            REGISTRATION_DB._log(user['username'], 'torrent_vote_clear', ih, f'cleared={cleared}')
+        uploader = REGISTRATION_DB.get_user(t['uploaded_by_username']) if t['uploaded_by_username'] else None
+        if (final_vote != 0 and uploader and int(uploader['id']) != int(user['id'])
+                and ('vote_alerts' in uploader.keys()) and int(uploader['vote_alerts'] or 0) == 1):
+            REGISTRATION_DB.notify_torrent_vote(
+                int(uploader['id']), user['username'], ih, t['name'][:120], final_vote
+            )
+        return self._redirect(f'/manage/torrent/{ih.lower()}')
 
     def _get_torrent_detail(self, ih: str):
         user = self._get_session_user()
@@ -12062,7 +12195,11 @@ class ManageHandler(BaseHTTPRequestHandler):
                 label = 'sent you points'
                 url = '/manage/profile'
             else:
-                if n['type'] == 'followed_upload':
+                if n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
+                    icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
+                    label = 'reacted to your torrent'
+                    url = f'/manage/torrent/{n["info_hash"].lower()}'
+                elif n['type'] == 'followed_upload':
                     icon = '📦'
                     label = 'uploaded a new torrent'
                     url = f'/manage/torrent/{n["info_hash"].lower()}'
@@ -12447,6 +12584,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         if full_privacy_submit:
             show_online = fields.get('show_online', '0') == '1'
             bounty_alerts = fields.get('bounty_alerts', '0') == '1'
+            vote_alerts = fields.get('vote_alerts', '0') == '1'
             link_torrent_activity = fields.get('link_torrent_activity', '0') == '1'
             allow_follow_visibility = fields.get('allow_follow_visibility', '0') == '1'
             gravatar_opt_in = fields.get('gravatar_opt_in', '0') == '1'
@@ -12455,6 +12593,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         else:
             show_online = ('show_online' not in user.keys() or user['show_online'])
             bounty_alerts = ('bounty_alerts' not in user.keys() or user['bounty_alerts'])
+            vote_alerts = (('vote_alerts' in user.keys()) and user['vote_alerts'])
             link_torrent_activity = ('link_torrent_activity' not in user.keys() or user['link_torrent_activity'])
             allow_follow_visibility = ('allow_follow_visibility' not in user.keys() or user['allow_follow_visibility'])
             gravatar_opt_in = ('gravatar_opt_in' in user.keys() and user['gravatar_opt_in'])
@@ -12471,11 +12610,12 @@ class ManageHandler(BaseHTTPRequestHandler):
                 gravatar_hash = parsed_hash
             c.execute(
                 '''UPDATE users
-                   SET show_online=?, bounty_alerts=?, link_torrent_activity=?,
+                   SET show_online=?, bounty_alerts=?, vote_alerts=?, link_torrent_activity=?,
                        allow_follow_visibility=?, gravatar_opt_in=?, gravatar_hash=?
                    WHERE id=?''',
                 (1 if show_online else 0,
                  1 if bounty_alerts else 0,
+                 1 if vote_alerts else 0,
                  1 if link_torrent_activity else 0,
                  1 if allow_follow_visibility else 0,
                  1 if gravatar_opt_in else 0,
@@ -12485,11 +12625,12 @@ class ManageHandler(BaseHTTPRequestHandler):
         else:
             c.execute(
                 '''UPDATE users
-                   SET show_online=?, bounty_alerts=?, link_torrent_activity=?,
+                   SET show_online=?, bounty_alerts=?, vote_alerts=?, link_torrent_activity=?,
                        allow_follow_visibility=?
                    WHERE id=?''',
                 (1 if show_online else 0,
                  1 if bounty_alerts else 0,
+                 1 if vote_alerts else 0,
                  1 if link_torrent_activity else 0,
                  1 if allow_follow_visibility else 0,
                  user['id'])
@@ -13679,7 +13820,18 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
                 n_id   = n['id']
                 n_hash = n['info_hash'].lower()
-                if n['type'] == 'followed_upload':
+                if n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
+                    icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}\')"'
+                        f' aria-label="torrent vote by {from_h}">'
+                        f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> reacted to your torrent</div>'
+                        f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
+                elif n['type'] == 'followed_upload':
                     dropdown_items += (
                         f'<button class="notif-item" '
                         f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}\')"'
@@ -16712,7 +16864,23 @@ def _render_notifications_page(viewer) -> str:
                 f'</div>'
             )
         else:
-            if n['type'] == 'followed_upload':
+            if n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
+                icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
+                url = f'/manage/torrent/{n["info_hash"].lower()}'
+                read_js = f"readNotif({n_id},'{url}')"
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' reacted to your torrent: '
+                    f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                    f'</div>'
+                )
+            elif n['type'] == 'followed_upload':
                 url = f'/manage/torrent/{n["info_hash"].lower()}'
                 read_js = f"readNotif({n_id},'{url}')"
                 rows += (
@@ -16774,6 +16942,11 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     is_owner  = t['uploaded_by_id'] == viewer['id']
     can_del   = is_super or vrole == 'admin' or is_owner
     ih        = t['info_hash']
+    vote_summary = (REGISTRATION_DB.get_torrent_vote_summary(ih, user_id=int(viewer['id']))
+                    if REGISTRATION_DB else {'up': 0, 'down': 0, 'my_vote': 0})
+    vote_up = int(vote_summary.get('up', 0))
+    vote_down = int(vote_summary.get('down', 0))
+    my_vote = int(vote_summary.get('my_vote', 0))
 
     # ── Dynamic back link label ───────────────────────────────
     import re as _re
@@ -16902,6 +17075,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             '</tr>'
             for m in swarm_members
         )
+
         swarm_card = (
             '<div class="card">'
             '<div class="card-title">Members Currently Sharing This Torrent</div>'
@@ -16914,6 +17088,30 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             '</tbody></table></div>'
             '</div>'
         )
+
+    vote_controls = (
+        '<div style="display:flex;flex-direction:column;gap:8px;align-items:flex-start;'
+        'padding-bottom:10px;border-bottom:1px solid var(--border);width:100%">'
+        '<div style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;'
+        'text-transform:uppercase;color:var(--muted)">Community Vote</div>'
+        '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+        f'<form method="POST" action="/manage/torrent/vote" style="display:inline">'
+        f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
+        '<input type="hidden" name="vote" value="up">'
+        f'<button type="submit" class="btn {"btn-green" if my_vote == 1 else ""}" '
+        'style="font-size:1.02rem;padding:10px 14px;line-height:1.1;min-width:88px" '
+        f'title="{"Click again to remove your upvote" if my_vote == 1 else "Upvote this torrent"}">👍 {vote_up}</button>'
+        '</form>'
+        f'<form method="POST" action="/manage/torrent/vote" style="display:inline">'
+        f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
+        '<input type="hidden" name="vote" value="down">'
+        f'<button type="submit" class="btn {"btn-danger" if my_vote == -1 else ""}" '
+        'style="font-size:1.02rem;padding:10px 14px;line-height:1.1;min-width:88px" '
+        f'title="{"Click again to remove your downvote" if my_vote == -1 else "Downvote this torrent"}">👎 {vote_down}</button>'
+        '</form>'
+        '</div>'
+        '</div>'
+    )
 
     body = f'''
   <div class="page-title">{t["name"]}</div>
@@ -16966,6 +17164,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     <div class="card">
       <div class="card-title">Actions</div>
       <div style="display:flex;flex-direction:column;gap:12px;align-items:flex-start">
+        {vote_controls}
         <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet Link</button>
         {peer_update_btn}
         {del_btn}
@@ -17571,6 +17770,10 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<input type="checkbox" name="bounty_alerts" value="1" '
             + ('checked' if ('bounty_alerts' not in viewer.keys() or viewer['bounty_alerts']) else '')
             + '> Bounty alerts (new bounty notifications)</label>'
+            '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
+            '<input type="checkbox" name="vote_alerts" value="1" '
+            + ('checked' if (('vote_alerts' in viewer.keys()) and viewer['vote_alerts']) else '')
+            + '> Torrent vote alerts (when others vote on my uploads)</label>'
             '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9rem">'
             '<input type="checkbox" name="link_torrent_activity" value="1" '
             + ('checked' if ('link_torrent_activity' not in viewer.keys() or viewer['link_torrent_activity']) else '')
