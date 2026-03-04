@@ -18105,7 +18105,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + ('checked' if ('allow_follow_visibility' not in viewer.keys() or viewer['allow_follow_visibility']) else '')
             + '> Allow others to view my followers and following</label>'
             + gravatar_section
-            + '<div><button type="submit" class="btn btn-sm">Save</button></div>'
+            + '<div><button type="submit" class="btn btn-sm btn-accent-rev">Save</button></div>'
             + '</form>'
             + '</div>'
             + '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
