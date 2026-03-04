@@ -10,14 +10,14 @@ Supports both HTTP/HTTPS and UDP trackers, as well as scrape requests.
 Examples:
   ./tracker_test.py --tracker http://open.acgtracker.com:1096/announce
   ./tracker_test.py -t udp://tracker.opentrackr.org:1337/announce
-  ./tracker_test.py -t http://tracker.example.com/announce --event completed
+  ./tracker_test.py -t http://tracker.example.net/announce --event completed
   ./tracker_test.py --tracker udp://tracker2.com:6969 --hash deadbeef... --event started
-  ./tracker_test.py -t http://tracker.example.com/announce --format json --show-peers
-  ./tracker_test.py -t http://tracker.example.com/announce --show-peers --lookup
-  ./tracker_test.py -t http://tracker.example.com/announce --scrape
-  ./tracker_test.py -t http://tracker.example.com/announce --scrape --hash deadbeef...
+  ./tracker_test.py -t http://tracker.example.net/announce --format json --show-peers
+  ./tracker_test.py -t http://tracker.example.net/announce --show-peers --lookup
+  ./tracker_test.py -t http://tracker.example.net/announce --scrape
+  ./tracker_test.py -t http://tracker.example.net/announce --scrape --hash deadbeef...
   ./tracker_test.py -t udp://flaky.tracker.com:1337/announce --retry
-  ./tracker_test.py -t http://tracker.example.com/announce -R 5
+  ./tracker_test.py -t http://tracker.example.net/announce -R 5
 """
 
 import sys
