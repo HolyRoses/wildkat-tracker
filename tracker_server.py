@@ -18710,6 +18710,8 @@ def main():
                         help='Reset super-user passkeys and passkey-required flags, then exit')
     parser.add_argument('--super-user-reset-tfa', action='store_true',
                         help='Reset super-user TFA secret/backup-codes and TFA-required flag, then exit')
+    parser.add_argument('--super-user-reset-ip-lock', action='store_true',
+                        help='Clear super-user IP allowlist entries, then exit')
     parser.add_argument('--auth-break-glass', action='store_true',
                         help='Temporary startup override to bypass passkey enforcement gates')
     parser.add_argument('--auth-break-glass-ttl-minutes', type=int, default=0,
@@ -18845,6 +18847,21 @@ def main():
         db.reset_user_tfa(int(u['id']), actor='cli')
         db.delete_sessions_for_user(int(u['id']))
         print(f"Superuser {args.super_user!r} TFA reset. Sessions cleared.")
+        sys.exit(0)
+
+    # ── Super-user IP lock reset (run offline, exits) ─────────
+    if args.super_user_reset_ip_lock:
+        if not args.super_user:
+            print('Error: --super-user-reset-ip-lock requires --super-user', file=sys.stderr)
+            sys.exit(1)
+        db = RegistrationDB(args.db)
+        u = db.get_user(args.super_user)
+        if not u:
+            print(f'Error: super user {args.super_user!r} not found in {args.db}', file=sys.stderr)
+            sys.exit(1)
+        db.clear_ip_allowlist(int(u['id']), actor='cli')
+        db.delete_sessions_for_user(int(u['id']))
+        print(f"Superuser {args.super_user!r} IP allowlist cleared. Sessions cleared.")
         sys.exit(0)
 
     # ── TLS / HTTPS ──────────────────────────────────────────
