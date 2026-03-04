@@ -185,13 +185,23 @@ Click **Reply** on any comment to post a threaded reply. Replies are visually in
 
 Admins and Super can delete any comment regardless of ownership, and have a **🗑 Delete All Comments** button in the torrent Actions card.
 
+### Comment Voting
+
+Comments on both torrent and bounty threads show compact **👍 / 👎** vote controls and a score chip.
+
+- Click **👍** to upvote, **👎** to downvote.
+- Click your active vote again to remove it.
+- The score shows net state: `upvotes - downvotes`.
+- Hover each thumb to see that thumb's count.
+- Comment owners see the controls in read-only mode (disabled buttons) so layout stays consistent.
+
 ### Comment Locking
 
 Admins and Super can **lock** comments on a torrent from the Actions card. When locked no new comments can be posted. A lock badge appears in the section header.
 
 ### The Notification Bell
 
-When someone replies to your comment, @mentions you, or bounty events occur, a 🔔 badge appears in the navigation bar.
+When someone replies to your comment, @mentions you, votes on your comment (if your alert preference is enabled), or bounty events occur, a 🔔 badge appears in the navigation bar.
 
 **Bell dropdown** — click the bell to see your 5 most recent unread notifications. Each item shows who acted, what they did, and which torrent or bounty it relates to. Click any item to mark it read and navigate to the relevant page.
 
@@ -205,6 +215,8 @@ In addition to comment notifications, the bell delivers bounty-related events:
 |------|-------|
 | 📣 | Someone posted a new bounty |
 | @ | Someone @mentioned you in a bounty comment |
+| 👍 | Someone upvoted your bounty comment (when comment vote alerts are enabled) |
+| 👎 | Someone downvoted your bounty comment (when comment vote alerts are enabled) |
 | 🎯 | Someone claimed your bounty |
 | ✗ | Your claim was rejected |
 | ✅ | Your bounty claim was accepted |
@@ -217,6 +229,8 @@ In addition to comment notifications, the bell delivers bounty-related events:
 | 👥 | Someone started following you |
 | 📦 | Someone you follow uploaded a torrent |
 | ✅ | Someone you follow fulfilled a bounty |
+
+Torrent comment vote notifications use the same stateful wording (`upvoted your comment` / `downvoted your comment`) and open the exact torrent comment anchor.
 
 ---
 
@@ -248,6 +262,8 @@ The Actions card contains:
   - Allow others to send me DMs
   - Show my online status to others
   - Bounty alerts (new bounty notifications)
+  - Torrent vote alerts (when others vote on your uploads)
+  - Comment vote alerts (when others vote on your comments; default off)
   - Allow linking my torrent swarm activity
   - Use Gravatar avatar
   - Gravatar email or MD5 hash input (stores only the hash)
