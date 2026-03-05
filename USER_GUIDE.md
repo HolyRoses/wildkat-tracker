@@ -564,7 +564,7 @@ Top 3 in each category receive 🥇🥈🥉 medals. All usernames link to public
 
 Accessible to Admin and Super only via the **⚙ Admin Panel** link (visible on the dashboard for admins).
 
-The Admin Panel has eleven tabs:
+The Admin Panel has twelve tabs:
 
 ### Torrents Tab
 
@@ -641,6 +641,12 @@ A searchable log of significant actions across the entire system.
 Results show total matching count and up to 200 rows, newest first. Rows are color-coded: red for deletions/bans/penalties, green for logins/registrations/awards, amber for bounty and points activity.
 
 Use the **✕ Clear** button to reset all filters and return to the full unfiltered log.
+
+### Security Tab
+
+The Security tab shows detected abuse events (404 bursts, login fail bursts, WebAuthn/TFA fail bursts, etc.), linked bans, and action history.
+
+You can open an event detail view, review attribution confidence, and perform remediation actions such as clearing active bans or disabling/enabling attributed member accounts.
 
 ---
 
@@ -771,6 +777,45 @@ Behavior notes:
   - only yesterday's row is loaded into **Yesterday**
   - older rows are kept as historical daily totals
 - The **All Time** unique IP metric is a high-water value (highest unique IP count observed in a single day), not a stored all-time deduplicated IP identity set.
+
+### Security Hardening Policies
+
+Security policy settings include threshold/window controls, auto-ban toggles, and enforcement backend:
+
+| Setting | Description |
+|---------|-------------|
+| Enable auto-ban | Automatically create active bans when trigger thresholds are hit |
+| Temporary ban duration | Ban TTL in minutes |
+| Ban enforcement backend | `app` or `system fw` |
+| Firewall script path | Path to helper script used when backend is `system fw` (default `/opt/tracker/tracker_fw.sh`) |
+
+Backend behavior:
+
+- `app`: requests are blocked directly by the application when source IP has an active ban.
+- `system fw`: app calls the firewall helper script (via sudo) to add/remove block rules.
+- If firewall apply fails, the system falls back to app blocking and alerts admins.
+
+For `system fw`, deploy all of the following:
+
+- firewall helper script (`/opt/tracker/tracker_fw.sh`)
+- sudoers policy allowing tracker service user to run that script without a password
+- systemd service override with `ExecStartPre=+/opt/tracker/tracker_fw.sh ensure` so INPUT hooks are present on startup
+
+### Security Trigger Utility
+
+The optional `security_event_trigger.sh` script can be used by operators to generate controlled test events for the Security tab and event log.
+
+Typical use:
+
+```bash
+./security_event_trigger.sh --404 --count 12 --interval 0.05 --base https://tracker.example.net
+```
+
+Other supported test modes include unknown POST bursts, failed login bursts, WebAuthn start failures, and failed TFA challenge bursts.
+
+Use this tool only for test/validation workflows and from trusted operator systems.
+
+> **WARNING:** THIS SCRIPT IS DESIGNED TO TRIP AUTO-BAN THRESHOLDS AND CAN BAN THE IP YOU ARE CURRENTLY USING. WITH FIREWALL ENFORCEMENT ENABLED, BANS CAN BE REHYDRATED AFTER RESTART, SO YOU MAY LOCK YOURSELF OUT OF THE SERVER ENTIRELY. DO NOT RUN THESE TESTS WITHOUT A VERIFIED RECOVERY PATH. MINIMUM RECOVERY OPTIONS ARE CONSOLE/KVM ACCESS OR A SECOND TRUSTED ADMIN SESSION FROM A DIFFERENT IP ADDRESS.
 
 ### Trusted Proxy IP Handling (`X-Forwarded-For`)
 

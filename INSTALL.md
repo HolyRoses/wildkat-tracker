@@ -41,10 +41,14 @@ useradd --system --no-create-home --shell /sbin/nologin tracker
 mkdir -p /opt/tracker
 cp tracker_server.py /opt/tracker/
 cp tracker_query.py /opt/tracker/
+cp tracker_fw.sh /opt/tracker/
+cp 99-tracker-user.sudoers.example /opt/tracker/
 chown -R tracker:tracker /opt/tracker
-chmod 750 /opt/tracker
-chmod 750 /opt/tracker/tracker_server.py
-chmod 750 /opt/tracker/tracker_query.py
+chmod 755 /opt/tracker
+chmod 755 /opt/tracker/tracker_server.py
+chmod 755 /opt/tracker/tracker_query.py
+chmod 755 /opt/tracker/tracker_fw.sh
+chmod 644 /opt/tracker/99-tracker-user.sudoers.example
 ```
 
 ---
@@ -100,8 +104,9 @@ mkdir -p /etc/ssl/acme/tracker.example.net
   --reloadcmd "systemctl restart tracker"
 
 chown -R tracker:tracker /etc/ssl/acme/tracker.example.net
-chmod 750 /etc/ssl/acme/tracker.example.net
-chmod 640 /etc/ssl/acme/tracker.example.net/*
+chmod 755 /etc/ssl/acme/tracker.example.net
+chmod 644 /etc/ssl/acme/tracker.example.net/fullchain.cer
+chmod 600 /etc/ssl/acme/tracker.example.net/*.key
 ```
 
 The `--reloadcmd` wires up automatic tracker restarts whenever the certificate is renewed.
@@ -146,52 +151,65 @@ cp tracker.service /etc/systemd/system/
 systemctl daemon-reload
 ```
 
-Edit the `ExecStart` line in `/etc/systemd/system/tracker.service` to match your deployment.
+Do **not** edit `/etc/systemd/system/tracker.service` directly after installation.
+Create a drop-in override instead:
 
-### Tracker only (no registration mode)
-
+```bash
+sudo systemctl edit tracker.service
 ```
+
+Use `/etc/systemd/system/tracker.service.d/override.conf` for deployment-specific settings.
+
+Example override (registration mode + dedicated file logging + firewall helper compatibility hardening):
+
+```ini
+[Service]
+Environment="WK_TFA_SECRET_KEY=<WK_TFA_SECRET_KEY>"
+ExecStartPre=+/opt/tracker/tracker_fw.sh ensure
+ExecStart=
 ExecStart=/usr/bin/python3 /opt/tracker/tracker_server.py \
+  --registration \
+  --super-user super \
+  --db /opt/tracker/tracker.db \
   --http-port 8080 \
   --https-port 8443 \
+  --redirect-http \
   --udp-port 6969 \
   --web-https-port 443 \
   --web-redirect-http \
   --cert /etc/ssl/acme/tracker.example.net/fullchain.cer \
   --key /etc/ssl/acme/tracker.example.net/tracker.example.net.key \
   --ipv6 \
-  --redirect-http \
   --domain tracker.example.net:8443 \
-  --tracker-id MyTracker \
-  --interval 1800 \
-  --min-interval 60 \
-  --peer-ttl 3600 \
-  --max-peers 200
-```
-
-### With registration mode enabled
-
-```
-ExecStart=/usr/bin/python3 /opt/tracker/tracker_server.py \
-  --http-port 8080 \
-  --https-port 8443 \
-  --udp-port 6969 \
-  --web-https-port 443 \
-  --web-redirect-http \
-  --cert /etc/ssl/acme/tracker.example.net/fullchain.cer \
-  --key /etc/ssl/acme/tracker.example.net/tracker.example.net.key \
-  --ipv6 \
-  --redirect-http \
-  --domain tracker.example.net:8443 \
-  --tracker-id MyTracker \
+  --tracker-id Wildkat \
   --interval 1800 \
   --min-interval 60 \
   --peer-ttl 3600 \
   --max-peers 200 \
-  --registration \
-  --super-user super \
-  --db /opt/tracker/tracker.db
+  --verbose
+
+LogsDirectory=tracker
+LogsDirectoryMode=0750
+StandardOutput=append:/var/log/tracker/tracker.log
+StandardError=append:/var/log/tracker/tracker.log
+
+CapabilityBoundingSet=CAP_SETGID CAP_SETUID CAP_NET_BIND_SERVICE CAP_AUDIT_WRITE CAP_NET_ADMIN
+AmbientCapabilities=CAP_SETGID CAP_SETUID CAP_NET_BIND_SERVICE CAP_AUDIT_WRITE CAP_NET_ADMIN
+SystemCallFilter=
+SystemCallArchitectures=
+
+NoNewPrivileges=no
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectControlGroups=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictSUIDSGID=no
 ```
+
+This override includes:
+- Alternate file logging (`/var/log/tracker/tracker.log`)
+- Firewall bootstrap (`ExecStartPre=+/opt/tracker/tracker_fw.sh ensure`)
+- The hardening adjustments required for firewall helper compatibility
 
 ### The --domain Flag and HTTP Redirect
 
@@ -203,6 +221,41 @@ When `--redirect-http` is enabled, HTTP requests receive a `301 Moved Permanentl
 | 8443 (non-standard) | `tracker.example.net:8443` |
 
 > **Note:** When using non-privileged ports (8080/8443), the `AmbientCapabilities` and `CapabilityBoundingSet` lines in the service unit are not needed and can be removed.
+
+### TFA Encryption Key (Required for New TFA Enrollment)
+
+If you plan to use TFA (TOTP), set `WK_TFA_SECRET_KEY` in a systemd override for `tracker.service`.
+
+Generate a valid Fernet key:
+
+```bash
+python3 - <<'PY'
+from cryptography.fernet import Fernet
+print(Fernet.generate_key().decode())
+PY
+```
+
+Create/update a service override:
+
+```bash
+sudo systemctl edit tracker.service
+```
+
+Add:
+
+```ini
+[Service]
+Environment="WK_TFA_SECRET_KEY=<your key>"
+```
+
+Apply and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart tracker.service
+```
+
+> **Critical:** Keep this key safe and stable. Do not lose it and do not change it after rollout. Existing encrypted TFA secrets depend on this exact key.
 
 ---
 
@@ -269,6 +322,52 @@ sudo systemctl disable netfilter-persistent
 ```
 
 Make sure your OCI Security List rules are correct before doing this.
+
+### Optional: Security Auto-Ban via System Firewall
+
+By default, security bans are enforced in-app (`app` backend).
+To enforce bans at OS firewall level (`system fw` backend), deploy `tracker_fw.sh` and sudoers policy.
+
+Install required firewall packages:
+
+```bash
+sudo apt install -y iptables ipset
+```
+
+Deploy helper files:
+
+```bash
+sudo install -o root -g root -m 750 tracker_fw.sh /opt/tracker/tracker_fw.sh
+
+sudo cp /opt/tracker/99-tracker-user.sudoers.example /etc/sudoers.d/99-tracker-user
+sudo chown root:root /etc/sudoers.d/99-tracker-user
+sudo chmod 440 /etc/sudoers.d/99-tracker-user
+sudo visudo -cf /etc/sudoers.d/99-tracker-user
+```
+
+Use a service drop-in to ensure firewall rules are bootstrapped at startup:
+
+```bash
+sudo systemctl edit tracker.service
+```
+
+Add (or keep) this line in the override:
+
+```ini
+[Service]
+ExecStartPre=+/opt/tracker/tracker_fw.sh ensure
+```
+
+Then in Admin Settings → Security Hardening Policies:
+
+- Set **Ban enforcement backend** to `system fw`
+- Set **Firewall script path** to `/opt/tracker/tracker_fw.sh`
+
+If firewall apply fails, the server automatically falls back to app-level blocking and alerts admins.
+
+Optional: `security_event_trigger.sh` can be used to generate test security events after deployment.
+Usage details are in `USER_GUIDE.md`.
+
 
 ---
 
