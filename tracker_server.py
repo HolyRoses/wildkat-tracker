@@ -338,10 +338,19 @@ def _security_track_probe(ip: str, origin: str, trigger: str, threshold: int, wi
     """
     if not REGISTRATION_DB or not ip:
         return False, None
-    hits = REGISTRATION_DB.security_increment_counter(
-        ip=ip, bucket=trigger, window_seconds=window_sec,
-        path=path, method=method, status=status
-    )
+    try:
+        hits = REGISTRATION_DB.security_increment_counter(
+            ip=ip, bucket=trigger, window_seconds=window_sec,
+            path=path, method=method, status=status
+        )
+    except sqlite3.OperationalError as e:
+        if 'locked' in str(e).lower():
+            log.debug('security probe counter skipped (non-fatal lock): trigger=%s ip=%s', trigger, ip)
+            return False, None
+        raise
+    if hits <= 0:
+        # Counter path skipped due transient contention; do not block request flow.
+        return False, None
     if hits < threshold:
         return False, None
     event_id = REGISTRATION_DB.security_create_event(
@@ -1589,6 +1598,8 @@ class RegistrationDB:
         self._local = threading.local()
         self._restore_lock = threading.Lock()
         self._restore_gen  = 0   # incremented on every restore; forces conn reopen
+        self._last_seen_lock = threading.Lock()
+        self._last_seen_cache = {}
         self._tfa_fernet = _build_tfa_fernet()
         if (os.getenv('WK_TFA_SECRET_KEY', '') or '').strip() and not self._tfa_fernet:
             err = _TFA_FERNET_INIT_ERROR or 'WK_TFA_SECRET_KEY is set but invalid'
@@ -2966,14 +2977,46 @@ class RegistrationDB:
                      self._ts(), tracker[:255], ih_upper)
                 )
                 c.commit()
-                break
+                try:
+                    self._log(actor, 'update_peer_stats', ih_upper,
+                              f'seeds={int(seeds)} peers={int(peers)}')
+                except sqlite3.OperationalError as e:
+                    if 'locked' in str(e).lower():
+                        log.warning('update_peer_stats log skipped (non-fatal lock): %s', e)
+                    else:
+                        raise
+                return True
             except sqlite3.OperationalError as e:
                 if 'locked' in str(e).lower() and attempt < 7:
                     time.sleep(0.25 * (attempt + 1))
                     continue
+                if 'locked' in str(e).lower():
+                    log.warning('update_torrent_peer_snapshot lock after retries (non-fatal): ih=%s err=%s',
+                                ih_upper, e)
+                    return False
                 raise
-        self._log(actor, 'update_peer_stats', ih_upper,
-                  f'seeds={int(seeds)} peers={int(peers)}')
+        return False
+
+    def maintenance_write_window_available(self, timeout_sec: float = 0.15) -> bool:
+        """Best-effort probe used by periodic maintenance to avoid lock pileups."""
+        probe = None
+        try:
+            probe = sqlite3.connect(self._path, timeout=max(0.01, float(timeout_sec)))
+            probe.execute('PRAGMA journal_mode=WAL')
+            probe.execute('PRAGMA busy_timeout=150')
+            probe.execute('BEGIN IMMEDIATE')
+            probe.rollback()
+            return True
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower():
+                return False
+            raise
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:
+                    pass
 
     # ── Top-up system ────────────────────────────────────────
 
@@ -4033,11 +4076,35 @@ class RegistrationDB:
         return self._conn().execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
 
     def update_last_seen(self, uid: int) -> None:
-        """Stamp last_seen for online presence tracking. Fire-and-forget."""
+        """Stamp last_seen for online presence tracking.
+        Throttled and non-blocking to avoid request latency during write contention.
+        """
         try:
-            now = datetime.datetime.now().isoformat(timespec='seconds')
-            self._conn().execute('UPDATE users SET last_seen=? WHERE id=?', (now, uid))
-            self._conn().commit()
+            now_ts = time.monotonic()
+            # Avoid writing on every request; once per minute per user is enough for presence.
+            with self._last_seen_lock:
+                prev = float(self._last_seen_cache.get(int(uid), 0.0))
+                if now_ts - prev < 60.0:
+                    return
+                self._last_seen_cache[int(uid)] = now_ts
+
+            now = self._ts()
+            c = None
+            try:
+                c = sqlite3.connect(self._path, timeout=0.10)
+                c.execute('PRAGMA journal_mode=WAL')
+                c.execute('PRAGMA busy_timeout=100')
+                c.execute('UPDATE users SET last_seen=? WHERE id=?', (now, int(uid)))
+                c.commit()
+            finally:
+                if c is not None:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+        except sqlite3.OperationalError as e:
+            if 'locked' not in str(e).lower():
+                log.warning('update_last_seen failed (non-fatal): %s', e)
         except Exception:
             pass
 
@@ -5867,14 +5934,21 @@ class RegistrationDB:
         return int(cur.rowcount or 0)
 
     def get_active_account_delete_challenge(self, user_id: int):
-        self.expire_account_delete_challenges()
         now = self._ts()
-        return self._conn().execute(
-            "SELECT * FROM account_delete_challenges "
-            "WHERE user_id=? AND status='challenged' AND expires_at>? "
-            "ORDER BY id DESC LIMIT 1",
-            (user_id, now)
-        ).fetchone()
+        try:
+            # Read-only lookup on hot request paths. Expiry cleanup runs via
+            # background maintenance to avoid write contention during GET flows.
+            return self._conn().execute(
+                "SELECT * FROM account_delete_challenges "
+                "WHERE user_id=? AND status='challenged' AND expires_at>? "
+                "ORDER BY id DESC LIMIT 1",
+                (user_id, now)
+            ).fetchone()
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower():
+                log.warning('get_active_account_delete_challenge lock (non-fatal): %s', e)
+                return None
+            raise
 
     def create_account_delete_challenge(self, user_id: int, actor: str,
                                         requested_ip: str, requested_user_agent: str,
@@ -6712,29 +6786,56 @@ class RegistrationDB:
         # adjacent boundaries and effectively raise burst throughput without crossing
         # threshold inside a single bucket window. Accepted for current threat model.
         window_start = now_epoch - (now_epoch % window_seconds)
-        c = self._conn()
-        row = c.execute(
-            'SELECT id,hits FROM security_ip_counters WHERE ip=? AND bucket=? '
-            'AND window_start_epoch=? AND window_seconds=?',
-            (ip, bucket, window_start, window_seconds)
-        ).fetchone()
-        if row:
-            hits = int(row['hits'] or 0) + 1
-            c.execute(
-                'UPDATE security_ip_counters SET hits=?,last_path=?,last_method=?,last_status=?,updated_at=? WHERE id=?',
-                (hits, path[:255], method[:16], int(status or 0), self._ts(), int(row['id']))
-            )
-        else:
-            hits = 1
-            c.execute(
-                'INSERT INTO security_ip_counters '
-                '(ip,bucket,window_start_epoch,window_seconds,hits,last_path,last_method,last_status,updated_at) '
-                'VALUES (?,?,?,?,?,?,?,?,?)',
-                (ip, bucket, window_start, window_seconds, 1,
-                 path[:255], method[:16], int(status or 0), self._ts())
-            )
-        c.commit()
-        return hits
+        # Hot path for hostile traffic: use short-timeout dedicated connection so
+        # lock contention never stalls request handling.
+        for attempt in range(3):
+            c = None
+            try:
+                c = sqlite3.connect(self._path, timeout=0.10)
+                c.row_factory = sqlite3.Row
+                c.execute('PRAGMA journal_mode=WAL')
+                c.execute('PRAGMA busy_timeout=100')
+                row = c.execute(
+                    'SELECT id,hits FROM security_ip_counters WHERE ip=? AND bucket=? '
+                    'AND window_start_epoch=? AND window_seconds=?',
+                    (ip, bucket, window_start, window_seconds)
+                ).fetchone()
+                if row:
+                    hits = int(row['hits'] or 0) + 1
+                    c.execute(
+                        'UPDATE security_ip_counters SET hits=?,last_path=?,last_method=?,last_status=?,updated_at=? WHERE id=?',
+                        (hits, path[:255], method[:16], int(status or 0), self._ts(), int(row['id']))
+                    )
+                else:
+                    hits = 1
+                    c.execute(
+                        'INSERT INTO security_ip_counters '
+                        '(ip,bucket,window_start_epoch,window_seconds,hits,last_path,last_method,last_status,updated_at) '
+                        'VALUES (?,?,?,?,?,?,?,?,?)',
+                        (ip, bucket, window_start, window_seconds, 1,
+                         path[:255], method[:16], int(status or 0), self._ts())
+                    )
+                c.commit()
+                return hits
+            except sqlite3.IntegrityError:
+                if attempt < 2:
+                    time.sleep(0.02 * (attempt + 1))
+                    continue
+                return 0
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower():
+                    if attempt < 2:
+                        time.sleep(0.02 * (attempt + 1))
+                        continue
+                    return 0
+                raise
+            finally:
+                if c is not None:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+        return 0
 
     def security_prune_counters(self, older_than_sec: int = 7200):
         cutoff = int(time.time()) - max(60, int(older_than_sec))
@@ -6818,14 +6919,37 @@ class RegistrationDB:
         c.commit()
         return int(c.execute('SELECT last_insert_rowid()').fetchone()[0])
 
-    def security_get_active_ban(self, ip: str) -> sqlite3.Row | None:
+    def security_get_active_ban(self, ip: str, timeout_sec: float | None = None) -> sqlite3.Row | None:
         now = self._ts()
-        return self._conn().execute(
-            'SELECT * FROM security_bans WHERE ip=? AND state=? '
-            'AND (is_permanent=1 OR expires_at IS NULL OR expires_at>?) '
-            'ORDER BY id DESC LIMIT 1',
-            (ip, 'active', now)
-        ).fetchone()
+        if timeout_sec is None:
+            return self._conn().execute(
+                'SELECT * FROM security_bans WHERE ip=? AND state=? '
+                'AND (is_permanent=1 OR expires_at IS NULL OR expires_at>?) '
+                'ORDER BY id DESC LIMIT 1',
+                (ip, 'active', now)
+            ).fetchone()
+        c = None
+        try:
+            c = sqlite3.connect(self._path, timeout=max(0.01, float(timeout_sec)))
+            c.row_factory = sqlite3.Row
+            c.execute('PRAGMA journal_mode=WAL')
+            c.execute(f'PRAGMA busy_timeout={max(1, int(float(timeout_sec) * 1000.0))}')
+            return c.execute(
+                'SELECT * FROM security_bans WHERE ip=? AND state=? '
+                'AND (is_permanent=1 OR expires_at IS NULL OR expires_at>?) '
+                'ORDER BY id DESC LIMIT 1',
+                (ip, 'active', now)
+            ).fetchone()
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower():
+                return None
+            raise
+        finally:
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
 
     def security_upsert_ban(self, *, ip: str, reason_code: str, reason_detail: str = '',
                             linked_event_id: int | None = None, actor: str = 'system',
@@ -8929,14 +9053,17 @@ def _peer_update_worker():
                 log.debug('PEER queue update failed ih=%s source=%s err=%s',
                           ih, source, details.get('error', 'unknown'))
                 continue
-            REGISTRATION_DB.update_torrent_peer_snapshot(
+            if not REGISTRATION_DB.update_torrent_peer_snapshot(
                 ih,
                 details['seeds'],
                 details['peers'],
                 details.get('downloaded'),
                 details.get('tracker', ''),
                 actor
-            )
+            ):
+                log.debug('PEER queue update deferred (db lock) ih=%s source=%s',
+                          ih, source)
+                continue
             log.debug('PEER queue update success ih=%s source=%s seeds=%s peers=%s',
                       ih, source, details.get('seeds', 0), details.get('peers', 0))
         except Exception:
@@ -9099,7 +9226,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         ip, _ = self._client_ip_info()
         if not REGISTRATION_DB or not ip:
             return False
-        ban = REGISTRATION_DB.security_get_active_ban(ip)
+        # Keep this check fast under DB contention; default to allow on transient lock.
+        ban = REGISTRATION_DB.security_get_active_ban(ip, timeout_sec=0.05)
         if not ban:
             return False
         # App-level blocking applies only when ban backend is app.
@@ -9131,10 +9259,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             ua = self.headers.get('User-Agent', '')
         except Exception:
             ua = ''
-        _security_track_probe(
-            ip, origin, trigger, threshold, window_sec, severity, confidence,
-            path=path, method=method, status=status, user_agent=ua
-        )
+        try:
+            _security_track_probe(
+                ip, origin, trigger, threshold, window_sec, severity, confidence,
+                path=path, method=method, status=status, user_agent=ua
+            )
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower():
+                log.debug('security probe skipped (non-fatal lock): trigger=%s ip=%s', trigger, ip)
+                return
+            raise
 
     def _session_requires_passkey_enroll(self) -> bool:
         if _auth_break_glass_active():
@@ -9209,7 +9343,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         user = self._get_session_user()
         if not user:
             return False
-        return bool(REGISTRATION_DB.get_active_account_delete_challenge(int(user['id'])))
+        try:
+            return bool(REGISTRATION_DB.get_active_account_delete_challenge(int(user['id'])))
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower():
+                log.warning('_session_has_active_delete_challenge lock (non-fatal): %s', e)
+                return False
+            raise
 
     def _resolve_post_auth_redirect(self, user, token: str, policy: dict,
                                     client_ip: str = '', user_agent: str = '') -> str:
@@ -20778,6 +20918,9 @@ def main():
             time.sleep(60)
             STATS.check_rollover()
             if REGISTRATION_DB is not None:
+                if not REGISTRATION_DB.maintenance_write_window_available(timeout_sec=0.15):
+                    log.warning('maintenance cycle skipped (non-fatal): database is locked')
+                    continue
                 try:
                     REGISTRATION_DB.purge_expired_sessions()
                 except Exception as _e:
