@@ -279,6 +279,55 @@ def _security_cfg_bool(key: str, default: bool) -> bool:
         return default
 
 
+def _security_ban_backend_mode() -> str:
+    try:
+        raw = (REGISTRATION_DB.get_setting('security_ban_backend', 'app') if REGISTRATION_DB else 'app') or 'app'
+    except Exception:
+        raw = 'app'
+    mode = str(raw).strip().lower()
+    return mode if mode in ('app', 'system_fw') else 'app'
+
+
+def _security_fw_script_path() -> str:
+    try:
+        raw = (REGISTRATION_DB.get_setting('security_fw_script_path', '/opt/tracker/tracker_fw.sh')
+               if REGISTRATION_DB else '/opt/tracker/tracker_fw.sh')
+    except Exception:
+        raw = '/opt/tracker/tracker_fw.sh'
+    out = str(raw or '').strip()
+    return out or '/opt/tracker/tracker_fw.sh'
+
+
+def _security_firewall_run(action: str, ip: str, *, ban_id: int = 0, reason: str = '') -> tuple[bool, str]:
+    """Execute firewall helper script via sudo; returns (ok, detail)."""
+    action = (action or '').strip().lower()
+    if action not in ('apply', 'clear'):
+        return False, 'invalid_action'
+    try:
+        ip = str(ipaddress.ip_address(str(ip).strip()))
+    except Exception:
+        return False, 'invalid_ip'
+    script_path = _security_fw_script_path()
+    if not os.path.isabs(script_path):
+        return False, 'script_path_not_absolute'
+    if not os.path.exists(script_path):
+        return False, 'script_not_found'
+    cmd = ['sudo', '-n', script_path, action, ip]
+    if ban_id > 0:
+        cmd.extend(['--ban-id', str(int(ban_id))])
+    if reason:
+        cmd.extend(['--reason', str(reason)[:200]])
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+    except Exception as exc:
+        return False, f'exec_error:{exc}'
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or '').strip()
+        return False, (err[:300] if err else f'rc={p.returncode}')
+    detail = (p.stdout or '').strip()
+    return True, (detail[:300] if detail else 'ok')
+
+
 def _security_track_probe(ip: str, origin: str, trigger: str, threshold: int, window_sec: int,
                           severity: str, confidence: float, *, path: str = '',
                           method: str = '', status: int = 0, user_agent: str = '',
@@ -317,7 +366,8 @@ def _security_track_probe(ip: str, origin: str, trigger: str, threshold: int, wi
     )
     if not _security_cfg_bool('security_auto_ban_enabled', True):
         return False, event_id
-    # Apply app-level ban immediately; firewall backend sync can run separately.
+    # Apply ban based on configured enforcement backend.
+    backend_mode = _security_ban_backend_mode()
     temp_minutes = _security_cfg_int('security_ban_temp_minutes', 60, 1, 10080)
     ban_id = REGISTRATION_DB.security_upsert_ban(
         ip=ip,
@@ -327,12 +377,31 @@ def _security_track_probe(ip: str, origin: str, trigger: str, threshold: int, wi
         actor='system',
         temp_minutes=temp_minutes,
         is_permanent=False,
-        firewall_backend=REGISTRATION_DB.get_setting('security_ban_backend', 'app')
+        firewall_backend=('system_fw' if backend_mode == 'system_fw' else 'app')
     )
+    ban_action = 'ban_applied'
+    ban_detail = f'ip={ip} temp_minutes={temp_minutes}'
+    if backend_mode == 'system_fw':
+        fw_ok, fw_detail = _security_firewall_run('apply', ip, ban_id=ban_id, reason=trigger)
+        if fw_ok:
+            REGISTRATION_DB.security_update_ban_firewall(ban_id, 'system_fw', fw_detail)
+            ban_action = 'ban_applied_system_fw'
+            ban_detail = f'ip={ip} temp_minutes={temp_minutes} detail={fw_detail}'
+        else:
+            # Fail-safe fallback: keep app-level blocking active if firewall apply fails.
+            REGISTRATION_DB.security_update_ban_firewall(ban_id, 'app', f'fw_apply_failed:{fw_detail}')
+            ban_action = 'ban_apply_failed_fallback_app'
+            ban_detail = f'ip={ip} temp_minutes={temp_minutes} error={fw_detail}'
+            REGISTRATION_DB.security_notify_admins(
+                'security_firewall_apply_failed',
+                f'Firewall apply failed for ip={ip} trigger={trigger}: {fw_detail}',
+                event_id,
+                actor='system'
+            )
     REGISTRATION_DB.security_link_ban_to_event(event_id, ban_id, auto_action='ban_temp')
     REGISTRATION_DB.security_add_action(
         event_id=event_id, ban_id=ban_id, actor='system',
-        action_type='ban_applied', detail=f'ip={ip} temp_minutes={temp_minutes}'
+        action_type=ban_action, detail=ban_detail
     )
     # Member-attributed alert + optional disable
     event = REGISTRATION_DB.security_get_event(event_id)
@@ -2425,6 +2494,7 @@ class RegistrationDB:
             'stats_persist_interval_sec':   '300',
             'security_auto_ban_enabled':    '1',
             'security_ban_backend':         'app',
+            'security_fw_script_path':      '/opt/tracker/tracker_fw.sh',
             'security_ban_temp_minutes':    '60',
             'security_ban_escalation_enabled': '1',
             'security_member_disable_on_strong_attribution': '1',
@@ -6832,6 +6902,44 @@ class RegistrationDB:
     def security_is_ip_banned(self, ip: str) -> bool:
         return self.security_get_active_ban(ip) is not None
 
+    def security_update_ban_firewall(self, ban_id: int, backend: str, firewall_ref: str = '') -> bool:
+        c = self._conn()
+        row = c.execute('SELECT id FROM security_bans WHERE id=?', (int(ban_id),)).fetchone()
+        if not row:
+            return False
+        c.execute(
+            'UPDATE security_bans SET updated_at=?,firewall_backend=?,firewall_ref=? WHERE id=?',
+            (self._ts(), str(backend)[:32], str(firewall_ref)[:255], int(ban_id))
+        )
+        c.commit()
+        return True
+
+    def security_list_expired_active_bans(self) -> list:
+        now = self._ts()
+        rows = self._conn().execute(
+            'SELECT * FROM security_bans WHERE state=? AND is_permanent=0 AND expires_at IS NOT NULL AND expires_at<=? ORDER BY id ASC',
+            ('active', now)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def security_list_active_bans(self, backend: str | None = None) -> list:
+        now = self._ts()
+        if backend:
+            rows = self._conn().execute(
+                'SELECT * FROM security_bans WHERE state=? AND firewall_backend=? '
+                'AND (is_permanent=1 OR expires_at IS NULL OR expires_at>?) '
+                'ORDER BY id ASC',
+                ('active', str(backend), now)
+            ).fetchall()
+        else:
+            rows = self._conn().execute(
+                'SELECT * FROM security_bans WHERE state=? '
+                'AND (is_permanent=1 OR expires_at IS NULL OR expires_at>?) '
+                'ORDER BY id ASC',
+                ('active', now)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def security_list_events(self, limit: int = 50, offset: int = 0,
                              q_ip: str = '', q_trigger: str = '', q_status: str = '',
                              q_severity: str = '', q_attr: str = '') -> tuple[list, int]:
@@ -8966,7 +9074,19 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _security_ip_blocked(self) -> bool:
         ip, _ = self._client_ip_info()
-        return bool(REGISTRATION_DB and REGISTRATION_DB.security_is_ip_banned(ip))
+        if not REGISTRATION_DB or not ip:
+            return False
+        ban = REGISTRATION_DB.security_get_active_ban(ip)
+        if not ban:
+            return False
+        # App-level blocking applies only when ban backend is app.
+        # system_fw backend relies on external firewall enforcement.
+        backend = 'app'
+        try:
+            backend = str(ban['firewall_backend'] or 'app')
+        except Exception:
+            backend = 'app'
+        return backend != 'system_fw'
 
     def _security_blocked_response(self):
         self.send_response(403)
@@ -9836,6 +9956,19 @@ class ManageHandler(BaseHTTPRequestHandler):
             clear_reason = (fields.get('clear_reason', '') or '').strip()[:240]
             if ban_id <= 0:
                 return self._redirect(f'/manage/admin/security/event/{event_id}?msg=No+linked+ban+found.&msg_type=error')
+            ban_row = REGISTRATION_DB.security_get_ban(ban_id)
+            if not ban_row:
+                return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Ban+record+not+found.&msg_type=error')
+            if str(ban_row.get('firewall_backend') or '') == 'system_fw':
+                fw_ok, fw_detail = _security_firewall_run(
+                    'clear',
+                    str(ban_row.get('ip') or ''),
+                    ban_id=ban_id,
+                    reason=(clear_reason or 'admin_clear')
+                )
+                if not fw_ok:
+                    q = urllib.parse.quote_plus(f'Firewall clear failed: {fw_detail}')
+                    return self._redirect(f'/manage/admin/security/event/{event_id}?msg={q}&msg_type=error')
             ok = REGISTRATION_DB.security_clear_ban(ban_id, user['username'], clear_reason)
             if not ok:
                 return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Ban+already+cleared+or+missing.&msg_type=error')
@@ -12233,6 +12366,20 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.set_setting('stats_persist_enabled', enabled, user['username'])
             REGISTRATION_DB.set_setting('stats_persist_interval_sec', interval, user['username'])
         elif form_id == 'security_policies':
+            backend = str(fields.get('security_ban_backend', 'app') or 'app').strip().lower()
+            if backend not in ('app', 'system_fw'):
+                backend = 'app'
+            fw_script_path = (fields.get('security_fw_script_path', '/opt/tracker/tracker_fw.sh') or '').strip()
+            if backend == 'system_fw':
+                if not fw_script_path:
+                    return self._redirect('/manage/admin?tab=settings&msg=Firewall+script+path+is+required+for+system+fw+backend.&msg_type=error')
+                if not os.path.isabs(fw_script_path):
+                    return self._redirect('/manage/admin?tab=settings&msg=Firewall+script+path+must+be+absolute.&msg_type=error')
+                if not os.path.exists(fw_script_path):
+                    q = urllib.parse.quote_plus(f'Firewall script not found: {fw_script_path}')
+                    return self._redirect(f'/manage/admin?tab=settings&msg={q}&msg_type=error')
+            REGISTRATION_DB.set_setting('security_ban_backend', backend, user['username'])
+            REGISTRATION_DB.set_setting('security_fw_script_path', fw_script_path or '/opt/tracker/tracker_fw.sh', user['username'])
             REGISTRATION_DB.set_setting(
                 'security_auto_ban_enabled',
                 '1' if fields.get('security_auto_ban_enabled') == '1' else '0',
@@ -16098,6 +16245,8 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     login_reveal_lockout_message = settings.get('login_reveal_lockout_message', '0') == '1'
     login_allow_passkey_when_locked = settings.get('login_allow_passkey_when_locked', '1') == '1'
     security_auto_ban_enabled = settings.get('security_auto_ban_enabled', '1') == '1'
+    security_ban_backend = settings.get('security_ban_backend', 'app')
+    security_fw_script_path = settings.get('security_fw_script_path', '/opt/tracker/tracker_fw.sh')
     security_ban_temp_minutes = settings.get('security_ban_temp_minutes', '60')
     security_member_disable = settings.get('security_member_disable_on_strong_attribution', '1') == '1'
     security_admin_alert = settings.get('security_admin_alert_on_member_attribution', '1') == '1'
@@ -16197,6 +16346,17 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             <input type="checkbox" name="security_auto_ban_enabled" value="1" {'checked' if security_auto_ban_enabled else ''}>
             Enable auto-ban when thresholds are exceeded
           </label>
+          <div class="form-group">
+            <label>Ban enforcement backend</label>
+            <select name="security_ban_backend" style="max-width:220px">
+              <option value="app" {'selected' if security_ban_backend == 'app' else ''}>app</option>
+              <option value="system_fw" {'selected' if security_ban_backend == 'system_fw' else ''}>system fw</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Firewall script path (system fw backend)</label>
+            <input type="text" name="security_fw_script_path" value="{_h(security_fw_script_path)}" placeholder="/opt/tracker/tracker_fw.sh">
+          </div>
           <div class="form-group">
             <label>Temporary ban duration (minutes)</label>
             <input type="number" name="security_ban_temp_minutes" value="{security_ban_temp_minutes}" min="1" max="10080" style="width:140px">
@@ -20452,6 +20612,42 @@ def main():
         except Exception as _e:
             log.warning('stats persistence restore failed (non-fatal): %s', _e)
 
+        try:
+            if _security_ban_backend_mode() == 'system_fw':
+                _active_fw = REGISTRATION_DB.security_list_active_bans(backend='system_fw')
+                _ok_count = 0
+                _fail_count = 0
+                for _b in _active_fw:
+                    _ban_id = int(_b.get('id') or 0)
+                    _ip = str(_b.get('ip') or '')
+                    _fw_ok, _fw_detail = _security_firewall_run(
+                        'apply',
+                        _ip,
+                        ban_id=_ban_id,
+                        reason='startup_rehydrate'
+                    )
+                    if _fw_ok:
+                        _ok_count += 1
+                        REGISTRATION_DB.security_update_ban_firewall(_ban_id, 'system_fw', _fw_detail)
+                    else:
+                        _fail_count += 1
+                        REGISTRATION_DB.security_update_ban_firewall(_ban_id, 'app', f'fw_apply_failed:{_fw_detail}')
+                        log.warning('security startup rehydrate failed ban_id=%s ip=%s detail=%s',
+                                    _ban_id, _ip, _fw_detail)
+                    REGISTRATION_DB.security_add_action(
+                        event_id=int(_b.get('linked_event_id') or 0) or None,
+                        ban_id=_ban_id or None,
+                        actor='system',
+                        action_type=('fw_apply_startup_ok' if _fw_ok else 'fw_apply_startup_failed'),
+                        action_result=('ok' if _fw_ok else 'error'),
+                        detail=f'ip={_ip} detail={_fw_detail}'
+                    )
+                if _active_fw:
+                    log.info('security startup rehydrate: applied %d ban(s), failed %d',
+                             _ok_count, _fail_count)
+        except Exception as _e:
+            log.warning('security startup rehydrate failed (non-fatal): %s', _e)
+
     if args.web_https_port:
         if not ssl_ctx:
             print('Error: --web-https-port requires --cert and --key', file=sys.stderr)
@@ -20532,6 +20728,27 @@ def main():
                 except Exception as _e:
                     log.warning('expire_tfa_challenges failed (non-fatal): %s', _e)
                 try:
+                    expired_rows = REGISTRATION_DB.security_list_expired_active_bans()
+                    for _b in expired_rows:
+                        if str(_b.get('firewall_backend') or '') != 'system_fw':
+                            continue
+                        _fw_ok, _fw_detail = _security_firewall_run(
+                            'clear',
+                            str(_b.get('ip') or ''),
+                            ban_id=int(_b.get('id') or 0),
+                            reason='auto_expire'
+                        )
+                        REGISTRATION_DB.security_add_action(
+                            event_id=int(_b.get('linked_event_id') or 0) or None,
+                            ban_id=int(_b.get('id') or 0) or None,
+                            actor='system',
+                            action_type=('fw_clear_expired_ok' if _fw_ok else 'fw_clear_expired_failed'),
+                            action_result=('ok' if _fw_ok else 'error'),
+                            detail=f'ip={_b.get("ip","")} detail={_fw_detail}'
+                        )
+                        if not _fw_ok:
+                            log.warning('security firewall clear on expire failed ban_id=%s ip=%s detail=%s',
+                                        _b.get('id'), _b.get('ip'), _fw_detail)
                     expired_bans = REGISTRATION_DB.security_expire_bans()
                     if expired_bans:
                         log.info('security reconcile: expired %d ban(s)', expired_bans)

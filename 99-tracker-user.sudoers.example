@@ -1,0 +1,7 @@
+# /etc/sudoers.d/99-tracker-user
+#
+# Allow tracker service user to execute the firewall helper without a password.
+# Keep scope narrow; do not grant ALL commands.
+
+Defaults:tracker !requiretty
+tracker ALL=(root) NOPASSWD: /opt/tracker/tracker_fw.sh, /usr/sbin/ipset, /usr/sbin/iptables, /usr/sbin/ip6tables
