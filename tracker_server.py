@@ -6940,6 +6940,29 @@ class RegistrationDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def security_list_bans(self, *, state: str = '', q_ip: str = '', q_backend: str = '',
+                           limit: int = 50, offset: int = 0) -> tuple[list, int]:
+        clauses = []
+        params = []
+        if state:
+            clauses.append('state=?')
+            params.append(state)
+        if q_ip:
+            clauses.append('ip LIKE ?')
+            params.append(f'%{q_ip}%')
+        if q_backend:
+            clauses.append('firewall_backend=?')
+            params.append(q_backend)
+        where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        rows = self._conn().execute(
+            f'SELECT * FROM security_bans {where} ORDER BY id DESC LIMIT ? OFFSET ?',
+            params + [int(limit), int(offset)]
+        ).fetchall()
+        total = self._conn().execute(
+            f'SELECT COUNT(*) FROM security_bans {where}', params
+        ).fetchone()[0]
+        return [dict(r) for r in rows], int(total)
+
     def security_list_events(self, limit: int = 50, offset: int = 0,
                              q_ip: str = '', q_trigger: str = '', q_status: str = '',
                              q_severity: str = '', q_attr: str = '') -> tuple[list, int]:
@@ -9832,19 +9855,21 @@ class ManageHandler(BaseHTTPRequestHandler):
         # security log pagination + search
         spage = _get_named_page_param(self.path, 'spage')
         security_pp = 50
+        s_view = qs.get('sview', ['events'])[0].strip().lower()
+        if s_view not in ('events', 'bans'):
+            s_view = 'events'
         s_trigger = qs.get('strigger', [''])[0].strip()
         s_status = qs.get('sstatus', [''])[0].strip()
         s_ip = qs.get('sip', [''])[0].strip()
-        security_events, security_total = REGISTRATION_DB.security_list_events(
-            limit=security_pp,
-            offset=(spage - 1) * security_pp,
-            q_trigger=s_trigger,
-            q_status=s_status,
-            q_ip=s_ip,
-        )
-        security_total_pages = max(1, (security_total + security_pp - 1) // security_pp)
-        if spage > security_total_pages:
-            spage = security_total_pages
+        security_bans = []
+        if s_view == 'bans':
+            security_events = []
+            security_bans, security_total = REGISTRATION_DB.security_list_bans(
+                state='active', q_ip=s_ip,
+                limit=security_pp,
+                offset=(spage - 1) * security_pp,
+            )
+        else:
             security_events, security_total = REGISTRATION_DB.security_list_events(
                 limit=security_pp,
                 offset=(spage - 1) * security_pp,
@@ -9852,6 +9877,23 @@ class ManageHandler(BaseHTTPRequestHandler):
                 q_status=s_status,
                 q_ip=s_ip,
             )
+        security_total_pages = max(1, (security_total + security_pp - 1) // security_pp)
+        if spage > security_total_pages:
+            spage = security_total_pages
+            if s_view == 'bans':
+                security_bans, security_total = REGISTRATION_DB.security_list_bans(
+                    state='active', q_ip=s_ip,
+                    limit=security_pp,
+                    offset=(spage - 1) * security_pp,
+                )
+            else:
+                security_events, security_total = REGISTRATION_DB.security_list_events(
+                    limit=security_pp,
+                    offset=(spage - 1) * security_pp,
+                    q_trigger=s_trigger,
+                    q_status=s_status,
+                    q_ip=s_ip,
+                )
         trackers     = REGISTRATION_DB.list_magnet_trackers()
         settings     = REGISTRATION_DB.get_all_settings()
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
@@ -9863,7 +9905,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                 tab = 'adduser'
             elif msg.startswith('User ') and ' created as ' in msg:
                 tab = 'adduser'
-            elif qs.get('strigger', [''])[0] or qs.get('sstatus', [''])[0] or qs.get('sip', [''])[0]:
+            elif qs.get('strigger', [''])[0] or qs.get('sstatus', [''])[0] or qs.get('sip', [''])[0] or qs.get('sview', [''])[0]:
                 tab = 'security'
         self._send_html(_render_admin(user, all_torrents, all_users, events, trackers, settings,
                                       page=page, total_pages=total_pages, total=total,
@@ -9877,13 +9919,15 @@ class ManageHandler(BaseHTTPRequestHandler):
                                       eaction=qs.get('eaction', [''])[0],
                                       etarget=qs.get('etarget', [''])[0],
                                       security_events=security_events,
+                                      security_bans=security_bans,
                                       spage=spage,
                                       security_total_pages=security_total_pages,
                                       security_total=security_total,
                                       security_pp=security_pp,
                                       strigger=s_trigger,
                                       sstatus=s_status,
-                                      sip=s_ip))
+                                      sip=s_ip,
+                                      sview=s_view))
 
     def _get_admin_event_detail(self, event_id_raw: str):
         user = self._get_session_user()
@@ -9925,7 +9969,11 @@ class ManageHandler(BaseHTTPRequestHandler):
         back = urllib.parse.unquote(qs.get('back', [''])[0]).strip()
         if not back.startswith('/manage/admin'):
             back = '/manage/admin?tab=security'
-        self._send_html(_render_admin_security_event_detail(user, event, ban, actions, back_url=back))
+        msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        self._send_html(_render_admin_security_event_detail(
+            user, event, ban, actions, back_url=back, msg=msg, msg_type=msg_type
+        ))
 
     def _post_admin_security_action(self):
         user = self._get_session_user()
@@ -16062,7 +16110,8 @@ def _render_admin_event_detail(user, event: dict, back_url: str = '/manage/admin
 
 
 def _render_admin_security_event_detail(user, event: dict, ban: dict | None, actions: list,
-                                        back_url: str = '/manage/admin?tab=security') -> str:
+                                        back_url: str = '/manage/admin?tab=security',
+                                        msg: str = '', msg_type: str = 'error') -> str:
     event_id = int(event.get('id', 0))
     safe_back = back_url if (back_url or '').startswith('/manage/admin') else '/manage/admin?tab=security'
     member_line = '--'
@@ -16156,12 +16205,12 @@ def _render_admin_security_event_detail(user, event: dict, ban: dict | None, act
       <form method="POST" action="/manage/admin/security/action" style="display:inline" data-confirm="Disable attributed member account?">
         <input type="hidden" name="event_id" value="{event_id}">
         <input type="hidden" name="action" value="disable_member">
-        <button class="btn btn-sm btn-danger">Disable Member</button>
+        <button class="btn btn-sm btn-danger" {'' if member_uid > 0 else 'disabled style="opacity:0.95;cursor:not-allowed" title="No attributed member for this event"'}>Disable Member</button>
       </form>
       <form method="POST" action="/manage/admin/security/action" style="display:inline">
         <input type="hidden" name="event_id" value="{event_id}">
         <input type="hidden" name="action" value="enable_member">
-        <button class="btn btn-sm btn-green">Enable Member</button>
+        <button class="btn btn-sm btn-green" {'' if member_uid > 0 else 'disabled style="opacity:0.95;cursor:not-allowed" title="No attributed member for this event"'}>Enable Member</button>
       </form>
     </div>
   </div>
@@ -16172,7 +16221,7 @@ def _render_admin_security_event_detail(user, event: dict, ban: dict | None, act
       {action_rows}
     </table></div>
   </div>'''
-    return _manage_page(f'Security Event #{event_id}', body, user=user)
+    return _manage_page(f'Security Event #{event_id}', body, user=user, msg=msg, msg_type=msg_type)
 
 
 def _render_admin(user, all_torrents: list, all_users: list, events: list,
@@ -16184,12 +16233,14 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   epage: int = 1, ev_total_pages: int = 1, events_pp: int = 50,
                   ev_total: int = 0, eq: str = '', eactor: str = '',
                   eaction: str = '', etarget: str = '',
-                  security_events: list | None = None, spage: int = 1,
+                  security_events: list | None = None, security_bans: list | None = None, spage: int = 1,
                   security_total_pages: int = 1, security_total: int = 0,
                   security_pp: int = 50, strigger: str = '', sstatus: str = '',
-                  sip: str = '') -> str:
+                  sip: str = '', sview: str = 'events') -> str:
     is_super = user['username'] == SUPER_USER
     security_events = security_events or []
+    security_bans = security_bans or []
+    sview = sview if sview in ('events', 'bans') else 'events'
 
     # ── Tracker rows ─────────────────────────────────────────────
     tr_rows = ''
@@ -17320,7 +17371,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     if not ev_rows:
         ev_rows = '<tr><td colspan="5" class="empty">No matching events</td></tr>'
 
-    sec_back_params = [('tab', 'security')]
+    sec_back_params = [('tab', 'security'), ('sview', sview)]
     if spage > 1:
         sec_back_params.append(('spage', str(spage)))
     if strigger:
@@ -17331,7 +17382,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         sec_back_params.append(('sip', sip))
     sec_back_url = '/manage/admin?' + urllib.parse.urlencode(sec_back_params)
     sec_back_enc = urllib.parse.quote(sec_back_url, safe='')
-    sec_page_params = [('tab', 'security')]
+    sec_page_params = [('tab', 'security'), ('sview', sview)]
     if strigger:
         sec_page_params.append(('strigger', strigger))
     if sstatus:
@@ -17372,6 +17423,55 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         )
     if not sec_rows:
         sec_rows = '<tr><td colspan="8" class="empty">No security events</td></tr>'
+
+    sec_ban_rows = ''
+    for sb in security_bans:
+        sb_id = int(sb.get('id') or 0)
+        sb_ip = _h(sb.get('ip', ''))
+        sb_backend = _h(sb.get('firewall_backend', 'app'))
+        sb_reason = _h(sb.get('reason_code', ''))
+        sb_hits = int(sb.get('hit_count') or 0)
+        sb_created = _h(str(sb.get('created_at', ''))[:19].replace('T', ' '))
+        sb_expires = '--' if int(sb.get('is_permanent') or 0) else _h(str(sb.get('expires_at') or '')[:19].replace('T', ' '))
+        linked_event = int(sb.get('linked_event_id') or 0)
+        ev_link = (f'<a href="/manage/admin/security/event/{linked_event}?back={sec_back_enc}" class="btn btn-sm">View &#8594;</a>'
+                   if linked_event > 0 else '<span style="color:var(--muted)">--</span>')
+        sec_ban_rows += (
+            '<tr>'
+            f'<td class="hash" style="white-space:nowrap">{sb_created}</td>'
+            f'<td class="hash">{sb_id}</td>'
+            f'<td class="hash">{sb_ip}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.76rem">{sb_reason}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.76rem">{sb_hits}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem;text-transform:uppercase">{sb_backend}</td>'
+            f'<td class="hash" style="white-space:nowrap">{sb_expires}</td>'
+            f'<td>{ev_link}</td>'
+            '</tr>'
+        )
+    if not sec_ban_rows:
+        sec_ban_rows = '<tr><td colspan="8" class="empty">No active bans</td></tr>'
+
+    sec_title = 'Active Bans' if sview == 'bans' else 'Security Events'
+    sec_table_head = (
+        '<th scope="col" style="white-space:nowrap;width:140px">Time</th>'
+        '<th scope="col">Trigger</th>'
+        '<th scope="col">Source</th>'
+        '<th scope="col">Hits</th>'
+        '<th scope="col">Attributed Member</th>'
+        '<th scope="col">Severity</th>'
+        '<th scope="col">Status</th>'
+        '<th scope="col">Actions</th>'
+        if sview == 'events' else
+        '<th scope="col" style="white-space:nowrap;width:140px">Created</th>'
+        '<th scope="col">Ban ID</th>'
+        '<th scope="col">IP</th>'
+        '<th scope="col">Reason</th>'
+        '<th scope="col">Hits</th>'
+        '<th scope="col">Backend</th>'
+        '<th scope="col">Expires</th>'
+        '<th scope="col">Actions</th>'
+    )
+    sec_table_rows = sec_rows if sview == 'events' else sec_ban_rows
 
     _tab_settings  = ('<button class="tab" onclick="showTab(\'settings\',this)">Settings</button>'
                       if is_super else '')
@@ -17644,48 +17744,33 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
 
   <div class="panel" id="panel-security">
     <div class="card">
-      <div class="card-title">Security Events
+      <div class="card-title">{sec_title}
         <span style="color:var(--muted);font-size:0.78rem;font-weight:400;margin-left:8px">
           {security_total} matching · showing {sec_range_label} · page {spage}/{security_total_pages}
         </span>
       </div>
+      <div class="actions" style="margin-bottom:10px">
+        <a class="btn btn-sm {'btn-primary' if sview == 'events' else ''}" href="/manage/admin?tab=security&sview=events">Events</a>
+        <a class="btn btn-sm {'btn-primary' if sview == 'bans' else ''}" href="/manage/admin?tab=security&sview=bans">Active Bans</a>
+      </div>
       <form method="GET" action="/manage/admin" style="margin-bottom:16px">
         <input type="hidden" name="tab" value="security">
+        <input type="hidden" name="sview" value="{sview}">
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
-          <div class="form-group" style="margin:0;min-width:170px">
-            <label style="font-size:0.75rem">Trigger</label>
-            <input type="text" name="strigger" value="{_h(strigger)}" placeholder="e.g. http_404_burst"
-                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
-                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
-          </div>
-          <div class="form-group" style="margin:0;min-width:130px">
-            <label style="font-size:0.75rem">Status</label>
-            <input type="text" name="sstatus" value="{_h(sstatus)}" placeholder="open"
-                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
-                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
-          </div>
+          {'' if sview == 'bans' else '<div class="form-group" style="margin:0;min-width:170px"><label style="font-size:0.75rem">Trigger</label><input type="text" name="strigger" value="'+_h(strigger)+'" placeholder="e.g. http_404_burst" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem"></div>'}
+          {'' if sview == 'bans' else '<div class="form-group" style="margin:0;min-width:130px"><label style="font-size:0.75rem">Status</label><input type="text" name="sstatus" value="'+_h(sstatus)+'" placeholder="open" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem"></div>'}
           <div class="form-group" style="margin:0;min-width:150px">
             <label style="font-size:0.75rem">Source IP</label>
             <input type="text" name="sip" value="{_h(sip)}" placeholder="1.2.3.4"
-                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
-                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
           </div>
           <button type="submit" class="btn btn-primary" style="white-space:nowrap">🔍 Search</button>
-          <a href="/manage/admin?tab=security" class="btn" style="white-space:nowrap">✕ Clear</a>
+          <a href="/manage/admin?tab=security&sview={sview}" class="btn" style="white-space:nowrap">✕ Clear</a>
         </div>
       </form>
       <div class="table-wrap"><table>
-        <thead><tr>
-          <th scope="col" style="white-space:nowrap;width:140px">Time</th>
-          <th scope="col">Trigger</th>
-          <th scope="col">Source</th>
-          <th scope="col">Hits</th>
-          <th scope="col">Attributed Member</th>
-          <th scope="col">Severity</th>
-          <th scope="col">Status</th>
-          <th scope="col">Actions</th>
-        </tr></thead>
-        <tbody>{sec_rows}</tbody>
+        <thead><tr>{sec_table_head}</tr></thead>
+        <tbody>{sec_table_rows}</tbody>
       </table></div>
       {_pagination_html(spage, security_total_pages, sec_page_base, page_param='spage')}
     </div>
