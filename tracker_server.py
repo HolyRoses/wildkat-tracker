@@ -237,6 +237,136 @@ def _ip_is_trusted_proxy(addr: str) -> bool:
         return False
     return any(ip_obj in net for net in TRUSTED_PROXY_NETWORKS)
 
+
+def _resolved_client_ip(socket_ip: str, headers) -> tuple[str, str]:
+    """Resolve effective client IP with strict trusted-proxy XFF handling."""
+    xff_header = ''
+    try:
+        xff_header = headers.get('X-Forwarded-For', '') if headers else ''
+    except Exception:
+        xff_header = ''
+    if xff_header and _ip_is_trusted_proxy(socket_ip):
+        forwarded = _first_valid_xff_ip(xff_header)
+        if forwarded:
+            return forwarded, 'xff_trusted_proxy'
+    return socket_ip, 'socket'
+
+
+def _security_cfg_int(key: str, default: int, lo: int, hi: int) -> int:
+    # Intentionally uncached: operators can change security thresholds at runtime
+    # and we apply them immediately on the next probe. This keeps policy behavior
+    # deterministic during active incidents. If profiling later shows this read path
+    # is a bottleneck, add a short TTL cache with explicit invalidation semantics.
+    try:
+        if REGISTRATION_DB:
+            raw = REGISTRATION_DB.get_setting(key, str(default))
+        else:
+            raw = str(default)
+        return max(lo, min(hi, int(raw)))
+    except Exception:
+        return default
+
+
+def _security_cfg_bool(key: str, default: bool) -> bool:
+    # See _security_cfg_int note above: intentionally no TTL cache at this time.
+    try:
+        if REGISTRATION_DB:
+            raw = REGISTRATION_DB.get_setting(key, '1' if default else '0')
+        else:
+            raw = '1' if default else '0'
+        return str(raw) == '1'
+    except Exception:
+        return default
+
+
+def _security_track_probe(ip: str, origin: str, trigger: str, threshold: int, window_sec: int,
+                          severity: str, confidence: float, *, path: str = '',
+                          method: str = '', status: int = 0, user_agent: str = '',
+                          actor: str = 'system') -> tuple[bool, int | None]:
+    """
+    Record a probe hit and optionally create an event + active ban.
+    Returns (did_ban, event_id).
+    """
+    if not REGISTRATION_DB or not ip:
+        return False, None
+    hits = REGISTRATION_DB.security_increment_counter(
+        ip=ip, bucket=trigger, window_seconds=window_sec,
+        path=path, method=method, status=status
+    )
+    if hits < threshold:
+        return False, None
+    event_id = REGISTRATION_DB.security_create_event(
+        source_ip=ip,
+        source_origin=origin,
+        trigger_type=trigger,
+        severity=severity,
+        confidence=confidence,
+        window_seconds=window_sec,
+        hit_count=hits,
+        threshold_hit=threshold,
+        request_sample=f'status={status} method={method} path={path}',
+        user_agent_sample=user_agent,
+        path_sample=path,
+        method_sample=method,
+        auto_action='none',
+        status='open',
+    )
+    REGISTRATION_DB.security_add_action(
+        event_id=event_id, actor=actor, action_type='event_detected',
+        detail=f'trigger={trigger} hits={hits}/{threshold} window={window_sec}s'
+    )
+    if not _security_cfg_bool('security_auto_ban_enabled', True):
+        return False, event_id
+    # Apply app-level ban immediately; firewall backend sync can run separately.
+    temp_minutes = _security_cfg_int('security_ban_temp_minutes', 60, 1, 10080)
+    ban_id = REGISTRATION_DB.security_upsert_ban(
+        ip=ip,
+        reason_code=trigger,
+        reason_detail=f'auto ban from trigger {trigger} hits={hits}',
+        linked_event_id=event_id,
+        actor='system',
+        temp_minutes=temp_minutes,
+        is_permanent=False,
+        firewall_backend=REGISTRATION_DB.get_setting('security_ban_backend', 'app')
+    )
+    REGISTRATION_DB.security_link_ban_to_event(event_id, ban_id, auto_action='ban_temp')
+    REGISTRATION_DB.security_add_action(
+        event_id=event_id, ban_id=ban_id, actor='system',
+        action_type='ban_applied', detail=f'ip={ip} temp_minutes={temp_minutes}'
+    )
+    # Member-attributed alert + optional disable
+    event = REGISTRATION_DB.security_get_event(event_id)
+    if event and str(event.get('member_confidence', 'none')) in ('possible', 'strong'):
+        if _security_cfg_bool('security_admin_alert_on_member_attribution', True):
+            msg = (f"Security event attributed ({event['member_confidence']}) "
+                   f"ip={ip} trigger={trigger}")
+            REGISTRATION_DB.security_notify_admins('security_member_attributed_attack', msg, event_id, actor='system')
+        if (str(event.get('member_confidence', 'none')) == 'strong'
+                and _security_cfg_bool('security_member_disable_on_strong_attribution', True)
+                and event.get('member_user_id')):
+            if REGISTRATION_DB.security_disable_user_by_id(int(event['member_user_id']), 'system',
+                                                           reason=f'security_event_id={event_id} trigger={trigger}'):
+                REGISTRATION_DB.security_add_action(
+                    event_id=event_id, ban_id=ban_id, actor='system',
+                    action_type='account_disabled', detail=f"user_id={event['member_user_id']} strong attribution"
+                )
+                REGISTRATION_DB.security_notify_admins(
+                    'security_account_disabled_auto',
+                    f"Account disabled from security attribution user_id={event['member_user_id']}",
+                    event_id,
+                    actor='system'
+                )
+    if severity in ('high', 'critical'):
+        REGISTRATION_DB.security_notify_admins(
+            'security_auto_ban_applied',
+            f'Auto-ban applied for ip={ip} trigger={trigger}',
+            event_id,
+            actor='system'
+        )
+    log.warning('SECURITY auto-ban ip=%s trigger=%s hits=%s threshold=%s event_id=%s ban_id=%s',
+                ip, trigger, hits, threshold, event_id, ban_id)
+    return True, event_id
+
 # ─────────────────────────────────────────────────────────────
 # Peer registry  (thread-safe in-memory store)
 # ─────────────────────────────────────────────────────────────
@@ -1633,6 +1763,99 @@ class RegistrationDB:
             );
             CREATE INDEX IF NOT EXISTS idx_tracker_stats_daily_day
               ON tracker_stats_daily(day DESC);
+            CREATE TABLE IF NOT EXISTS security_events (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at          TEXT    NOT NULL,
+                updated_at          TEXT    NOT NULL,
+                source_ip           TEXT    NOT NULL,
+                source_ip_version   INTEGER NOT NULL DEFAULT 4,
+                source_origin       TEXT    NOT NULL DEFAULT 'socket',
+                trigger_type        TEXT    NOT NULL,
+                severity            TEXT    NOT NULL DEFAULT 'medium',
+                confidence          REAL    NOT NULL DEFAULT 0.0,
+                window_seconds      INTEGER NOT NULL DEFAULT 1,
+                hit_count           INTEGER NOT NULL DEFAULT 1,
+                threshold_hit       INTEGER NOT NULL DEFAULT 0,
+                request_sample      TEXT    NOT NULL DEFAULT '',
+                user_agent_sample   TEXT    NOT NULL DEFAULT '',
+                path_sample         TEXT    NOT NULL DEFAULT '',
+                method_sample       TEXT    NOT NULL DEFAULT '',
+                status              TEXT    NOT NULL DEFAULT 'open',
+                auto_action         TEXT    NOT NULL DEFAULT '',
+                ban_id              INTEGER,
+                member_user_id      INTEGER,
+                member_confidence   TEXT    NOT NULL DEFAULT 'none',
+                member_evidence     TEXT    NOT NULL DEFAULT '',
+                notes               TEXT    NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_security_events_created
+              ON security_events(id DESC);
+            CREATE INDEX IF NOT EXISTS idx_security_events_ip_created
+              ON security_events(source_ip, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_security_events_status_created
+              ON security_events(status, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_security_events_trigger_created
+              ON security_events(trigger_type, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_security_events_member_created
+              ON security_events(member_user_id, id DESC);
+            CREATE TABLE IF NOT EXISTS security_bans (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at        TEXT    NOT NULL,
+                updated_at        TEXT    NOT NULL,
+                ip                TEXT    NOT NULL,
+                ip_version        INTEGER NOT NULL DEFAULT 4,
+                reason_code       TEXT    NOT NULL,
+                reason_detail     TEXT    NOT NULL DEFAULT '',
+                state             TEXT    NOT NULL DEFAULT 'active',
+                is_permanent      INTEGER NOT NULL DEFAULT 0,
+                expires_at        TEXT,
+                created_by        TEXT    NOT NULL DEFAULT 'system',
+                cleared_at        TEXT,
+                cleared_by        TEXT,
+                clear_reason      TEXT    NOT NULL DEFAULT '',
+                linked_event_id   INTEGER,
+                firewall_backend  TEXT    NOT NULL DEFAULT 'app',
+                firewall_ref      TEXT    NOT NULL DEFAULT '',
+                hit_count         INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_security_bans_ip_active
+              ON security_bans(ip, state) WHERE state='active';
+            CREATE INDEX IF NOT EXISTS idx_security_bans_created
+              ON security_bans(id DESC);
+            CREATE INDEX IF NOT EXISTS idx_security_bans_event
+              ON security_bans(linked_event_id);
+            CREATE TABLE IF NOT EXISTS security_actions (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at    TEXT    NOT NULL,
+                event_id      INTEGER,
+                ban_id        INTEGER,
+                actor         TEXT    NOT NULL DEFAULT 'system',
+                action_type   TEXT    NOT NULL,
+                action_result TEXT    NOT NULL DEFAULT 'ok',
+                detail        TEXT    NOT NULL DEFAULT '',
+                before_state  TEXT    NOT NULL DEFAULT '',
+                after_state   TEXT    NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_security_actions_event
+              ON security_actions(event_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_security_actions_ban
+              ON security_actions(ban_id, id DESC);
+            CREATE TABLE IF NOT EXISTS security_ip_counters (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip                  TEXT    NOT NULL,
+                bucket              TEXT    NOT NULL,
+                window_start_epoch  INTEGER NOT NULL,
+                window_seconds      INTEGER NOT NULL,
+                hits                INTEGER NOT NULL DEFAULT 0,
+                last_path           TEXT    NOT NULL DEFAULT '',
+                last_method         TEXT    NOT NULL DEFAULT '',
+                last_status         INTEGER NOT NULL DEFAULT 0,
+                updated_at          TEXT    NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_security_ip_counter_unique
+              ON security_ip_counters(ip, bucket, window_start_epoch, window_seconds);
+            CREATE INDEX IF NOT EXISTS idx_security_ip_counter_updated
+              ON security_ip_counters(updated_at);
         ''')
         # ── Migrations ────────────────────────────────────────
         cols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
@@ -2200,6 +2423,25 @@ class RegistrationDB:
             'peer_query_auto_upload_cap':   '5',
             'stats_persist_enabled':        '0',
             'stats_persist_interval_sec':   '300',
+            'security_auto_ban_enabled':    '1',
+            'security_ban_backend':         'app',
+            'security_ban_temp_minutes':    '60',
+            'security_ban_escalation_enabled': '1',
+            'security_member_disable_on_strong_attribution': '1',
+            'security_admin_alert_on_member_attribution': '1',
+            'security_404_burst_enabled':   '1',
+            'security_404_burst_threshold': '5',
+            'security_404_burst_window_sec': '1',
+            'security_login_fail_burst_threshold': '10',
+            'security_login_fail_window_sec': '60',
+            'security_unknown_post_threshold': '8',
+            'security_unknown_post_window_sec': '10',
+            'security_csrf_fail_threshold':  '10',
+            'security_csrf_fail_window_sec': '60',
+            'security_webauthn_fail_threshold': '10',
+            'security_webauthn_fail_window_sec': '120',
+            'security_tfa_fail_threshold':   '10',
+            'security_tfa_fail_window_sec':  '120',
             'webauthn_login_enabled':       '0',
             'webauthn_enforce_sitewide':    '0',
             'webauthn_enforce_admins':      '0',
@@ -5355,12 +5597,10 @@ class RegistrationDB:
         ).fetchone()
         old_vote = int(row['vote']) if row else 0
         action = 'added'
-        final_vote = vote_val
         now_ts = self._ts()
         if row and old_vote == vote_val:
             c.execute('DELETE FROM torrent_votes WHERE id=?', (row['id'],))
             action = 'removed'
-            final_vote = 0
         elif row:
             c.execute(
                 'UPDATE torrent_votes SET vote=?, updated_at=? WHERE id=?',
@@ -6383,6 +6623,317 @@ class RegistrationDB:
             (int(event_id),)
         ).fetchone()
         return dict(row) if row else None
+
+    # ── Security Events / Bans ───────────────────────────────
+
+    def security_increment_counter(self, ip: str, bucket: str, window_seconds: int,
+                                   path: str = '', method: str = '', status: int = 0) -> int:
+        now_epoch = int(time.time())
+        window_seconds = max(1, int(window_seconds or 1))
+        # Fixed-window counter by design. Known trade-off: requests can straddle
+        # adjacent boundaries and effectively raise burst throughput without crossing
+        # threshold inside a single bucket window. Accepted for current threat model.
+        window_start = now_epoch - (now_epoch % window_seconds)
+        c = self._conn()
+        row = c.execute(
+            'SELECT id,hits FROM security_ip_counters WHERE ip=? AND bucket=? '
+            'AND window_start_epoch=? AND window_seconds=?',
+            (ip, bucket, window_start, window_seconds)
+        ).fetchone()
+        if row:
+            hits = int(row['hits'] or 0) + 1
+            c.execute(
+                'UPDATE security_ip_counters SET hits=?,last_path=?,last_method=?,last_status=?,updated_at=? WHERE id=?',
+                (hits, path[:255], method[:16], int(status or 0), self._ts(), int(row['id']))
+            )
+        else:
+            hits = 1
+            c.execute(
+                'INSERT INTO security_ip_counters '
+                '(ip,bucket,window_start_epoch,window_seconds,hits,last_path,last_method,last_status,updated_at) '
+                'VALUES (?,?,?,?,?,?,?,?,?)',
+                (ip, bucket, window_start, window_seconds, 1,
+                 path[:255], method[:16], int(status or 0), self._ts())
+            )
+        c.commit()
+        return hits
+
+    def security_prune_counters(self, older_than_sec: int = 7200):
+        cutoff = int(time.time()) - max(60, int(older_than_sec))
+        c = self._conn()
+        c.execute('DELETE FROM security_ip_counters WHERE window_start_epoch<?', (cutoff,))
+        c.commit()
+
+    def security_resolve_member_attribution(self, ip: str) -> tuple[int | None, str, str]:
+        """Return (member_user_id, confidence, evidence_summary)."""
+        c = self._conn()
+        login_rows = c.execute(
+            'SELECT user_id,MAX(logged_in_at) AS last_seen FROM login_history WHERE ip_address=? GROUP BY user_id ORDER BY last_seen DESC LIMIT 3',
+            (ip,)
+        ).fetchall()
+        allow_rows = c.execute(
+            'SELECT DISTINCT user_id FROM ip_allowlist WHERE ip_address=? ORDER BY user_id ASC LIMIT 3',
+            (ip,)
+        ).fetchall()
+        login_ids = [int(r['user_id']) for r in login_rows if r['user_id'] is not None]
+        allow_ids = [int(r['user_id']) for r in allow_rows if r['user_id'] is not None]
+        if not login_ids and not allow_ids:
+            return None, 'none', ''
+        common = set(login_ids).intersection(set(allow_ids))
+        if len(common) == 1:
+            uid = list(common)[0]
+            return uid, 'strong', f'ip matched login_history and ip_allowlist for user_id={uid}'
+        if len(login_ids) == 1 and not allow_ids:
+            uid = login_ids[0]
+            return uid, 'possible', f'ip matched login_history for user_id={uid}'
+        if len(allow_ids) == 1 and not login_ids:
+            uid = allow_ids[0]
+            return uid, 'possible', f'ip matched ip_allowlist for user_id={uid}'
+        # ambiguous multi-user mapping
+        return None, 'none', f'ip mapping ambiguous login_ids={login_ids} allow_ids={allow_ids}'
+
+    def security_create_event(self, *, source_ip: str, source_origin: str,
+                              trigger_type: str, severity: str, confidence: float,
+                              window_seconds: int, hit_count: int, threshold_hit: int,
+                              request_sample: str = '', user_agent_sample: str = '',
+                              path_sample: str = '', method_sample: str = '',
+                              auto_action: str = '', status: str = 'open') -> int:
+        ip_version = 6 if ':' in (source_ip or '') else 4
+        member_user_id, member_confidence, member_evidence = self.security_resolve_member_attribution(source_ip)
+        c = self._conn()
+        ts = self._ts()
+        c.execute(
+            '''INSERT INTO security_events
+               (created_at,updated_at,source_ip,source_ip_version,source_origin,trigger_type,
+                severity,confidence,window_seconds,hit_count,threshold_hit,request_sample,
+                user_agent_sample,path_sample,method_sample,status,auto_action,
+                member_user_id,member_confidence,member_evidence)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (ts, ts, source_ip[:64], ip_version, source_origin[:32], trigger_type[:64],
+             severity[:16], float(confidence), int(window_seconds), int(hit_count), int(threshold_hit),
+             request_sample[:500], user_agent_sample[:255], path_sample[:255], method_sample[:16],
+             status[:32], auto_action[:32], member_user_id, member_confidence[:16], member_evidence[:500])
+        )
+        c.commit()
+        return int(c.execute('SELECT last_insert_rowid()').fetchone()[0])
+
+    def security_link_ban_to_event(self, event_id: int, ban_id: int, auto_action: str = 'ban_temp'):
+        c = self._conn()
+        c.execute(
+            'UPDATE security_events SET ban_id=?,auto_action=?,status=?,updated_at=? WHERE id=?',
+            (int(ban_id), auto_action[:32], 'actioned', self._ts(), int(event_id))
+        )
+        c.commit()
+
+    def security_add_action(self, *, event_id: int | None = None, ban_id: int | None = None,
+                            actor: str = 'system', action_type: str,
+                            action_result: str = 'ok', detail: str = '',
+                            before_state: str = '', after_state: str = '') -> int:
+        c = self._conn()
+        c.execute(
+            'INSERT INTO security_actions '
+            '(created_at,event_id,ban_id,actor,action_type,action_result,detail,before_state,after_state) '
+            'VALUES (?,?,?,?,?,?,?,?,?)',
+            (self._ts(), event_id, ban_id, actor[:64], action_type[:64], action_result[:16],
+             detail[:1000], before_state[:1000], after_state[:1000])
+        )
+        c.commit()
+        return int(c.execute('SELECT last_insert_rowid()').fetchone()[0])
+
+    def security_get_active_ban(self, ip: str) -> sqlite3.Row | None:
+        now = self._ts()
+        return self._conn().execute(
+            'SELECT * FROM security_bans WHERE ip=? AND state=? '
+            'AND (is_permanent=1 OR expires_at IS NULL OR expires_at>?) '
+            'ORDER BY id DESC LIMIT 1',
+            (ip, 'active', now)
+        ).fetchone()
+
+    def security_upsert_ban(self, *, ip: str, reason_code: str, reason_detail: str = '',
+                            linked_event_id: int | None = None, actor: str = 'system',
+                            temp_minutes: int = 60, is_permanent: bool = False,
+                            firewall_backend: str = 'app') -> int:
+        c = self._conn()
+        now = self._ts()
+        try:
+            now_dt = datetime.datetime.fromisoformat(now)
+        except Exception:
+            now_dt = datetime.datetime.now()
+        active = self.security_get_active_ban(ip)
+        if active:
+            hit_count = int(active['hit_count'] or 0) + 1
+            expires_at = active['expires_at']
+            if not int(active['is_permanent'] or 0):
+                try:
+                    dt = datetime.datetime.fromisoformat(str(expires_at)) if expires_at else None
+                except Exception:
+                    dt = None
+                new_exp = now_dt + datetime.timedelta(minutes=max(1, int(temp_minutes)))
+                if not dt or new_exp > dt:
+                    expires_at = new_exp.isoformat(timespec='seconds')
+            c.execute(
+                'UPDATE security_bans SET updated_at=?,reason_code=?,reason_detail=?,hit_count=?,expires_at=?,linked_event_id=? WHERE id=?',
+                (now, reason_code[:64], reason_detail[:500], hit_count, expires_at, linked_event_id, int(active['id']))
+            )
+            c.commit()
+            return int(active['id'])
+        expires_at = None if is_permanent else (
+            now_dt + datetime.timedelta(minutes=max(1, int(temp_minutes)))
+        ).isoformat(timespec='seconds')
+        c.execute(
+            'INSERT INTO security_bans '
+            '(created_at,updated_at,ip,ip_version,reason_code,reason_detail,state,is_permanent,expires_at,created_by,linked_event_id,firewall_backend,hit_count) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (now, now, ip[:64], (6 if ':' in ip else 4), reason_code[:64], reason_detail[:500],
+             'active', (1 if is_permanent else 0), expires_at, actor[:64], linked_event_id,
+             firewall_backend[:32], 1)
+        )
+        c.commit()
+        return int(c.execute('SELECT last_insert_rowid()').fetchone()[0])
+
+    def security_clear_ban(self, ban_id: int, actor: str, clear_reason: str = '') -> bool:
+        c = self._conn()
+        row = c.execute('SELECT * FROM security_bans WHERE id=?', (int(ban_id),)).fetchone()
+        if not row:
+            return False
+        if str(row['state'] or '') != 'active':
+            return False
+        c.execute(
+            'UPDATE security_bans SET state=?,updated_at=?,cleared_at=?,cleared_by=?,clear_reason=? WHERE id=?',
+            ('cleared', self._ts(), self._ts(), actor[:64], clear_reason[:500], int(ban_id))
+        )
+        c.commit()
+        return True
+
+    def security_expire_bans(self) -> int:
+        now = self._ts()
+        c = self._conn()
+        rows = c.execute(
+            'SELECT id FROM security_bans WHERE state=? AND is_permanent=0 AND expires_at IS NOT NULL AND expires_at<=?',
+            ('active', now)
+        ).fetchall()
+        if not rows:
+            return 0
+        ids = [int(r['id']) for r in rows]
+        placeholders = ','.join('?' for _ in ids)
+        c.execute(f'UPDATE security_bans SET state=?,updated_at=? WHERE id IN ({placeholders})',
+                  ['expired', now] + ids)
+        c.commit()
+        return len(ids)
+
+    def security_is_ip_banned(self, ip: str) -> bool:
+        return self.security_get_active_ban(ip) is not None
+
+    def security_list_events(self, limit: int = 50, offset: int = 0,
+                             q_ip: str = '', q_trigger: str = '', q_status: str = '',
+                             q_severity: str = '', q_attr: str = '') -> tuple[list, int]:
+        clauses = []
+        params = []
+        if q_ip:
+            clauses.append('source_ip LIKE ?')
+            params.append(f'%{q_ip}%')
+        if q_trigger:
+            clauses.append('trigger_type LIKE ?')
+            params.append(f'%{q_trigger}%')
+        if q_status:
+            clauses.append('status=?')
+            params.append(q_status)
+        if q_severity:
+            clauses.append('severity=?')
+            params.append(q_severity)
+        if q_attr == 'yes':
+            clauses.append("member_confidence IN ('possible','strong')")
+        elif q_attr == 'no':
+            clauses.append("member_confidence='none'")
+        where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        rows = self._conn().execute(
+            f'SELECT * FROM security_events {where} ORDER BY id DESC LIMIT ? OFFSET ?',
+            params + [int(limit), int(offset)]
+        ).fetchall()
+        total = self._conn().execute(
+            f'SELECT COUNT(*) FROM security_events {where}', params
+        ).fetchone()[0]
+        return [dict(r) for r in rows], int(total)
+
+    def security_get_event(self, event_id: int):
+        row = self._conn().execute('SELECT * FROM security_events WHERE id=?', (int(event_id),)).fetchone()
+        return dict(row) if row else None
+
+    def security_get_ban(self, ban_id: int):
+        row = self._conn().execute('SELECT * FROM security_bans WHERE id=?', (int(ban_id),)).fetchone()
+        return dict(row) if row else None
+
+    def security_list_actions(self, event_id: int | None = None, ban_id: int | None = None, limit: int = 200) -> list:
+        if event_id is not None:
+            rows = self._conn().execute(
+                'SELECT * FROM security_actions WHERE event_id=? ORDER BY id DESC LIMIT ?',
+                (int(event_id), int(limit))
+            ).fetchall()
+        elif ban_id is not None:
+            rows = self._conn().execute(
+                'SELECT * FROM security_actions WHERE ban_id=? ORDER BY id DESC LIMIT ?',
+                (int(ban_id), int(limit))
+            ).fetchall()
+        else:
+            rows = self._conn().execute(
+                'SELECT * FROM security_actions ORDER BY id DESC LIMIT ?',
+                (int(limit),)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def security_admin_user_ids(self) -> list[int]:
+        rows = self._conn().execute(
+            'SELECT id,username,is_admin FROM users WHERE is_disabled=0'
+        ).fetchall()
+        out = []
+        for r in rows:
+            if int(r['is_admin'] or 0) == 1 or str(r['username'] or '') == SUPER_USER:
+                out.append(int(r['id']))
+        return out
+
+    def security_notify_admins(self, ntype: str, message: str, event_id: int, actor: str = 'system'):
+        sec_ref = f'SECURITY:{int(event_id)}'
+        for uid in self.security_admin_user_ids():
+            self.add_notification(uid, ntype, actor, sec_ref, message[:120], int(event_id))
+
+    def security_disable_user_by_id(self, user_id: int, actor: str, reason: str = '') -> bool:
+        u = self.get_user_by_id(int(user_id))
+        if not u:
+            return False
+        if str(u['username']) == SUPER_USER:
+            return False
+        self._conn().execute('UPDATE users SET is_disabled=1 WHERE id=?', (int(user_id),))
+        self._conn().commit()
+        self._log(actor, 'disable_user_security', str(u['username']), reason[:255])
+        return True
+
+    def security_enable_user_by_id(self, user_id: int, actor: str, reason: str = '') -> bool:
+        u = self.get_user_by_id(int(user_id))
+        if not u:
+            return False
+        self._conn().execute('UPDATE users SET is_disabled=0 WHERE id=?', (int(user_id),))
+        self._conn().commit()
+        self._log(actor, 'enable_user_security', str(u['username']), reason[:255])
+        return True
+
+    def security_close_event(self, event_id: int, actor: str, detail: str = 'marked_resolved') -> bool:
+        c = self._conn()
+        row = c.execute('SELECT id,ban_id FROM security_events WHERE id=?', (int(event_id),)).fetchone()
+        if not row:
+            return False
+        c.execute(
+            'UPDATE security_events SET status=?,updated_at=? WHERE id=?',
+            ('resolved', self._ts(), int(event_id))
+        )
+        c.commit()
+        self.security_add_action(
+            event_id=int(event_id),
+            ban_id=int(row['ban_id'] or 0) or None,
+            action_type='manual_close_event',
+            actor=actor,
+            detail=detail[:255]
+        )
+        return True
 
 
 
@@ -8401,6 +8952,39 @@ class ManageHandler(BaseHTTPRequestHandler):
     def _current_valid_session_token(self) -> str:
         return getattr(self, '_valid_token', '') or self._get_session_token()
 
+    def _client_ip_info(self) -> tuple[str, str]:
+        socket_ip = self.client_address[0] if self.client_address else ''
+        return _resolved_client_ip(socket_ip, self.headers)
+
+    def _security_ip_blocked(self) -> bool:
+        ip, _ = self._client_ip_info()
+        return bool(REGISTRATION_DB and REGISTRATION_DB.security_is_ip_banned(ip))
+
+    def _security_blocked_response(self):
+        self.send_response(403)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        body = b'Forbidden'
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _security_probe(self, trigger: str, threshold: int, window_sec: int,
+                        severity: str, confidence: float, *, path: str = '',
+                        method: str = '', status: int = 0):
+        ip, origin = self._client_ip_info()
+        ua = ''
+        try:
+            ua = self.headers.get('User-Agent', '')
+        except Exception:
+            ua = ''
+        _security_track_probe(
+            ip, origin, trigger, threshold, window_sec, severity, confidence,
+            path=path, method=method, status=status, user_agent=ua
+        )
+
     def _session_requires_passkey_enroll(self) -> bool:
         if _auth_break_glass_active():
             return False
@@ -8619,6 +9203,8 @@ class ManageHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._require_https():
             return
+        if self._security_ip_blocked():
+            return self._security_blocked_response()
         path = urllib.parse.urlparse(self.path).path.rstrip('/')
 
         # Enforced passkey-enrollment gate (session-scoped). User can only access
@@ -8664,6 +9250,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_admin()
         elif path.startswith('/manage/admin/event/'):
             self._get_admin_event_detail(path[len('/manage/admin/event/'):])
+        elif path.startswith('/manage/admin/security/event/'):
+            self._get_admin_security_event_detail(path[len('/manage/admin/security/event/'):])
         elif path == '/manage/password':
             self._get_password_page()
         elif path.startswith('/manage/admin/set-password/'):
@@ -8741,6 +9329,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             ih = path[len('/manage/torrent/'):]
             self._get_torrent_detail(ih)
         else:
+            if _security_cfg_bool('security_404_burst_enabled', True):
+                self._security_probe(
+                    'http_404_burst',
+                    _security_cfg_int('security_404_burst_threshold', 5, 2, 500),
+                    _security_cfg_int('security_404_burst_window_sec', 1, 1, 60),
+                    'medium', 0.70,
+                    path=path, method='GET', status=404
+                )
             self._send_html('<h1>Not Found</h1>', 404)
 
     def do_POST(self):
@@ -8750,6 +9346,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             del self._body_cache
         if not self._require_https():
             return
+        if self._security_ip_blocked():
+            return self._security_blocked_response()
         path = urllib.parse.urlparse(self.path).path.rstrip('/')
         if path == '/coinbase/webhook':
             self._post_coinbase_webhook()
@@ -8814,6 +9412,13 @@ class ManageHandler(BaseHTTPRequestHandler):
                 if not csrf_ok:
                     log.warning('CSRF mismatch path=%s candidates=%d submitted_len=%d',
                                 path, len(session_candidates), len(submitted))
+                    self._security_probe(
+                        'csrf_fail_burst',
+                        _security_cfg_int('security_csrf_fail_threshold', 10, 2, 500),
+                        _security_cfg_int('security_csrf_fail_window_sec', 60, 1, 600),
+                        'high', 0.85,
+                        path=path, method='POST', status=403
+                    )
                     self._redirect('/manage?msg=csrf')
                     return
 
@@ -8921,6 +9526,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_tracker_toggle()
         elif path == '/manage/admin/tracker-move':
             self._post_tracker_move()
+        elif path == '/manage/admin/security/action':
+            self._post_admin_security_action()
         elif path == '/manage/admin/save-settings':
             self._post_save_settings()
         elif path == '/manage/comment/post':
@@ -9014,6 +9621,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         elif path == '/manage/admin/ip-lock-clear':
             self._post_ip_lock_clear()
         else:
+            self._security_probe(
+                'unknown_post_burst',
+                _security_cfg_int('security_unknown_post_threshold', 8, 2, 500),
+                _security_cfg_int('security_unknown_post_window_sec', 10, 1, 120),
+                'high', 0.80,
+                path=path, method='POST', status=404
+            )
             self._send_html('<h1>Not Found</h1>', 404)
 
     # ── GET handlers ─────────────────────────────────────────
@@ -9087,6 +9701,29 @@ class ManageHandler(BaseHTTPRequestHandler):
                 q_action=e_q_action,
                 q_target=e_q_target,
             )
+        # security log pagination + search
+        spage = _get_named_page_param(self.path, 'spage')
+        security_pp = 50
+        s_trigger = qs.get('strigger', [''])[0].strip()
+        s_status = qs.get('sstatus', [''])[0].strip()
+        s_ip = qs.get('sip', [''])[0].strip()
+        security_events, security_total = REGISTRATION_DB.security_list_events(
+            limit=security_pp,
+            offset=(spage - 1) * security_pp,
+            q_trigger=s_trigger,
+            q_status=s_status,
+            q_ip=s_ip,
+        )
+        security_total_pages = max(1, (security_total + security_pp - 1) // security_pp)
+        if spage > security_total_pages:
+            spage = security_total_pages
+            security_events, security_total = REGISTRATION_DB.security_list_events(
+                limit=security_pp,
+                offset=(spage - 1) * security_pp,
+                q_trigger=s_trigger,
+                q_status=s_status,
+                q_ip=s_ip,
+            )
         trackers     = REGISTRATION_DB.list_magnet_trackers()
         settings     = REGISTRATION_DB.get_all_settings()
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
@@ -9098,6 +9735,8 @@ class ManageHandler(BaseHTTPRequestHandler):
                 tab = 'adduser'
             elif msg.startswith('User ') and ' created as ' in msg:
                 tab = 'adduser'
+            elif qs.get('strigger', [''])[0] or qs.get('sstatus', [''])[0] or qs.get('sip', [''])[0]:
+                tab = 'security'
         self._send_html(_render_admin(user, all_torrents, all_users, events, trackers, settings,
                                       page=page, total_pages=total_pages, total=total,
                                       upage=upage, utotal_pages=utotal_pages, utotal=utotal,
@@ -9108,7 +9747,15 @@ class ManageHandler(BaseHTTPRequestHandler):
                                       eq=qs.get('eq', [''])[0],
                                       eactor=qs.get('eactor', [''])[0],
                                       eaction=qs.get('eaction', [''])[0],
-                                      etarget=qs.get('etarget', [''])[0]))
+                                      etarget=qs.get('etarget', [''])[0],
+                                      security_events=security_events,
+                                      spage=spage,
+                                      security_total_pages=security_total_pages,
+                                      security_total=security_total,
+                                      security_pp=security_pp,
+                                      strigger=s_trigger,
+                                      sstatus=s_status,
+                                      sip=s_ip))
 
     def _get_admin_event_detail(self, event_id_raw: str):
         user = self._get_session_user()
@@ -9129,6 +9776,102 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not back.startswith('/manage/admin'):
             back = '/manage/admin?tab=events'
         self._send_html(_render_admin_event_detail(user, event, back_url=back))
+
+    def _get_admin_security_event_detail(self, event_id_raw: str):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        is_super = user['username'] == SUPER_USER
+        if not (user['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
+        event_id_str = (event_id_raw or '').strip('/')
+        if not event_id_str.isdigit():
+            return self._redirect('/manage/admin?tab=security&msg=Invalid+security+event+id.&msg_type=error')
+        event_id = int(event_id_str)
+        event = REGISTRATION_DB.security_get_event(event_id)
+        if not event:
+            return self._redirect('/manage/admin?tab=security&msg=Security+event+not+found.&msg_type=error')
+        ban = REGISTRATION_DB.security_get_ban(int(event['ban_id'])) if event.get('ban_id') else None
+        actions = REGISTRATION_DB.security_list_actions(event_id=event_id, limit=300)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        back = urllib.parse.unquote(qs.get('back', [''])[0]).strip()
+        if not back.startswith('/manage/admin'):
+            back = '/manage/admin?tab=security'
+        self._send_html(_render_admin_security_event_detail(user, event, ban, actions, back_url=back))
+
+    def _post_admin_security_action(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        is_super = user['username'] == SUPER_USER
+        if not (user['is_admin'] or is_super):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        action = (fields.get('action', '') or '').strip()
+        try:
+            event_id = int(fields.get('event_id', '0'))
+        except Exception:
+            event_id = 0
+        if event_id <= 0:
+            return self._redirect('/manage/admin?tab=security&msg=Missing+security+event+id.&msg_type=error')
+        event = REGISTRATION_DB.security_get_event(event_id)
+        if not event:
+            return self._redirect('/manage/admin?tab=security&msg=Security+event+not+found.&msg_type=error')
+        if action == 'clear_ban':
+            try:
+                ban_id = int(fields.get('ban_id', '0'))
+            except Exception:
+                ban_id = 0
+            if ban_id <= 0:
+                ban_id = int(event.get('ban_id') or 0)
+            clear_reason = (fields.get('clear_reason', '') or '').strip()[:240]
+            if ban_id <= 0:
+                return self._redirect(f'/manage/admin/security/event/{event_id}?msg=No+linked+ban+found.&msg_type=error')
+            ok = REGISTRATION_DB.security_clear_ban(ban_id, user['username'], clear_reason)
+            if not ok:
+                return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Ban+already+cleared+or+missing.&msg_type=error')
+            REGISTRATION_DB.security_add_action(
+                event_id=event_id,
+                ban_id=ban_id,
+                action_type='manual_clear_ban',
+                actor=user['username'],
+                detail=clear_reason or 'manual clear from admin security view'
+            )
+            return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Ban+cleared.&msg_type=success')
+        if action == 'disable_member':
+            uid = int(event.get('member_user_id') or 0)
+            if uid <= 0:
+                return self._redirect(f'/manage/admin/security/event/{event_id}?msg=No+member+attribution+for+this+event.&msg_type=error')
+            if not REGISTRATION_DB.security_disable_user_by_id(uid, user['username'], f'security_event_id={event_id} manual_disable=1'):
+                return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Unable+to+disable+account.&msg_type=error')
+            REGISTRATION_DB.security_add_action(
+                event_id=event_id,
+                ban_id=int(event.get('ban_id') or 0) or None,
+                action_type='manual_disable_member',
+                actor=user['username'],
+                detail=f'user_id={uid}'
+            )
+            return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Attributed+member+disabled.&msg_type=success')
+        if action == 'enable_member':
+            uid = int(event.get('member_user_id') or 0)
+            if uid <= 0:
+                return self._redirect(f'/manage/admin/security/event/{event_id}?msg=No+member+attribution+for+this+event.&msg_type=error')
+            if not REGISTRATION_DB.security_enable_user_by_id(uid, user['username'], f'security_event_id={event_id} manual_enable=1'):
+                return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Unable+to+enable+account.&msg_type=error')
+            REGISTRATION_DB.security_add_action(
+                event_id=event_id,
+                ban_id=int(event.get('ban_id') or 0) or None,
+                action_type='manual_enable_member',
+                actor=user['username'],
+                detail=f'user_id={uid}'
+            )
+            return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Attributed+member+enabled.&msg_type=success')
+        if action == 'close_event':
+            if not REGISTRATION_DB.security_close_event(event_id, user['username']):
+                return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Unable+to+resolve+security+event.&msg_type=error')
+            return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Security+event+marked+resolved.&msg_type=success')
+        return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Unknown+security+action.&msg_type=error')
 
     def _get_password_page(self):
         user = self._get_session_user()
@@ -9318,6 +10061,13 @@ class ManageHandler(BaseHTTPRequestHandler):
             used_backup = True
         if not ok:
             attempts, wait = REGISTRATION_DB.register_tfa_challenge_failure(int(challenge['id']))
+            self._security_probe(
+                'tfa_fail_burst',
+                _security_cfg_int('security_tfa_fail_threshold', 10, 2, 500),
+                _security_cfg_int('security_tfa_fail_window_sec', 120, 1, 1800),
+                'high', 0.85,
+                path='/manage/tfa/challenge', method='POST', status=403
+            )
             if attempts >= TFA_CHALLENGE_MAX_ATTEMPTS:
                 REGISTRATION_DB.consume_tfa_challenge(int(challenge['id']))
                 REGISTRATION_DB.delete_session(token)
@@ -9426,6 +10176,13 @@ class ManageHandler(BaseHTTPRequestHandler):
             log.debug('LOGIN failed user=%r', username)
             REGISTRATION_DB._log(username or '(unknown)', 'login_failed',
                                  client_ip)
+            self._security_probe(
+                'login_fail_burst',
+                _security_cfg_int('security_login_fail_burst_threshold', 10, 2, 500),
+                _security_cfg_int('security_login_fail_window_sec', 60, 1, 1800),
+                'high', 0.85,
+                path='/manage/login', method='POST', status=403
+            )
             self._send_html(_render_login(invalid_login_msg))
             return
         if not REGISTRATION_DB.is_ip_allowed(user['id'], client_ip):
@@ -9522,11 +10279,25 @@ class ManageHandler(BaseHTTPRequestHandler):
         user = REGISTRATION_DB.get_user(username)
         lock_allows_passkey = _webauthn_allow_locked_accounts()
         if not user or user['is_disabled'] or (user['is_locked'] and not lock_allows_passkey):
+            self._security_probe(
+                'webauthn_fail_burst',
+                _security_cfg_int('security_webauthn_fail_threshold', 10, 2, 500),
+                _security_cfg_int('security_webauthn_fail_window_sec', 120, 1, 1800),
+                'high', 0.85,
+                path='/manage/webauthn/auth/start', method='POST', status=403
+            )
             return self._send_json(generic_fail, 403)
         policy = _auth_factor_policy_for_user(user)
         user_enabled = _flag_true(user['webauthn_enabled']) if ('webauthn_enabled' in user.keys()) else False
         if not user_enabled and not policy.get('passkey_required'):
             log.warning('WEBAUTHN auth start denied user=%s reason=account_passkey_disabled', username)
+            self._security_probe(
+                'webauthn_fail_burst',
+                _security_cfg_int('security_webauthn_fail_threshold', 10, 2, 500),
+                _security_cfg_int('security_webauthn_fail_window_sec', 120, 1, 1800),
+                'high', 0.85,
+                path='/manage/webauthn/auth/start', method='POST', status=403
+            )
             return self._send_json(generic_fail, 403)
         if not user_enabled and policy.get('passkey_required'):
             log.debug('WEBAUTHN auth start user flag disabled; proceeding due to policy user=%s policy_required=1',
@@ -9534,6 +10305,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         rows = REGISTRATION_DB.list_webauthn_credentials(user['id'])
         if not rows:
             log.warning('WEBAUTHN auth start denied user=%s reason=no_registered_passkeys', username)
+            self._security_probe(
+                'webauthn_fail_burst',
+                _security_cfg_int('security_webauthn_fail_threshold', 10, 2, 500),
+                _security_cfg_int('security_webauthn_fail_window_sec', 120, 1, 1800),
+                'high', 0.85,
+                path='/manage/webauthn/auth/start', method='POST', status=403
+            )
             return self._send_json(generic_fail, 403)
         server = self._webauthn_server()
         if not server:
@@ -9628,6 +10406,13 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._send_json({'ok': False, 'error': 'Account not found.'}, 404)
         lock_allows_passkey = _webauthn_allow_locked_accounts()
         if user['is_disabled'] or (user['is_locked'] and not lock_allows_passkey):
+            self._security_probe(
+                'webauthn_fail_burst',
+                _security_cfg_int('security_webauthn_fail_threshold', 10, 2, 500),
+                _security_cfg_int('security_webauthn_fail_window_sec', 120, 1, 1800),
+                'high', 0.85,
+                path='/manage/webauthn/auth/finish', method='POST', status=403
+            )
             return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 403)
         client_ip = self.client_address[0] if self.client_address else ''
         if not REGISTRATION_DB.is_ip_allowed(user['id'], client_ip):
@@ -9681,6 +10466,13 @@ class ManageHandler(BaseHTTPRequestHandler):
                     )
                     log.warning('WEBAUTHN clone suspected user=%s cred=%s old=%s new=%s',
                                 user['username'], cred_id_b64[:14], stored_sign_count, new_sign_count)
+                    self._security_probe(
+                        'webauthn_fail_burst',
+                        _security_cfg_int('security_webauthn_fail_threshold', 10, 2, 500),
+                        _security_cfg_int('security_webauthn_fail_window_sec', 120, 1, 1800),
+                        'high', 0.90,
+                        path='/manage/webauthn/auth/finish', method='POST', status=403
+                    )
                     return self._send_json({'ok': False, 'error': 'Passkey authentication failed.'}, 403)
                 REGISTRATION_DB.touch_webauthn_credential(int(row['id']), int(auth_data.counter))
                 REGISTRATION_DB.set_webauthn_primary_credential(int(user['id']), int(row['id']))
@@ -9725,6 +10517,13 @@ class ManageHandler(BaseHTTPRequestHandler):
                                  f'challenge_id={challenge_id}')
             log.warning('WEBAUTHN auth finish failed user=%s challenge_id=%s err=%s',
                         user['username'], challenge_id, e)
+            self._security_probe(
+                'webauthn_fail_burst',
+                _security_cfg_int('security_webauthn_fail_threshold', 10, 2, 500),
+                _security_cfg_int('security_webauthn_fail_window_sec', 120, 1, 1800),
+                'high', 0.85,
+                path='/manage/webauthn/auth/finish', method='POST', status=403
+            )
             return self._send_json({'ok': False, 'error': 'Passkey authentication failed.'}, 403)
 
     def _post_webauthn_register_start(self):
@@ -11421,6 +12220,47 @@ class ManageHandler(BaseHTTPRequestHandler):
                 interval = '300'
             REGISTRATION_DB.set_setting('stats_persist_enabled', enabled, user['username'])
             REGISTRATION_DB.set_setting('stats_persist_interval_sec', interval, user['username'])
+        elif form_id == 'security_policies':
+            REGISTRATION_DB.set_setting(
+                'security_auto_ban_enabled',
+                '1' if fields.get('security_auto_ban_enabled') == '1' else '0',
+                user['username']
+            )
+            REGISTRATION_DB.set_setting(
+                'security_member_disable_on_strong_attribution',
+                '1' if fields.get('security_member_disable_on_strong_attribution') == '1' else '0',
+                user['username']
+            )
+            REGISTRATION_DB.set_setting(
+                'security_admin_alert_on_member_attribution',
+                '1' if fields.get('security_admin_alert_on_member_attribution') == '1' else '0',
+                user['username']
+            )
+            REGISTRATION_DB.set_setting(
+                'security_404_burst_enabled',
+                '1' if fields.get('security_404_burst_enabled') == '1' else '0',
+                user['username']
+            )
+            for key, default, lo, hi in [
+                ('security_ban_temp_minutes', '60', 1, 10080),
+                ('security_404_burst_threshold', '5', 2, 500),
+                ('security_404_burst_window_sec', '1', 1, 60),
+                ('security_login_fail_burst_threshold', '10', 2, 500),
+                ('security_login_fail_window_sec', '60', 1, 1800),
+                ('security_unknown_post_threshold', '8', 2, 500),
+                ('security_unknown_post_window_sec', '10', 1, 120),
+                ('security_csrf_fail_threshold', '10', 2, 500),
+                ('security_csrf_fail_window_sec', '60', 1, 1800),
+                ('security_webauthn_fail_threshold', '10', 2, 500),
+                ('security_webauthn_fail_window_sec', '120', 1, 1800),
+                ('security_tfa_fail_threshold', '10', 2, 500),
+                ('security_tfa_fail_window_sec', '120', 1, 1800),
+            ]:
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except Exception:
+                    v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
         elif form_id == 'peer_query_settings':
             enabled = '1' if fields.get('peer_query_enabled') == '1' else '0'
             tracker = fields.get('peer_query_tracker', '').strip()
@@ -11733,7 +12573,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         settings_forms = {
             'complexity', 'account_lockout', 'free_signup', 'open_tracker', 'comments_enabled',
             'robots_txt', 'torrents_per_page', 'upload_limits', 'stats_persistence',
-            'gravatar_settings', 'webauthn_settings', 'tfa_settings',
+            'security_policies', 'gravatar_settings', 'webauthn_settings', 'tfa_settings',
         }
         if form_id == 'topup_settings':
             tab = 'topups'
@@ -15036,6 +15876,120 @@ def _render_admin_event_detail(user, event: dict, back_url: str = '/manage/admin
     return _manage_page(f'Event #{event_id}', body, user=user)
 
 
+def _render_admin_security_event_detail(user, event: dict, ban: dict | None, actions: list,
+                                        back_url: str = '/manage/admin?tab=security') -> str:
+    event_id = int(event.get('id', 0))
+    safe_back = back_url if (back_url or '').startswith('/manage/admin') else '/manage/admin?tab=security'
+    member_line = '--'
+    member_uid = int(event.get('member_user_id') or 0)
+    if member_uid > 0:
+        member_row = REGISTRATION_DB.get_user_by_id(member_uid) if REGISTRATION_DB else None
+        member_username = member_row['username'] if member_row else f'user_id={member_uid}'
+        confidence = _h(event.get('member_confidence', 'none'))
+        member_line = (
+            f'<a href="/manage/admin/user/{_h(member_username)}" class="user-link">{_h(member_username)}</a>'
+            f' ({confidence})'
+        )
+    ban_html = '<div style="color:var(--muted);font-size:0.86rem">No linked ban record.</div>'
+    if ban:
+        bid = int(ban.get('id', 0))
+        bstate = _h(ban.get('state', ''))
+        bexp = _h(str((ban.get('expires_at') or '')[:19]).replace('T', ' ') if ban.get('expires_at') else '--')
+        bby = _h(ban.get('created_by') or '--')
+        clear_by = _h(ban.get('cleared_by') or '--')
+        clear_reason = _h(ban.get('clear_reason') or '--')
+        is_active = (ban.get('state') == 'active')
+        ban_html = (
+            '<div style="display:grid;grid-template-columns:minmax(150px,220px) 1fr;gap:8px 14px;align-items:start">'
+            f'<div class="hash">Ban ID</div><div class="hash">{bid}</div>'
+            f'<div class="hash">State</div><div>{bstate}</div>'
+            f'<div class="hash">Expires</div><div>{bexp}</div>'
+            f'<div class="hash">Created By</div><div>{bby}</div>'
+            f'<div class="hash">Cleared By</div><div>{clear_by}</div>'
+            f'<div class="hash">Clear Reason</div><div>{clear_reason}</div>'
+            '</div>'
+        )
+        if is_active:
+            ban_html += (
+                '<form method="POST" action="/manage/admin/security/action" data-confirm="Clear this active ban?" '
+                'style="margin-top:12px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">'
+                f'<input type="hidden" name="event_id" value="{event_id}">'
+                f'<input type="hidden" name="ban_id" value="{bid}">'
+                '<input type="hidden" name="action" value="clear_ban">'
+                '<div class="form-group" style="margin:0;min-width:260px">'
+                '<label style="font-size:0.75rem">Clear reason (optional)</label>'
+                '<input type="text" name="clear_reason" placeholder="manual review complete">'
+                '</div>'
+                '<button type="submit" class="btn btn-sm btn-green">Clear Ban</button>'
+                '</form>'
+            )
+    action_rows = ''
+    for a in actions:
+        action_rows += (
+            '<tr>'
+            f'<td class="hash">{_h(str((a.get("created_at") or "")[:19]).replace("T"," "))}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.76rem">{_h(a.get("action_type",""))}</td>'
+            f'<td>{_h(a.get("actor",""))}</td>'
+            f'<td style="word-break:break-word">{_h(a.get("detail",""))}</td>'
+            '</tr>'
+        )
+    if not action_rows:
+        action_rows = '<tr><td colspan="4" class="empty">No actions logged</td></tr>'
+    body = f'''
+  <div class="page-title">Security Event Detail</div>
+  <div class="page-sub">
+    Security action trail &nbsp;·&nbsp;
+    <a href="{_h(safe_back)}" style="color:var(--muted);text-decoration:none;font-size:0.85rem">&#10094; Back to Security</a>
+  </div>
+  <div class="card">
+    <div style="display:grid;grid-template-columns:minmax(160px,220px) 1fr;gap:10px 14px;align-items:start">
+      <div class="hash">Event ID</div><div class="hash">{event_id}</div>
+      <div class="hash">Created</div><div>{_h(str((event.get('created_at') or '')[:19]).replace('T',' '))}</div>
+      <div class="hash">Source IP</div><div>{_h(event.get('source_ip', ''))} <span style="color:var(--muted)">({_h(event.get('source_origin', 'socket'))})</span></div>
+      <div class="hash">Trigger</div><div style="font-family:var(--mono);font-size:0.8rem">{_h(event.get('trigger_type', ''))}</div>
+      <div class="hash">Severity</div><div>{_h(event.get('severity', ''))}</div>
+      <div class="hash">Status</div><div>{_h(event.get('status', ''))}</div>
+      <div class="hash">Hits</div><div>{_h(str(event.get('hit_count', 0)))}</div>
+      <div class="hash">Member Attribution</div><div>{member_line}</div>
+      <div class="hash">Path</div><div>{_h(event.get('request_path', ''))}</div>
+      <div class="hash">Method</div><div>{_h(event.get('request_method', ''))}</div>
+      <div class="hash">Notes</div><div>{_h(event.get('notes', ''))}</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Linked Ban</div>
+    {ban_html}
+  </div>
+  <div class="card">
+    <div class="card-title">Manual Actions</div>
+    <div class="actions">
+      <form method="POST" action="/manage/admin/security/action" style="display:inline">
+        <input type="hidden" name="event_id" value="{event_id}">
+        <input type="hidden" name="action" value="close_event">
+        <button class="btn btn-sm">Mark Resolved</button>
+      </form>
+      <form method="POST" action="/manage/admin/security/action" style="display:inline" data-confirm="Disable attributed member account?">
+        <input type="hidden" name="event_id" value="{event_id}">
+        <input type="hidden" name="action" value="disable_member">
+        <button class="btn btn-sm btn-danger">Disable Member</button>
+      </form>
+      <form method="POST" action="/manage/admin/security/action" style="display:inline">
+        <input type="hidden" name="event_id" value="{event_id}">
+        <input type="hidden" name="action" value="enable_member">
+        <button class="btn btn-sm btn-green">Enable Member</button>
+      </form>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Actions</div>
+    <div class="table-wrap"><table>
+      <tr><th scope="col">Time</th><th scope="col">Action</th><th scope="col">Actor</th><th scope="col">Detail</th></tr>
+      {action_rows}
+    </table></div>
+  </div>'''
+    return _manage_page(f'Security Event #{event_id}', body, user=user)
+
+
 def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   trackers: list, settings: dict,
                   msg: str = '', msg_type: str = 'error',
@@ -15044,8 +15998,13 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   uquery: str = '', tab: str = '', new_username: str = '',
                   epage: int = 1, ev_total_pages: int = 1, events_pp: int = 50,
                   ev_total: int = 0, eq: str = '', eactor: str = '',
-                  eaction: str = '', etarget: str = '') -> str:
+                  eaction: str = '', etarget: str = '',
+                  security_events: list | None = None, spage: int = 1,
+                  security_total_pages: int = 1, security_total: int = 0,
+                  security_pp: int = 50, strigger: str = '', sstatus: str = '',
+                  sip: str = '') -> str:
     is_super = user['username'] == SUPER_USER
+    security_events = security_events or []
 
     # ── Tracker rows ─────────────────────────────────────────────
     tr_rows = ''
@@ -15100,6 +16059,23 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     login_auto_unlock_hours = settings.get('login_auto_unlock_hours', '24')
     login_reveal_lockout_message = settings.get('login_reveal_lockout_message', '0') == '1'
     login_allow_passkey_when_locked = settings.get('login_allow_passkey_when_locked', '1') == '1'
+    security_auto_ban_enabled = settings.get('security_auto_ban_enabled', '1') == '1'
+    security_ban_temp_minutes = settings.get('security_ban_temp_minutes', '60')
+    security_member_disable = settings.get('security_member_disable_on_strong_attribution', '1') == '1'
+    security_admin_alert = settings.get('security_admin_alert_on_member_attribution', '1') == '1'
+    security_404_enabled = settings.get('security_404_burst_enabled', '1') == '1'
+    security_404_threshold = settings.get('security_404_burst_threshold', '5')
+    security_404_window = settings.get('security_404_burst_window_sec', '1')
+    security_login_threshold = settings.get('security_login_fail_burst_threshold', '10')
+    security_login_window = settings.get('security_login_fail_window_sec', '60')
+    security_unknown_threshold = settings.get('security_unknown_post_threshold', '8')
+    security_unknown_window = settings.get('security_unknown_post_window_sec', '10')
+    security_csrf_threshold = settings.get('security_csrf_fail_threshold', '10')
+    security_csrf_window = settings.get('security_csrf_fail_window_sec', '60')
+    security_webauthn_threshold = settings.get('security_webauthn_fail_threshold', '10')
+    security_webauthn_window = settings.get('security_webauthn_fail_window_sec', '120')
+    security_tfa_threshold = settings.get('security_tfa_fail_threshold', '10')
+    security_tfa_window = settings.get('security_tfa_fail_window_sec', '120')
     robots_txt_val = settings.get('robots_txt', 'User-agent: *\nDisallow: /')
     settings_html = f'''
     <div class="two-col">
@@ -15171,6 +16147,86 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             }});
           }})();
         </script>
+      </div>
+      <div class="card">
+        <div class="card-title">Security Hardening Policies</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Configure IP-based probe detection, automated bans, and member attribution response.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="security_policies">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+            <input type="checkbox" name="security_auto_ban_enabled" value="1" {'checked' if security_auto_ban_enabled else ''}>
+            Enable auto-ban when thresholds are exceeded
+          </label>
+          <div class="form-group">
+            <label>Temporary ban duration (minutes)</label>
+            <input type="number" name="security_ban_temp_minutes" value="{security_ban_temp_minutes}" min="1" max="10080" style="width:140px">
+          </div>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="security_member_disable_on_strong_attribution" value="1" {'checked' if security_member_disable else ''}>
+            Disable member account on strong attribution
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
+            <input type="checkbox" name="security_admin_alert_on_member_attribution" value="1" {'checked' if security_admin_alert else ''}>
+            Alert admins when attacks map to member IPs
+          </label>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px">
+            <div class="form-group" style="margin:0">
+              <label>404 threshold</label>
+              <input type="number" name="security_404_burst_threshold" value="{security_404_threshold}" min="2" max="500">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>404 window (sec)</label>
+              <input type="number" name="security_404_burst_window_sec" value="{security_404_window}" min="1" max="60">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>Login-fail threshold</label>
+              <input type="number" name="security_login_fail_burst_threshold" value="{security_login_threshold}" min="2" max="500">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>Login-fail window (sec)</label>
+              <input type="number" name="security_login_fail_window_sec" value="{security_login_window}" min="1" max="1800">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>Unknown POST threshold</label>
+              <input type="number" name="security_unknown_post_threshold" value="{security_unknown_threshold}" min="2" max="500">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>Unknown POST window (sec)</label>
+              <input type="number" name="security_unknown_post_window_sec" value="{security_unknown_window}" min="1" max="120">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>CSRF-fail threshold</label>
+              <input type="number" name="security_csrf_fail_threshold" value="{security_csrf_threshold}" min="2" max="500">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>CSRF-fail window (sec)</label>
+              <input type="number" name="security_csrf_fail_window_sec" value="{security_csrf_window}" min="1" max="1800">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>WebAuthn-fail threshold</label>
+              <input type="number" name="security_webauthn_fail_threshold" value="{security_webauthn_threshold}" min="2" max="500">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>WebAuthn-fail window (sec)</label>
+              <input type="number" name="security_webauthn_fail_window_sec" value="{security_webauthn_window}" min="1" max="1800">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>TFA-fail threshold</label>
+              <input type="number" name="security_tfa_fail_threshold" value="{security_tfa_threshold}" min="2" max="500">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label>TFA-fail window (sec)</label>
+              <input type="number" name="security_tfa_fail_window_sec" value="{security_tfa_window}" min="1" max="1800">
+            </div>
+          </div>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
+            <input type="checkbox" name="security_404_burst_enabled" value="1" {'checked' if security_404_enabled else ''}>
+            Enable 404 burst detection
+          </label>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
       </div>
       <div class="card">
         <div class="card-title">Open Tracker</div>
@@ -16066,6 +17122,59 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     if not ev_rows:
         ev_rows = '<tr><td colspan="5" class="empty">No matching events</td></tr>'
 
+    sec_back_params = [('tab', 'security')]
+    if spage > 1:
+        sec_back_params.append(('spage', str(spage)))
+    if strigger:
+        sec_back_params.append(('strigger', strigger))
+    if sstatus:
+        sec_back_params.append(('sstatus', sstatus))
+    if sip:
+        sec_back_params.append(('sip', sip))
+    sec_back_url = '/manage/admin?' + urllib.parse.urlencode(sec_back_params)
+    sec_back_enc = urllib.parse.quote(sec_back_url, safe='')
+    sec_page_params = [('tab', 'security')]
+    if strigger:
+        sec_page_params.append(('strigger', strigger))
+    if sstatus:
+        sec_page_params.append(('sstatus', sstatus))
+    if sip:
+        sec_page_params.append(('sip', sip))
+    sec_page_base = '/manage/admin?' + urllib.parse.urlencode(sec_page_params)
+    sec_start = ((spage - 1) * security_pp) + 1 if security_total else 0
+    sec_end = min(security_total, spage * security_pp) if security_total else 0
+    sec_range_label = f'{sec_start}-{sec_end}' if security_total else '0'
+    sec_rows = ''
+    for se in security_events:
+        sev = _h(se.get('severity', ''))
+        status = _h(se.get('status', ''))
+        trig = _h(se.get('trigger_type', ''))
+        source_ip = _h(se.get('source_ip', ''))
+        origin = _h(se.get('source_origin', ''))
+        hit_count = int(se.get('hit_count') or 0)
+        member = '--'
+        member_uid = int(se.get('member_user_id') or 0)
+        if member_uid > 0:
+            member_row = REGISTRATION_DB.get_user_by_id(member_uid) if REGISTRATION_DB else None
+            member_username = member_row['username'] if member_row else f'user_id={member_uid}'
+            member_conf = _h(se.get('member_confidence', 'none'))
+            member = f'<a href="/manage/admin/user/{_h(member_username)}" class="user-link">{_h(member_username)}</a> ({member_conf})'
+        detail_link = f'/manage/admin/security/event/{int(se["id"])}?back={sec_back_enc}'
+        sec_rows += (
+            f'<tr>'
+            f'<td class="hash" style="white-space:nowrap"><a href="{detail_link}" class="user-link">{_h(str(se.get("created_at",""))[:19].replace("T"," "))}</a></td>'
+            f'<td style="font-family:var(--mono);font-size:0.76rem">{trig}</td>'
+            f'<td style="white-space:nowrap">{source_ip}<div style="color:var(--muted);font-size:0.72rem">{origin}</div></td>'
+            f'<td style="font-family:var(--mono);font-size:0.76rem">{hit_count}</td>'
+            f'<td>{member}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem;text-transform:uppercase">{sev}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem;text-transform:uppercase">{status}</td>'
+            f'<td><a href="{detail_link}" class="btn btn-sm">View &#8594;</a></td>'
+            f'</tr>'
+        )
+    if not sec_rows:
+        sec_rows = '<tr><td colspan="8" class="empty">No security events</td></tr>'
+
     _tab_settings  = ('<button class="tab" onclick="showTab(\'settings\',this)">Settings</button>'
                       if is_super else '')
     _tab_database  = ('<button class="tab" onclick="showTab(\'database\',this)">Database</button>'
@@ -16079,7 +17188,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _tab_danger    = ('<button class="tab tab-danger" onclick="showTab(\'danger\',this)"'
                       '>Danger</button>'
                       if is_super else '')
-    _tab_names = ['torrents','users','adduser','trackers','settings','database','economy','topups','invites','danger','events']
+    _tab_names = ['torrents','users','adduser','trackers','settings','database','economy','topups','invites','danger','events','security']
     if tab and tab in _tab_names:
         _safe_tab = tab.replace("'", '')
         _autotab_js = (
@@ -16188,6 +17297,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     {_tab_invites}
     {_tab_danger}
     <button class="tab" onclick="showTab('events',this)">Event Log</button>
+    <button class="tab" onclick="showTab('security',this)">Security</button>
   </div>
 
   <div class="panel visible" id="panel-torrents">
@@ -16331,6 +17441,55 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <tbody>{ev_rows}</tbody>
       </table></div>
       {_pagination_html(epage, ev_total_pages, ev_page_base, page_param='epage')}
+    </div>
+  </div>
+
+  <div class="panel" id="panel-security">
+    <div class="card">
+      <div class="card-title">Security Events
+        <span style="color:var(--muted);font-size:0.78rem;font-weight:400;margin-left:8px">
+          {security_total} matching · showing {sec_range_label} · page {spage}/{security_total_pages}
+        </span>
+      </div>
+      <form method="GET" action="/manage/admin" style="margin-bottom:16px">
+        <input type="hidden" name="tab" value="security">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <div class="form-group" style="margin:0;min-width:170px">
+            <label style="font-size:0.75rem">Trigger</label>
+            <input type="text" name="strigger" value="{_h(strigger)}" placeholder="e.g. http_404_burst"
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
+                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <div class="form-group" style="margin:0;min-width:130px">
+            <label style="font-size:0.75rem">Status</label>
+            <input type="text" name="sstatus" value="{_h(sstatus)}" placeholder="open"
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
+                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <div class="form-group" style="margin:0;min-width:150px">
+            <label style="font-size:0.75rem">Source IP</label>
+            <input type="text" name="sip" value="{_h(sip)}" placeholder="1.2.3.4"
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);
+                          border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <button type="submit" class="btn btn-primary" style="white-space:nowrap">🔍 Search</button>
+          <a href="/manage/admin?tab=security" class="btn" style="white-space:nowrap">✕ Clear</a>
+        </div>
+      </form>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th scope="col" style="white-space:nowrap;width:140px">Time</th>
+          <th scope="col">Trigger</th>
+          <th scope="col">Source</th>
+          <th scope="col">Hits</th>
+          <th scope="col">Attributed Member</th>
+          <th scope="col">Severity</th>
+          <th scope="col">Status</th>
+          <th scope="col">Actions</th>
+        </tr></thead>
+        <tbody>{sec_rows}</tbody>
+      </table></div>
+      {_pagination_html(spage, security_total_pages, sec_page_base, page_param='spage')}
     </div>
   </div>'''
     return _manage_page('Admin Panel', body, user=user, msg=msg, msg_type=msg_type)
@@ -19317,6 +20476,16 @@ def main():
                     REGISTRATION_DB.expire_tfa_challenges()
                 except Exception as _e:
                     log.warning('expire_tfa_challenges failed (non-fatal): %s', _e)
+                try:
+                    expired_bans = REGISTRATION_DB.security_expire_bans()
+                    if expired_bans:
+                        log.info('security reconcile: expired %d ban(s)', expired_bans)
+                except Exception as _e:
+                    log.warning('security_expire_bans failed (non-fatal): %s', _e)
+                try:
+                    REGISTRATION_DB.security_prune_counters(older_than_sec=7200)
+                except Exception as _e:
+                    log.warning('security_prune_counters failed (non-fatal): %s', _e)
                 try:
                     _sp_cfg = REGISTRATION_DB.get_stats_persist_config()
                     _now = time.time()
