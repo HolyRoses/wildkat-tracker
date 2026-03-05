@@ -204,6 +204,41 @@ When `--redirect-http` is enabled, HTTP requests receive a `301 Moved Permanentl
 
 > **Note:** When using non-privileged ports (8080/8443), the `AmbientCapabilities` and `CapabilityBoundingSet` lines in the service unit are not needed and can be removed.
 
+### TFA Encryption Key (Required for New TFA Enrollment)
+
+If you plan to use TFA (TOTP), set `WK_TFA_SECRET_KEY` in a systemd override for `tracker.service`.
+
+Generate a valid Fernet key:
+
+```bash
+python3 - <<'PY'
+from cryptography.fernet import Fernet
+print(Fernet.generate_key().decode())
+PY
+```
+
+Create/update a service override:
+
+```bash
+sudo systemctl edit tracker.service
+```
+
+Add:
+
+```ini
+[Service]
+Environment="WK_TFA_SECRET_KEY=<your key>"
+```
+
+Apply and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart tracker.service
+```
+
+> **Critical:** Keep this key safe and stable. Do not lose it and do not change it after rollout. Existing encrypted TFA secrets depend on this exact key.
+
 ---
 
 ## 5. Enable and Start

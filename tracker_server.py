@@ -5724,8 +5724,16 @@ class RegistrationDB:
         )
         self._conn().commit()
 
+    def touch_session_created_at(self, token: str):
+        """Refresh a session's created_at marker (used after in-session MFA enrollment)."""
+        self._conn().execute(
+            'UPDATE sessions SET created_at=? WHERE token=?',
+            (self._ts(), token)
+        )
+        self._conn().commit()
+
     def get_session_pending_tfa_challenge_id(self, token: str) -> int:
-        now = datetime.datetime.now().isoformat(timespec='seconds')
+        now = self._ts()
         row = self._conn().execute(
             'SELECT pending_tfa_challenge_id FROM sessions WHERE token=? AND expires_at>?',
             (token, now)
@@ -10002,6 +10010,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         token = self._current_valid_session_token()
         if token:
             REGISTRATION_DB.set_session_tfa_enroll(token, False)
+            # Keep the in-progress session valid after successful enrollment.
+            # Without this, stale-session protection can invalidate this same
+            # session because created_at precedes tfa_enrolled_at by a few seconds.
+            REGISTRATION_DB.touch_session_created_at(token)
         REGISTRATION_DB._log(user['username'], 'tfa_enroll_finish', user['username'], f'backup_codes={len(backup_codes)}')
         delete_flow_active = bool(REGISTRATION_DB.get_active_account_delete_challenge(int(user['id'])))
         self._send_html(_render_tfa_setup_page(
@@ -13174,6 +13186,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
             is_follow = str(n['info_hash']).upper().startswith('FOLLOW:')
             is_points = str(n['info_hash']).upper().startswith('POINTS:')
+            is_security = str(n['info_hash']).upper().startswith('SECURITY:')
             if is_bounty:
                 bid   = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
@@ -13232,6 +13245,14 @@ class ManageHandler(BaseHTTPRequestHandler):
                 icon = '💵'
                 label = 'sent you points'
                 url = '/manage/profile'
+            elif is_security:
+                icon = '🛡️'
+                label = 'security event alert'
+                event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n.get('comment_id') or '')
+                if event_id.isdigit():
+                    url = f'/manage/admin/security/event/{event_id}'
+                else:
+                    url = '/manage/admin?tab=security'
             else:
                 if n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
                     icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
@@ -14124,11 +14145,11 @@ _MANAGE_CSS = '''
   .badge-disabled { background: rgba(85,88,120,0.2); color: var(--muted); border: 1px solid var(--border); }
 
   .hash { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
-  .tabs { display: flex; gap: 4px; margin-bottom: 24px; background: var(--card);
-          border: 1px solid var(--border); border-radius: 10px; padding: 4px; width: 100%;
+  .tabs { display: flex; gap: 3px; margin-bottom: 24px; background: var(--card);
+          border: 1px solid var(--border); border-radius: 10px; padding: 3px; width: 100%;
           overflow-x: auto; justify-content: center; }
-  .tab { font-family: var(--mono); font-size: 0.75rem; letter-spacing: 0.1em; text-transform: uppercase;
-         padding: 7px 20px; border-radius: 7px; border: none; background: transparent;
+  .tab { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.085em; text-transform: uppercase;
+         padding: 6px 14px; border-radius: 7px; border: none; background: transparent;
          color: var(--muted); cursor: pointer; transition: color 0.15s; }
   .tabs .tab { flex: 0 0 auto; }
   .tab:hover { color: var(--accent); background: rgba(245,166,35,0.08); }
@@ -14804,6 +14825,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
             is_follow = str(n['info_hash']).upper().startswith('FOLLOW:')
             is_points = str(n['info_hash']).upper().startswith('POINTS:')
+            is_security = str(n['info_hash']).upper().startswith('SECURITY:')
             if is_bounty:
                 bid = str(n['info_hash']).split(':',1)[1]
                 ntype = n['type']
@@ -14890,6 +14912,22 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     f' aria-label="points transfer from {from_h}">'
                     f'<div class="notif-item-type">💵 <strong>{from_h}</strong> sent you points</div>'
                     f'<div class="notif-item-text"><em>{amount_h}</em></div>'
+                    f'<div class="notif-item-ts">{ts_h}</div>'
+                    f'</button>'
+                )
+            elif is_security:
+                from_h = _h(n['from_username'])
+                ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
+                n_id = n['id']
+                msg_h = _h(n['torrent_name'] or '')
+                event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n.get('comment_id') or '')
+                target_url = f'/manage/admin/security/event/{event_id}' if event_id.isdigit() else '/manage/admin?tab=security'
+                dropdown_items += (
+                    f'<button class="notif-item" '
+                    f'onclick="readNotif({n_id},\'{target_url}\')"'
+                    f' aria-label="security event notification">'
+                    f'<div class="notif-item-type">🛡️ <strong>{from_h}</strong> security event alert</div>'
+                    f'<div class="notif-item-text"><em>{msg_h}</em></div>'
                     f'<div class="notif-item-ts">{ts_h}</div>'
                     f'</button>'
                 )
@@ -18205,6 +18243,7 @@ def _render_notifications_page(viewer) -> str:
         is_topup = str(n['info_hash']).upper().startswith('TOPUP:')
         is_follow = str(n['info_hash']).upper().startswith('FOLLOW:')
         is_points = str(n['info_hash']).upper().startswith('POINTS:')
+        is_security = str(n['info_hash']).upper().startswith('SECURITY:')
         ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
         from_h = _h(n['from_username'])
         tname_h = _h(n['torrent_name'])
@@ -18305,6 +18344,22 @@ def _render_notifications_page(viewer) -> str:
                 f'<div style="font-size:0.9rem"><span style="margin-right:6px">💵</span>'
                 f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                 f' sent you points: '
+                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                f'<div class="notif-page-meta">{ts_h}</div>'
+                f'</div>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
+                f'</div>'
+            )
+        elif is_security:
+            event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n.get('comment_id') or '')
+            url = f'/manage/admin/security/event/{event_id}' if event_id.isdigit() else '/manage/admin?tab=security'
+            read_js = f"readNotif({n_id},'{url}')"
+            rows += (
+                f'<div class="notif-page-item{unread_cls}">'
+                f'<div>'
+                f'<div style="font-size:0.9rem"><span style="margin-right:6px">🛡️</span>'
+                f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                f' security event alert: '
                 f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                 f'<div class="notif-page-meta">{ts_h}</div>'
                 f'</div>'
