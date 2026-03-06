@@ -21018,11 +21018,8 @@ def main():
                         _last_stats_persist_flush = _now
                 except Exception as _e:
                     log.warning('stats persistence flush failed (non-fatal): %s', _e)
-            hashes = REGISTRY.all_hashes()
-            total_peers = sum(
-                len(REGISTRY._torrents.get(h, {})) for h in hashes
-            )
-            log.info('Stats: %d torrents  %d peers', len(hashes), total_peers)
+            active_torrents, total_peers = REGISTRY.live_stats()
+            log.info('Stats: %d torrents  %d peers', active_torrents, total_peers)
     except KeyboardInterrupt:
         log.info('Shutting down.')
         sys.exit(0)
