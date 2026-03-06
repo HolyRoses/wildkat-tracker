@@ -2964,7 +2964,8 @@ class RegistrationDB:
     def update_torrent_peer_snapshot(self, ih: str, seeds: int, peers: int,
                                      downloaded: int | None, tracker: str, actor: str):
         ih_upper = ih.upper()
-        for attempt in range(8):
+        # Peer snapshots are best-effort; fail fast under contention to avoid lock storms.
+        for attempt in range(3):
             try:
                 c = self._conn()
                 c.execute(
@@ -2987,12 +2988,12 @@ class RegistrationDB:
                         raise
                 return True
             except sqlite3.OperationalError as e:
-                if 'locked' in str(e).lower() and attempt < 7:
-                    time.sleep(0.25 * (attempt + 1))
+                if 'locked' in str(e).lower() and attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
                     continue
                 if 'locked' in str(e).lower():
-                    log.warning('update_torrent_peer_snapshot lock after retries (non-fatal): ih=%s err=%s',
-                                ih_upper, e)
+                    log.debug('update_torrent_peer_snapshot deferred (non-fatal lock): ih=%s err=%s',
+                              ih_upper, e)
                     return False
                 raise
         return False
@@ -9936,8 +9937,12 @@ class ManageHandler(BaseHTTPRequestHandler):
         torrents = REGISTRATION_DB.list_torrents(user_id=uid, page=page, per_page=per_page)
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['info'])[0]
         self._send_html(_render_dashboard(user, torrents, page=page,
-                                          total_pages=total_pages, total=total))
+                                          total_pages=total_pages, total=total,
+                                          msg=msg, msg_type=msg_type))
 
     def _get_admin(self):
         user = self._get_session_user()
@@ -11122,7 +11127,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         auto_peer_not_queued = 0
         peer_cfg = REGISTRATION_DB.get_peer_query_config()
         if added_with_hash and peer_cfg.get('active') and peer_cfg.get('auto_on_upload'):
-            cap = max(1, int(peer_cfg.get('auto_upload_cap', 5)))
+            configured_cap = max(1, int(peer_cfg.get('auto_upload_cap', 5)))
+            # Guardrail for very large uploads: keep auto peer queue pressure bounded.
+            hard_cap = 10
+            cap = min(configured_cap, hard_cap)
             for ih, tname in added_with_hash[:cap]:
                 if _enqueue_peer_update(ih, user['username'], 'upload'):
                     auto_peer_queued += 1
@@ -11149,17 +11157,11 @@ class ManageHandler(BaseHTTPRequestHandler):
             parts.append(f'{skipped_db_locked} skipped (temporary database lock)')
         if auto_peer_queued:
             parts.append(f'{auto_peer_queued} peer snapshots queued')
-        over_cap = max(0, len(added_with_hash) - max(1, int(peer_cfg.get('auto_upload_cap', 5)))) if (added_with_hash and peer_cfg.get('active') and peer_cfg.get('auto_on_upload')) else 0
+        over_cap = max(0, len(added_with_hash) - cap) if (added_with_hash and peer_cfg.get('active') and peer_cfg.get('auto_on_upload')) else 0
         if over_cap:
-            parts.append(f'{over_cap} peer snapshots deferred (cap)')
+            parts.append(f'{over_cap} peer snapshots deferred (cap {cap})')
         if auto_peer_not_queued:
             parts.append(f'{auto_peer_not_queued} peer snapshots queue failed')
-        # Include a short preview of registered torrent names when practical.
-        if added:
-            preview = ', '.join(added[:8])
-            if len(added) > 8:
-                preview += ', ...'
-            parts.append(f'registered: {preview}')
         msg = ' | '.join(parts) if parts else 'No files processed.'
         msg_type = 'success' if added else 'error'
         log.debug('UPLOAD result msg=%r msg_type=%r added=%d skipped=%d errors=%d',
@@ -11168,8 +11170,9 @@ class ManageHandler(BaseHTTPRequestHandler):
                   skipped_invalid)
         if follower_notifs:
             log.debug('UPLOAD follower notifications sent=%d uploader=%s', follower_notifs, user['username'])
-        torrents = REGISTRATION_DB.list_torrents(user_id=user['id'])
-        self._send_html(_render_dashboard(user, torrents, msg, msg_type))
+        # PRG pattern: prevent browser back button from replaying POST /manage/upload.
+        msg_q = urllib.parse.quote_plus(msg[:500])
+        return self._redirect(f'/manage/dashboard?msg={msg_q}&msg_type={msg_type}')
 
     def _get_notifications(self):
         user = self._get_session_user()
