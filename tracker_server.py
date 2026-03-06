@@ -14808,79 +14808,6 @@ function confirmAction(msg) {
     });
   });
 }
-function initiateSystemWipe() {
-  // Step 1: type SYSTEMWIPE
-  var o = document.createElement('div');
-  o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:9999;display:flex;align-items:center;justify-content:center';
-  o.setAttribute('role','alertdialog');
-  o.setAttribute('aria-modal','true');
-  o.setAttribute('aria-labelledby','_sw1_title');
-  o.innerHTML = '<div style="background:var(--card);border:2px solid var(--red);border-radius:12px;padding:32px;max-width:480px;width:92%">'
-    + '<div id="_sw1_title" style="font-family:var(--mono);font-size:0.7rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--red);margin-bottom:12px">&#9762; System Wipe — Step 1 of 2</div>'
-    + '<p style="font-size:0.9rem;color:var(--text);margin-bottom:18px;line-height:1.6">'
-    + 'This will permanently delete <strong>all users, torrents, comments, notifications, invites, and logs</strong> except your super account.<br><br>'
-    + 'Type <strong style="color:var(--red);font-family:var(--mono)">SYSTEMWIPE</strong> to continue:</p>'
-    + '<input id="_sw_input" type="text" autocomplete="off" spellcheck="false"'
-    + ' style="width:100%;padding:10px 14px;background:var(--card2);border:1px solid var(--border);'
-    + 'border-radius:6px;color:var(--text);font-family:var(--mono);font-size:1rem;outline:none;margin-bottom:18px"'
-    + ' aria-label="Type SYSTEMWIPE to confirm" placeholder="Type SYSTEMWIPE">'
-    + '<div style="display:flex;gap:12px;justify-content:flex-end">'
-    + '<button id="_sw1_cancel" class="btn">Cancel</button>'
-    + '<button id="_sw1_ok" class="btn btn-danger">Continue</button>'
-    + '</div></div>';
-  document.body.appendChild(o);
-  var inp = document.getElementById('_sw_input');
-  inp.focus();
-  inp.addEventListener('input', function() {
-    document.getElementById('_sw1_ok').disabled = inp.value !== 'SYSTEMWIPE';
-  });
-  document.getElementById('_sw1_ok').disabled = true;
-  document.getElementById('_sw1_cancel').onclick = function() { document.body.removeChild(o); };
-  document.getElementById('_sw1_ok').onclick = function() {
-    if (inp.value !== 'SYSTEMWIPE') return;
-    document.body.removeChild(o);
-    // Step 2: final confirmation
-    var o2 = document.createElement('div');
-    o2.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:center;justify-content:center';
-    o2.setAttribute('role','alertdialog');
-    o2.setAttribute('aria-modal','true');
-    o2.setAttribute('aria-labelledby','_sw2_title');
-    o2.innerHTML = '<div style="background:var(--card);border:2px solid var(--red);border-radius:12px;padding:32px;max-width:480px;width:92%;text-align:center">'
-      + '<div id="_sw2_title" style="font-family:var(--mono);font-size:0.7rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--red);margin-bottom:16px">&#9762; System Wipe — Step 2 of 2</div>'
-      + '<p style="font-size:1rem;color:var(--text);margin-bottom:24px;line-height:1.7">'
-      + '<strong style="color:var(--red)">This is your last chance.</strong><br>'
-      + 'All data will be permanently destroyed.<br>'
-      + 'This action <strong>cannot</strong> be undone.</p>'
-      + '<div style="display:flex;gap:12px;justify-content:center">'
-      + '<button id="_sw2_cancel" class="btn" style="min-width:100px">Cancel</button>'
-      + '<button id="_sw2_ok" class="btn btn-danger" style="min-width:140px">Wipe Everything</button>'
-      + '</div></div>';
-    document.body.appendChild(o2);
-    document.getElementById('_sw2_cancel').onclick = function() { document.body.removeChild(o2); };
-    document.getElementById('_sw2_ok').focus();
-    document.getElementById('_sw2_ok').onclick = function() {
-      document.body.removeChild(o2);
-      // Submit hidden form with CSRF + token
-      var f = document.createElement('form');
-      f.method = 'POST';
-      f.action = '/manage/admin/system-wipe';
-      var ct = document.createElement('input'); ct.type='hidden'; ct.name='confirm_token'; ct.value='SYSTEMWIPE';
-      f.appendChild(ct);
-      var csrf = document.createElement('input'); csrf.type='hidden'; csrf.name='_csrf';
-      csrf.value = (document.cookie.match(/wkcsrf=([^;]+)/) || [])[1] || '';
-      f.appendChild(csrf);
-      document.body.appendChild(f);
-      f.submit();
-    };
-    o2.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape') document.body.removeChild(o2);
-    });
-  };
-  o.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape') document.body.removeChild(o);
-    if (e.key === 'Enter' && inp.value === 'SYSTEMWIPE') document.getElementById('_sw1_ok').click();
-  });
-}
 function togglePwVis(btn) {
   var inp = btn.previousElementSibling;
   var showing = inp.type === 'text';
@@ -17408,10 +17335,90 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           notifications, invite codes, sessions, and event logs.
           Returns tracker to near-factory state. This <strong>absolutely cannot</strong> be undone.
         </p>
-        <button class="btn btn-danger" onclick="initiateSystemWipe()"
+        <button id="system-wipe-btn" class="btn btn-danger"
                 aria-label="Initiate system wipe — requires typed confirmation">&#9762; System Wipe</button>
       </div>
-    </div>'''
+    </div>
+    <script>
+    (function() {
+      var wipeBtn = document.getElementById('system-wipe-btn');
+      if (!wipeBtn) return;
+      function initiateSystemWipe() {
+        // Step 1: type SYSTEMWIPE
+        var o = document.createElement('div');
+        o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:9999;display:flex;align-items:center;justify-content:center';
+        o.setAttribute('role','alertdialog');
+        o.setAttribute('aria-modal','true');
+        o.setAttribute('aria-labelledby','_sw1_title');
+        o.innerHTML = '<div style="background:var(--card);border:2px solid var(--red);border-radius:12px;padding:32px;max-width:480px;width:92%">'
+          + '<div id="_sw1_title" style="font-family:var(--mono);font-size:0.7rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--red);margin-bottom:12px">&#9762; System Wipe - Step 1 of 2</div>'
+          + '<p style="font-size:0.9rem;color:var(--text);margin-bottom:18px;line-height:1.6">'
+          + 'This will permanently delete <strong>all users, torrents, comments, notifications, invites, and logs</strong> except your super account.<br><br>'
+          + 'Type <strong style="color:var(--red);font-family:var(--mono)">SYSTEMWIPE</strong> to continue:</p>'
+          + '<input id="_sw_input" type="text" autocomplete="off" spellcheck="false"'
+          + ' style="width:100%;padding:10px 14px;background:var(--card2);border:1px solid var(--border);'
+          + 'border-radius:6px;color:var(--text);font-family:var(--mono);font-size:1rem;outline:none;margin-bottom:18px"'
+          + ' aria-label="Type SYSTEMWIPE to confirm" placeholder="Type SYSTEMWIPE">'
+          + '<div style="display:flex;gap:12px;justify-content:flex-end">'
+          + '<button id="_sw1_cancel" class="btn">Cancel</button>'
+          + '<button id="_sw1_ok" class="btn btn-danger">Continue</button>'
+          + '</div></div>';
+        document.body.appendChild(o);
+        var inp = document.getElementById('_sw_input');
+        inp.focus();
+        inp.addEventListener('input', function() {
+          document.getElementById('_sw1_ok').disabled = inp.value !== 'SYSTEMWIPE';
+        });
+        document.getElementById('_sw1_ok').disabled = true;
+        document.getElementById('_sw1_cancel').onclick = function() { document.body.removeChild(o); };
+        document.getElementById('_sw1_ok').onclick = function() {
+          if (inp.value !== 'SYSTEMWIPE') return;
+          document.body.removeChild(o);
+          // Step 2: final confirmation
+          var o2 = document.createElement('div');
+          o2.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:center;justify-content:center';
+          o2.setAttribute('role','alertdialog');
+          o2.setAttribute('aria-modal','true');
+          o2.setAttribute('aria-labelledby','_sw2_title');
+          o2.innerHTML = '<div style="background:var(--card);border:2px solid var(--red);border-radius:12px;padding:32px;max-width:480px;width:92%;text-align:center">'
+            + '<div id="_sw2_title" style="font-family:var(--mono);font-size:0.7rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--red);margin-bottom:16px">&#9762; System Wipe - Step 2 of 2</div>'
+            + '<p style="font-size:1rem;color:var(--text);margin-bottom:24px;line-height:1.7">'
+            + '<strong style="color:var(--red)">This is your last chance.</strong><br>'
+            + 'All data will be permanently destroyed.<br>'
+            + 'This action <strong>cannot</strong> be undone.</p>'
+            + '<div style="display:flex;gap:12px;justify-content:center">'
+            + '<button id="_sw2_cancel" class="btn" style="min-width:100px">Cancel</button>'
+            + '<button id="_sw2_ok" class="btn btn-danger" style="min-width:140px">Wipe Everything</button>'
+            + '</div></div>';
+          document.body.appendChild(o2);
+          document.getElementById('_sw2_cancel').onclick = function() { document.body.removeChild(o2); };
+          document.getElementById('_sw2_ok').focus();
+          document.getElementById('_sw2_ok').onclick = function() {
+            document.body.removeChild(o2);
+            // Submit hidden form with CSRF + token
+            var f = document.createElement('form');
+            f.method = 'POST';
+            f.action = '/manage/admin/system-wipe';
+            var ct = document.createElement('input'); ct.type='hidden'; ct.name='confirm_token'; ct.value='SYSTEMWIPE';
+            f.appendChild(ct);
+            var csrf = document.createElement('input'); csrf.type='hidden'; csrf.name='_csrf';
+            csrf.value = (document.cookie.match(/wkcsrf=([^;]+)/) || [])[1] || '';
+            f.appendChild(csrf);
+            document.body.appendChild(f);
+            f.submit();
+          };
+          o2.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') document.body.removeChild(o2);
+          });
+        };
+        o.addEventListener('keydown', function(e) {
+          if (e.key === 'Escape') document.body.removeChild(o);
+          if (e.key === 'Enter' && inp.value === 'SYSTEMWIPE') document.getElementById('_sw1_ok').click();
+        });
+      }
+      wipeBtn.addEventListener('click', initiateSystemWipe);
+    })();
+    </script>'''
 
 
 
