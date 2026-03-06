@@ -11610,8 +11610,12 @@ class ManageHandler(BaseHTTPRequestHandler):
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
         warn     = urllib.parse.unquote(qs.get('warn',     [''])[0])
-        self._send_html(_render_torrent_detail(user, t, back_url=back,
-                                               msg=msg, msg_type=msg_type, warn=warn))
+        current_token = self._current_valid_session_token()
+        csrf_token = _csrf_token(current_token) if current_token else ''
+        self._send_html(_render_torrent_detail(
+            user, t, back_url=back, msg=msg, msg_type=msg_type, warn=warn,
+            csrf_token=csrf_token
+        ))
 
     def _post_delete_torrent(self):
         user = self._get_session_user()
@@ -18843,13 +18847,19 @@ def _render_notifications_page(viewer) -> str:
     return _manage_page('Notifications', body, user=viewer)
 
 
-def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: str = '', msg_type: str = 'error', warn: str = '') -> str:
+def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: str = '',
+                           msg_type: str = 'error', warn: str = '',
+                           csrf_token: str = '') -> str:
     """Full detail page for a single torrent."""
     is_super  = viewer['username'] == SUPER_USER
     vrole     = _user_role(viewer)
     is_owner  = t['uploaded_by_id'] == viewer['id']
     can_del   = is_super or vrole == 'admin' or is_owner
     ih        = t['info_hash']
+    csrf = (csrf_token or '').strip()
+    if not csrf:
+        token = _session_token_for(viewer)
+        csrf = _csrf_token(token) if token else ''
     vote_summary = (REGISTRATION_DB.get_torrent_vote_summary(ih, user_id=int(viewer['id']))
                     if REGISTRATION_DB else {'up': 0, 'down': 0, 'my_vote': 0})
     vote_up = int(vote_summary.get('up', 0))
@@ -18928,6 +18938,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             peer_update_btn = (
                 f'<form method="POST" action="/manage/torrent/update-peers" style="display:inline">'
                 f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
                 f'<button type="submit" class="btn btn-green">Refresh Seeds/Peers</button>'
                 f'</form>'
             )
@@ -18940,6 +18951,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                    f' data-confirm="Permanently delete {tname}?">'
                    f'<input type="hidden" name="info_hash" value="{ih}">'
                    f'<input type="hidden" name="redirect" value="{back_url}">'
+                   f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
                    f'<button class="btn btn-danger" aria-label="Delete torrent {tname}">Delete</button></form>')
 
     # Lock/unlock comments button (admin/super only)
@@ -18952,6 +18964,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             lock_btn = (
                 f'<form method="POST" action="/manage/torrent/unlock" style="display:inline">'
                 f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
                 f'<button type="submit" class="btn btn-sm"'
                 f' aria-label="Unlock comments for this torrent">&#x1F513; Unlock Comments</button>'
                 f'</form>'
@@ -18960,6 +18973,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             lock_btn = (
                 f'<form method="POST" action="/manage/torrent/lock" style="display:inline">'
                 f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
                 f'<button type="submit" class="btn btn-sm btn-danger"'
                 f' aria-label="Lock comments for this torrent">&#x1F512; Lock Comments</button>'
                 f'</form>'
@@ -18969,6 +18983,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             f'<form method="POST" action="/manage/comment/delete-all" style="display:inline"'
             f' data-confirm="Delete ALL comments on {tname_esc}? This cannot be undone.">'
             f'<input type="hidden" name="info_hash" value="{ih}">'
+            f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
             f'<button type="submit" class="btn btn-sm btn-danger"'
             f' aria-label="Delete all comments on this torrent">&#x1F5D1; Delete All Comments</button>'
             f'</form>'
@@ -19005,6 +19020,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         '<div style="display:flex;gap:8px;flex-wrap:wrap">'
         f'<form method="POST" action="/manage/torrent/vote" style="display:inline">'
         f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
+        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
         '<input type="hidden" name="vote" value="up">'
         f'<button type="submit" class="btn {"btn-green" if my_vote == 1 else ""}" '
         'style="font-size:1.02rem;padding:10px 14px;line-height:1.1;min-width:88px" '
@@ -19012,6 +19028,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         '</form>'
         f'<form method="POST" action="/manage/torrent/vote" style="display:inline">'
         f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
+        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
         '<input type="hidden" name="vote" value="down">'
         f'<button type="submit" class="btn {"btn-danger" if my_vote == -1 else ""}" '
         'style="font-size:1.02rem;padding:10px 14px;line-height:1.1;min-width:88px" '
