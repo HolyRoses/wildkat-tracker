@@ -241,6 +241,8 @@ def _ip_is_trusted_proxy(addr: str) -> bool:
 def _resolved_client_ip(socket_ip: str, headers) -> tuple[str, str]:
     """Resolve effective client IP with strict trusted-proxy XFF handling."""
     xff_header = ''
+    resolved = socket_ip
+    source = 'socket'
     try:
         xff_header = headers.get('X-Forwarded-For', '') if headers else ''
     except Exception:
@@ -248,8 +250,18 @@ def _resolved_client_ip(socket_ip: str, headers) -> tuple[str, str]:
     if xff_header and _ip_is_trusted_proxy(socket_ip):
         forwarded = _first_valid_xff_ip(xff_header)
         if forwarded:
-            return forwarded, 'xff_trusted_proxy'
-    return socket_ip, 'socket'
+            resolved = forwarded
+            source = 'xff_trusted_proxy'
+    # Canonicalize IPv4-mapped IPv6 so bans/attribution use one stable key.
+    try:
+        addr = ipaddress.ip_address(resolved)
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            resolved = str(addr.ipv4_mapped)
+        else:
+            resolved = str(addr)
+    except Exception:
+        pass
+    return resolved, source
 
 
 def _security_cfg_int(key: str, default: int, lo: int, hi: int) -> int:
@@ -622,10 +634,6 @@ class PeerRegistry:
                 if ip_latest:
                     out[ih_hex] = ip_latest
             return out
-
-    def all_hashes(self):
-        with self._lock:
-            return list(self._torrents.keys())
 
     def active_hashes(self) -> list[str]:
         """Return info_hashes that currently have at least one non-stale peer."""
@@ -1196,13 +1204,9 @@ def _h(s: str) -> str:
 
 def _session_token_for(user) -> str:
     """Look up the most recent active session token for a user (for CSRF generation in render functions)."""
-    if not REGISTRATION_DB:
+    if not user or not REGISTRATION_DB:
         return ''
-    row = REGISTRATION_DB._conn().execute(
-        'SELECT token FROM sessions WHERE user_id=? ORDER BY id DESC LIMIT 1',
-        (user['id'],)
-    ).fetchone()
-    return row[0] if row else ''
+    return REGISTRATION_DB.get_latest_session_token_for_user(int(user['id']))
 
 
 def _csrf_token(session_token: str) -> str:
@@ -1461,6 +1465,17 @@ def _auth_rate_limit_allow(bucket: str, ip: str, limit: int = AUTH_IP_RATE_MAX_R
             return False
         dq.append(now)
     return True
+
+
+def _auth_rate_limit_prune_empty() -> int:
+    """Remove empty buckets to prevent unbounded key accumulation under scans."""
+    removed = 0
+    with _AUTH_RATE_LIMIT_LOCK:
+        stale_keys = [k for k, dq in _AUTH_RATE_LIMIT_HITS.items() if not dq]
+        for k in stale_keys:
+            _AUTH_RATE_LIMIT_HITS.pop(k, None)
+            removed += 1
+    return removed
 
 
 def _build_tfa_fernet():
@@ -2654,6 +2669,27 @@ class RegistrationDB:
             (conversation_id, username, username)
         ).fetchall()
 
+    def get_new_conversation_messages(self, conversation_id: int, since_id: int, username: str) -> list:
+        return self._conn().execute(
+            '''SELECT id, sender, recipient, subject, body, sent_at, is_broadcast
+               FROM direct_messages
+               WHERE id > ? AND conversation_id=?
+               AND (
+                   (sender=? AND del_by_sender=0)
+                   OR (recipient=? AND del_by_recip=0)
+               )
+               ORDER BY id ASC''',
+            (int(since_id), int(conversation_id), username, username)
+        ).fetchall()
+
+    def mark_conversation_messages_read(self, conversation_id: int, username: str) -> None:
+        self._conn().execute(
+            '''UPDATE direct_messages SET read_at=?
+               WHERE conversation_id=? AND recipient=? AND read_at IS NULL''',
+            (self._ts(), int(conversation_id), username)
+        )
+        self._conn().commit()
+
     def get_unread_dm_count(self, username: str) -> int:
         """Count conversations with at least one unread message for this user."""
         return self._conn().execute(
@@ -3289,6 +3325,13 @@ class RegistrationDB:
         if actor:
             self._log(actor, 'topup_provider_ref_set', str(order_id),
                       f'checkout_id={provider_checkout_id[:32]} charge_id={provider_charge_id[:32]}')
+
+    def touch_topup_order_webhook_at(self, order_id: int) -> None:
+        self._conn().execute(
+            'UPDATE topup_orders SET last_webhook_at=?, updated_at=? WHERE id=?',
+            (self._ts(), self._ts(), int(order_id))
+        )
+        self._conn().commit()
 
     def create_coinbase_checkout_for_order(self, order_id: int, user, actor: str = '') -> tuple[bool, dict]:
         order = self.get_topup_order(order_id)
@@ -4122,6 +4165,17 @@ class RegistrationDB:
                 log.warning('update_last_seen failed (non-fatal): %s', e)
         except Exception:
             pass
+
+    def trim_last_seen_cache(self, max_age_sec: float = 120.0) -> int:
+        """Drop stale throttle entries to keep cache bounded over long uptimes."""
+        removed = 0
+        cutoff = time.monotonic() - max(1.0, float(max_age_sec))
+        with self._last_seen_lock:
+            stale = [uid for uid, ts in self._last_seen_cache.items() if float(ts) < cutoff]
+            for uid in stale:
+                self._last_seen_cache.pop(uid, None)
+                removed += 1
+        return removed
 
     def list_users(self, page: int = 1, per_page: int = 50) -> list:
         offset = (page - 1) * per_page
@@ -5771,6 +5825,13 @@ class RegistrationDB:
         return summary
 
     # ── Sessions ───────────────────────────────────────────────
+
+    def get_latest_session_token_for_user(self, user_id: int) -> str:
+        row = self._conn().execute(
+            'SELECT token FROM sessions WHERE user_id=? ORDER BY id DESC LIMIT 1',
+            (int(user_id),)
+        ).fetchone()
+        return str(row[0]) if row and row[0] else ''
 
     def create_session(self, user_id: int, must_enroll_passkey: bool = False,
                        primary_auth_ok: bool = True, must_enroll_tfa: bool = False,
@@ -9174,6 +9235,16 @@ class ManageHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'same-origin')
+        self.send_header(
+            'Content-Security-Policy',
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https://www.gravatar.com https://secure.gravatar.com https://*.gravatar.com"
+        )
         self._refresh_csrf_cookie()  # ensure wkcsrf is always current
         self.end_headers()
         self.wfile.write(body)
@@ -9434,8 +9505,8 @@ class ManageHandler(BaseHTTPRequestHandler):
 
     def _clear_session_cookie(self):
         expired = 'Expires=Thu, 01 Jan 1970 00:00:00 GMT'
-        self.send_header('Set-Cookie', f'wksession=; Path=/; HttpOnly; {expired}')
-        self.send_header('Set-Cookie', f'wkcsrf=; Path=/; {expired}')
+        self.send_header('Set-Cookie', f'wksession=; Path=/; HttpOnly; SameSite=Lax; Secure; {expired}')
+        self.send_header('Set-Cookie', f'wkcsrf=; Path=/; SameSite=Strict; Secure; {expired}')
 
     def _https_redirect(self):
         """Redirect to HTTPS if we're on plain HTTP."""
@@ -10496,7 +10567,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             'Please try again later or contact an administrator.'
             if reveal_lockout_msg else invalid_login_msg
         )
-        client_ip = self.client_address[0]
+        client_ip, _ = self._client_ip_info()
         if not _auth_rate_limit_allow('login', client_ip):
             log.warning('LOGIN rate_limited ip=%s user=%r', client_ip, username)
             self._send_html(_render_login('Too many sign-in attempts. Please wait and try again.'))
@@ -10618,7 +10689,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         ok, err = self._webauthn_guard()
         if not ok:
             return self._send_json({'ok': False, 'error': err}, 400)
-        client_ip = self.client_address[0] if self.client_address else ''
+        client_ip, _ = self._client_ip_info()
         if not _auth_rate_limit_allow('webauthn_auth_start', client_ip):
             log.warning('WEBAUTHN auth start rate_limited ip=%s', client_ip)
             return self._send_json({'ok': False, 'error': 'Invalid credentials.'}, 429)
@@ -10735,7 +10806,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         ok, err = self._webauthn_guard()
         if not ok:
             return self._send_json({'ok': False, 'error': err}, 400)
-        client_ip = self.client_address[0] if self.client_address else ''
+        client_ip, _ = self._client_ip_info()
         if not _auth_rate_limit_allow('webauthn_auth_finish', client_ip):
             log.warning('WEBAUTHN auth finish rate_limited ip=%s', client_ip)
             return self._send_json({'ok': False, 'error': 'Passkey authentication failed.'}, 429)
@@ -13407,11 +13478,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                         linked_order_id, 'pending', actor='coinbase_webhook',
                         reason='provider_pending', detail=f'Webhook {event_type}'
                     )
-                REGISTRATION_DB._conn().execute(
-                    'UPDATE topup_orders SET last_webhook_at=?, updated_at=? WHERE id=?',
-                    (REGISTRATION_DB._ts(), REGISTRATION_DB._ts(), linked_order_id)
-                )
-                REGISTRATION_DB._conn().commit()
+                REGISTRATION_DB.touch_topup_order_webhook_at(linked_order_id)
             except Exception as exc:
                 REGISTRATION_DB.mark_topup_webhook_processed(wh_id, status='error', error_msg=str(exc))
                 return self._send_json({'ok': False}, 500)
@@ -13512,11 +13579,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                     )
                     log.debug('PAYPAL webhook marked_failed order_id=%s event_type=%s event_id=%s',
                               linked_order_id, event_type[:80], event_id[:40])
-                REGISTRATION_DB._conn().execute(
-                    'UPDATE topup_orders SET last_webhook_at=?, updated_at=? WHERE id=?',
-                    (REGISTRATION_DB._ts(), REGISTRATION_DB._ts(), linked_order_id)
-                )
-                REGISTRATION_DB._conn().commit()
+                REGISTRATION_DB.touch_topup_order_webhook_at(linked_order_id)
             except Exception as exc:
                 log.exception('PAYPAL webhook processing_error wh_id=%s order_id=%s event_id=%s err=%s',
                               wh_id, linked_order_id, event_id[:40], exc)
@@ -13664,17 +13727,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         conv_id   = int(qs.get('conv_id', ['0'])[0])
         new_msgs  = []
         if conv_id and REGISTRATION_DB:
-            rows = REGISTRATION_DB._conn().execute(
-                '''SELECT id, sender, recipient, subject, body, sent_at, is_broadcast
-                   FROM direct_messages
-                   WHERE id > ? AND conversation_id=?
-                   AND (
-                       (sender=? AND del_by_sender=0)
-                       OR (recipient=? AND del_by_recip=0)
-                   )
-                   ORDER BY id ASC''',
-                (since_id, conv_id, uname, uname)
-            ).fetchall()
+            rows = REGISTRATION_DB.get_new_conversation_messages(conv_id, since_id, uname)
             for m in rows:
                 new_msgs.append({
                     'id':           m['id'],
@@ -13688,12 +13741,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                 })
             # Mark newly arrived incoming messages as read
             if new_msgs:
-                REGISTRATION_DB._conn().execute(
-                    '''UPDATE direct_messages SET read_at=?
-                       WHERE conversation_id=? AND recipient=? AND read_at IS NULL''',
-                    (datetime.datetime.now().isoformat(timespec='seconds'), conv_id, uname)
-                )
-                REGISTRATION_DB._conn().commit()
+                REGISTRATION_DB.mark_conversation_messages_read(conv_id, uname)
 
         # Presence
         other_online  = False
@@ -21020,6 +21068,18 @@ def main():
                     REGISTRATION_DB.security_prune_counters(older_than_sec=7200)
                 except Exception as _e:
                     log.warning('security_prune_counters failed (non-fatal): %s', _e)
+                try:
+                    _auth_removed = _auth_rate_limit_prune_empty()
+                    if _auth_removed:
+                        log.debug('auth rate-limit prune removed %d empty bucket(s)', _auth_removed)
+                except Exception as _e:
+                    log.warning('auth_rate_limit_prune_empty failed (non-fatal): %s', _e)
+                try:
+                    _ls_removed = REGISTRATION_DB.trim_last_seen_cache(max_age_sec=120.0)
+                    if _ls_removed:
+                        log.debug('last_seen cache prune removed %d stale entry(ies)', _ls_removed)
+                except Exception as _e:
+                    log.warning('trim_last_seen_cache failed (non-fatal): %s', _e)
                 try:
                     _sp_cfg = REGISTRATION_DB.get_stats_persist_config()
                     _now = time.time()
