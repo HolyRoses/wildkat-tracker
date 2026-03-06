@@ -571,9 +571,11 @@ class PeerRegistry:
     def scrape_stats(self, ih_hex: str):
         """Return (complete, incomplete, downloaded) for a single info_hash."""
         with self._lock:
-            self._ensure(ih_hex)
+            peers_map = self._torrents.get(ih_hex)
+            if not peers_map:
+                return 0, 0, 0
             self._purge_stale(ih_hex)
-            peers = list(self._torrents[ih_hex].values())
+            peers = list(self._torrents.get(ih_hex, {}).values())
 
         complete   = sum(1 for p in peers if p['left'] == 0)
         incomplete = len(peers) - complete
@@ -583,9 +585,11 @@ class PeerRegistry:
     def get_active_ip_last_seen(self, ih_hex: str) -> list[tuple[str, float]]:
         """Return unique active peer IPs for a torrent with most recent seen time."""
         with self._lock:
-            self._ensure(ih_hex)
+            peers_map = self._torrents.get(ih_hex)
+            if not peers_map:
+                return []
             self._purge_stale(ih_hex)
-            peers = list(self._torrents[ih_hex].values())
+            peers = list(self._torrents.get(ih_hex, {}).values())
         ip_latest: dict[str, float] = {}
         for p in peers:
             ip = p.get('ip', '')
@@ -622,6 +626,16 @@ class PeerRegistry:
     def all_hashes(self):
         with self._lock:
             return list(self._torrents.keys())
+
+    def active_hashes(self) -> list[str]:
+        """Return info_hashes that currently have at least one non-stale peer."""
+        with self._lock:
+            out = []
+            for ih_hex in list(self._torrents.keys()):
+                self._purge_stale(ih_hex)
+                if self._torrents.get(ih_hex):
+                    out.append(ih_hex)
+            return out
 
     def live_stats(self) -> tuple[int, int]:
         """Return (active_torrent_count, live_peer_count) under registry lock."""
@@ -7399,8 +7413,8 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
                 log.debug('HTTP SCRAPE  full scrape denied from=%s', self.client_address[0])
                 self._send_bencode(200, {b'failure reason': b'full scrape not allowed'})
                 return
-            # Full scrape allowed -- return all known torrents
-            ih_list = [bytes.fromhex(h) for h in REGISTRY.all_hashes()]
+            # Full scrape allowed -- return only currently active swarms.
+            ih_list = [bytes.fromhex(h) for h in REGISTRY.active_hashes()]
         elif len(ih_list) > MAX_SCRAPE_HASHES:
             log.debug('HTTP SCRAPE  too many hashes (%d) from=%s', len(ih_list), self.client_address[0])
             self._send_bencode(200, {b'failure reason': f'too many info_hashes, max is {MAX_SCRAPE_HASHES}'.encode()})
