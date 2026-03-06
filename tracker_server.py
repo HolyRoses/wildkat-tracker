@@ -15444,8 +15444,8 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
     black_btn_style = 'width:100%;margin-top:8px;background:#000;color:#fff;border-color:var(--border)'
     if passkey_sitewide:
         passkey_primary_btn = (
-            '<button type="button" class="btn btn-primary" style="width:100%;margin-top:8px" '
-            'onclick="startPasskeyLogin()">Sign in with Passkey</button>'
+            '<button type="button" id="passkey-primary-signin" class="btn btn-primary" style="width:100%;margin-top:8px">'
+            'Sign in with Passkey</button>'
         )
         passkey_sitewide_divider = '<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border)"></div>'
         sign_in_btn_cls = 'btn'
@@ -15467,7 +15467,7 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
     if webauthn_on:
         passkey_controls = (
             '<div id="passkey-login-msg" style="margin-top:8px;color:var(--muted);font-size:0.82rem"></div>'
-            '<button type="button" id="passkey-try-all" class="btn btn-sm" style="display:none;width:100%;margin-top:8px" onclick="startPasskeyLogin(true)">Try a different passkey</button>'
+            '<button type="button" id="passkey-try-all" class="btn btn-sm" style="display:none;width:100%;margin-top:8px">Try a different passkey</button>'
         )
         if passkey_sitewide:
             passkey_block = (
@@ -15479,18 +15479,20 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
             passkey_secondary_btn_id = ' id="passkey-secondary-signin"'
             passkey_block = (
                 '<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">'
-                f'<button type="button"{passkey_secondary_btn_id} class="btn" style="{black_btn_style}" onclick="startPasskeyLogin()">Sign in with Passkey</button>'
+                f'<button type="button"{passkey_secondary_btn_id} class="btn" style="{black_btn_style}">Sign in with Passkey</button>'
                 + passkey_controls +
                 '</div>'
             )
         passkey_block += (
             '<script>'
             '(function(){'
-            'window.startPasskeyLogin = async function(allCreds,autoRetried){'
+            'var primaryBtn=document.getElementById("passkey-primary-signin");'
+            'var secondaryBtn=document.getElementById("passkey-secondary-signin");'
+            'var tryAllBtn=document.getElementById("passkey-try-all");'
+            'async function startPasskeyLogin(allCreds,autoRetried){'
             'var u=document.querySelector(\'input[name=\"username\"]\');'
             'var m=document.getElementById(\"passkey-login-msg\");'
-            'var alt=document.getElementById(\"passkey-try-all\");'
-            'var showAlt=function(v){if(alt)alt.style.display=v?\"block\":\"none\";};'
+            'var showAlt=function(v){if(tryAllBtn)tryAllBtn.style.display=v?\"block\":\"none\";};'
             'var retried=!!autoRetried;'
             'var username=(u&&u.value?u.value.trim():\"\");'
             'if(!username){if(m)m.textContent=\"Enter your username first.\";return;}'
@@ -15528,21 +15530,24 @@ def _render_login(msg: str = '', msg_type: str = 'error') -> str:
             'var fj={};try{fj=await f.json();}catch(_e){fj={ok:false,error:\"Passkey finish failed (invalid server response).\"};}'
             'if(!fj.ok){'
             'if(fj.redirect){window.location.href=fj.redirect;return;}'
-            'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return window.startPasskeyLogin(true,true);}'
+            'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return startPasskeyLogin(true,true);}'
             'if(m)m.textContent=fj.error||\"Passkey authentication failed.\";if(canTryAll)showAlt(true);return;}'
             'window.location.href=fj.redirect||\"/manage/dashboard\";'
             '}catch(e){'
             'var n=(e&&e.name)||\"\";'
             'if(n===\"NotAllowedError\"){'
-            'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return window.startPasskeyLogin(true,true);}'
+            'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return startPasskeyLogin(true,true);}'
             'if(m)m.textContent=\"Authentication was canceled or the selected key is not valid for this username. Try again and choose the matching passkey.\";if(canTryAll)showAlt(true);return;}'
             'if(n===\"InvalidStateError\"){'
-            'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return window.startPasskeyLogin(true,true);}'
+            'if(canTryAll&&!retried){if(m)m.textContent=\"Trying other registered passkeys...\";return startPasskeyLogin(true,true);}'
             'if(m)m.textContent=\"Selected key is not registered for this account.\";if(canTryAll)showAlt(true);return;}'
             'if(n===\"AbortError\"){if(m)m.textContent=\"Passkey request was interrupted. Please try again.\";return;}'
             'if(m)m.textContent=\"Passkey authentication failed.\";'
             '}'
-            '};'
+            '}'
+            'if(primaryBtn)primaryBtn.addEventListener("click",function(){startPasskeyLogin(false,false);});'
+            'if(secondaryBtn)secondaryBtn.addEventListener("click",function(){startPasskeyLogin(false,false);});'
+            'if(tryAllBtn)tryAllBtn.addEventListener("click",function(){startPasskeyLogin(true,false);});'
             '})();'
             '</script>'
         )
@@ -15620,13 +15625,14 @@ def _render_passkey_enroll_page(user, msg: str = '', msg_type: str = 'error') ->
         '<div style="font-size:0.9rem;color:var(--muted);margin-bottom:12px">'
         f'Signed in as <strong style="color:var(--text)">{uname}</strong>. Add at least one passkey to continue.'
         '</div>'
-        '<button type="button" class="btn btn-primary" onclick="wkEnrollRequiredPasskey()">Add Passkey</button>'
+        '<button type="button" id="wk-enroll-required-btn" class="btn btn-primary">Add Passkey</button>'
         '<a href="/manage/logout" class="btn btn-sm" style="margin-left:8px">Logout</a>'
         '<div id="wk-enroll-msg" style="margin-top:10px;font-size:0.84rem;color:var(--muted)"></div>'
         '</div>'
         '<script>'
         '(function(){'
-        'window.wkEnrollRequiredPasskey=async function(){'
+        'var enrollBtn=document.getElementById("wk-enroll-required-btn");'
+        'async function wkEnrollRequiredPasskey(){'
         'var m=document.getElementById("wk-enroll-msg");'
         f'var csrf="{_csrf_token(_session_token_for(user))}";'
         'if(!window.PublicKeyCredential){if(m)m.textContent="Passkeys are not supported in this browser.";return;}'
@@ -15648,7 +15654,9 @@ def _render_passkey_enroll_page(user, msg: str = '', msg_type: str = 'error') ->
         'if(!fj.ok){if(m)m.textContent=fj.error||"Registration failed.";return;}'
         'if(m)m.textContent="Passkey registered.";'
         'window.location.href=fj.redirect||"/manage/dashboard";'
-        '}catch(e){if(m)m.textContent="Passkey registration failed.";}};})();'
+        '}catch(e){if(m)m.textContent="Passkey registration failed.";}}'
+        'if(enrollBtn)enrollBtn.addEventListener("click",wkEnrollRequiredPasskey);'
+        '})();'
         '</script>'
         '</div>'
     )
@@ -19453,7 +19461,10 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             al_rows = '<tr><td colspan="3" class="empty">No restrictions -- any IP allowed</td></tr>'
 
         ip_lock_js = (
-            '<script>function doIpLock(){'
+            '<script>(function(){'
+            + 'var ipLockBtn=document.getElementById("ip-lock-selected-btn");'
+            + 'if(!ipLockBtn)return;'
+            + 'function doIpLock(){'
             + 'var cbs=document.querySelectorAll(\'input[name="ip_check"]:checked\');'
             + 'if(!cbs.length){alert("Select at least one IP.");return;}'
             + 'var ips=Array.from(cbs).map(function(c){return c.value;}).join(",");'
@@ -19464,6 +19475,8 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + 'var m=document.cookie.match(/(?:^|;[ \\t]*)wkcsrf=([^;]+)/);'
             + 'var c=document.createElement("input");c.type="hidden";c.name="_csrf";c.value=(m?m[1]:"");f.appendChild(c);}'
             + 'f.submit();}'
+            + 'ipLockBtn.addEventListener("click",doIpLock);'
+            + '})();'
             + '</script>'
         )
 
@@ -19490,7 +19503,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + ip_rows
             + '</table></div>'
             + '<div style="margin-top:12px">'
-            + '<button type="button" class="btn btn-sm btn-primary" onclick="doIpLock()">&#128274; IP Lock Selected</button>'
+            + '<button type="button" id="ip-lock-selected-btn" class="btn btn-sm btn-primary">&#128274; IP Lock Selected</button>'
             + '</div></form></div>'
             + '<div class="card" style="overflow:hidden">'
             + '<div class="card-title">IP Allowlist</div>'
@@ -19673,11 +19686,12 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<div><button type="submit" class="btn btn-sm btn-accent-rev">Save Passkey Settings</button></div>'
             '</form>'
             + ('' if (not _WEBAUTHN_LIB_AVAILABLE or not _webauthn_login_enabled) else
-               '<button type="button" class="btn btn-sm btn-green" onclick="wkStartPasskeyEnroll()">Add Passkey</button>'
+               '<button type="button" id="wk-passkey-add-btn" class="btn btn-sm btn-green">Add Passkey</button>'
                '<div id="wk-passkey-msg" style="margin-top:8px;font-size:0.8rem;color:var(--muted)"></div>'
                '<script>'
                '(function(){'
-               'window.wkStartPasskeyEnroll=async function(){'
+               'var addBtn=document.getElementById("wk-passkey-add-btn");'
+               'async function wkStartPasskeyEnroll(){'
                'var m=document.getElementById("wk-passkey-msg");'
                f'var csrf="{_csrf_token(_session_token_for(viewer))}";'
                'if(!window.PublicKeyCredential){if(m)m.textContent="Passkeys are not supported in this browser.";return;}'
@@ -19699,7 +19713,9 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                'if(!fj.ok){if(m)m.textContent=fj.error||"Registration failed.";return;}'
                'if(m)m.textContent="Passkey registered.";'
                'setTimeout(function(){window.location.reload();},700);'
-               '}catch(e){if(m)m.textContent="Passkey registration failed.";}};})();'
+               '}catch(e){if(m)m.textContent="Passkey registration failed.";}}'
+               'if(addBtn)addBtn.addEventListener("click",wkStartPasskeyEnroll);'
+               '})();'
                '</script>')
             + '<div class="table-wrap" style="margin-top:10px"><table>'
             '<tr><th scope="col">Nickname</th><th scope="col">State</th><th scope="col">Last Used</th><th scope="col">Actions</th></tr>'
@@ -20236,8 +20252,8 @@ def _render_topups_page(user, orders: list, cfg: dict, msg: str = '', msg_type: 
     for amt in cfg.get('fixed_amounts_usd', [5, 10, 25, 50, 100]):
         q = REGISTRATION_DB.quote_topup_points(amt) if REGISTRATION_DB else {'quoted_points': 0}
         amount_buttons += (
-            f'<button type="button" class="btn btn-primary" style="margin-right:8px;margin-bottom:8px" '
-            f'onclick="submitTopupOrder({amt})">${amt} → {q["quoted_points"]} pts</button>'
+            f'<button type="button" class="btn btn-primary topup-amount-btn" style="margin-right:8px;margin-bottom:8px" '
+            f'data-amount="{amt}">${amt} → {q["quoted_points"]} pts</button>'
         )
     user_seq = {}
     for idx, o in enumerate(sorted(orders, key=lambda r: int(r['id']))):
@@ -20286,7 +20302,13 @@ def _render_topups_page(user, orders: list, cfg: dict, msg: str = '', msg_type: 
         + provider_control_html
         + '</form>'
         '<div style="display:flex;flex-wrap:wrap;align-items:center">' + amount_buttons + '</div>'
-        '<script>function submitTopupOrder(amt){var f=document.getElementById("topup-create-form");var a=document.getElementById("topup-amount-usd");if(!f||!a)return;a.value=String(amt);if(typeof _submitFormWithCsrf==="function"){_submitFormWithCsrf(f);}else{f.submit();}}</script>'
+        '<script>(function(){'
+        'var f=document.getElementById("topup-create-form");'
+        'var a=document.getElementById("topup-amount-usd");'
+        'if(!f||!a)return;'
+        'function submitTopupOrder(amt){a.value=String(amt);if(typeof _submitFormWithCsrf==="function"){_submitFormWithCsrf(f);}else{f.submit();}}'
+        'document.querySelectorAll(".topup-amount-btn").forEach(function(btn){btn.addEventListener("click",function(){submitTopupOrder(btn.getAttribute("data-amount")||"");});});'
+        '})();</script>'
         '</div>'
         '<div class="card">'
         '<div class="card-title">Order History</div>'
