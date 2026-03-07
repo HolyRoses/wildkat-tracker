@@ -14938,98 +14938,132 @@ function copyInvite(btn, path) {
     prompt('Copy this invite URL:', url);
   });
 }
-function toggleNotifDropdown(e) {
-  e.stopPropagation();
-  var btn = document.getElementById('nav-bell');
-  var d = document.getElementById('notif-dropdown');
-  if (!d) return;
-  var opening = !d.classList.contains('open');
-  d.classList.toggle('open');
-  if (btn) btn.setAttribute('aria-expanded', opening ? 'true' : 'false');
-  if (!opening) return;
-  // Fetch fresh notifications every time the dropdown opens
-  var body = d.querySelector('.notif-dropdown-body');
-  fetch('/manage/notifications/preview', {credentials:'same-origin'})
-    .then(function(r){ return r.ok ? r.json() : null; })
-    .then(function(data){
-      if (!body) return;
-      if (!data || !data.items || !data.items.length) {
-        body.innerHTML = '<div class="notif-empty">No unread notifications</div>';
-        return;
-      }
-      var html = '';
-      data.items.forEach(function(n){
-        var tname = n.torrent.length >= 40 ? n.torrent + '...' : n.torrent;
-        html += '<button class="notif-item" onclick="readNotif(' + n.id + ',&#39;' + n.url + '&#39;)">'
-              + '<div class="notif-item-type">' + n.icon + ' <strong>' + _esc(n.from) + '</strong> ' + _esc(n.label) + '</div>'
-              + '<div class="notif-item-text"><em>' + _esc(tname) + '</em></div>'
-              + '<div class="notif-item-ts">' + _esc(n.ts) + '</div>'
-              + '</button>';
-      });
-      body.innerHTML = html;
-    })
-    .catch(function(){
-      if (body) body.innerHTML = '<div class="notif-empty">Could not load notifications</div>';
-    });
-}
-function _esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-document.addEventListener('click', function() {
-  var btn = document.getElementById('nav-bell');
-  var d = document.getElementById('notif-dropdown');
-  if (d) d.classList.remove('open');
-  if (btn) btn.setAttribute('aria-expanded', 'false');
-});
-document.addEventListener('keydown', function(e){
-  if (e.key !== 'Escape') return;
-  var btn = document.getElementById('nav-bell');
-  var d = document.getElementById('notif-dropdown');
-  if (!d || !d.classList.contains('open')) return;
-  d.classList.remove('open');
-  if (btn) {
-    btn.setAttribute('aria-expanded', 'false');
-    btn.focus();
+// Notification dropdown and notification read actions.
+(function() {
+  var bellBtn = document.getElementById('nav-bell');
+  var notifDropdown = document.getElementById('notif-dropdown');
+
+  function _esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
-});
-function readNotif(id, url) {
-  fetch('/manage/notifications/read/' + id, {method:'POST',
-    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:'_csrf=' + encodeURIComponent(document.cookie.match(/wkcsrf=([^;]+)/)?.[1] || '')
-  }).then(function() { window.location = url; });
-}
-function toggleReplyForm(id, mentionUser) {
-  // Close any other open reply forms first
-  document.querySelectorAll('.comment-reply-form.open').forEach(function(el) {
-    if (el.id !== 'reply-form-' + id) {
-      el.classList.remove('open');
-      var ta = el.querySelector('textarea');
-      if (ta) ta.value = '';
+
+  function readNotif(id, url) {
+    fetch('/manage/notifications/read/' + id, {method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'_csrf=' + encodeURIComponent(document.cookie.match(/wkcsrf=([^;]+)/)?.[1] || '')
+    }).then(function() { window.location = url; });
+  }
+
+  function toggleNotifDropdown(e) {
+    e.stopPropagation();
+    if (!notifDropdown) return;
+    var opening = !notifDropdown.classList.contains('open');
+    notifDropdown.classList.toggle('open');
+    if (bellBtn) bellBtn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+    if (!opening) return;
+    var body = notifDropdown.querySelector('.notif-dropdown-body');
+    fetch('/manage/notifications/preview', {credentials:'same-origin'})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(data){
+        if (!body) return;
+        if (!data || !data.items || !data.items.length) {
+          body.innerHTML = '<div class="notif-empty">No unread notifications</div>';
+          return;
+        }
+        var html = '';
+        data.items.forEach(function(n){
+          var tname = n.torrent.length >= 40 ? n.torrent + '...' : n.torrent;
+          html += '<button class="notif-item" data-notif-id="' + n.id + '" data-notif-url="' + _esc(n.url) + '">'
+                + '<div class="notif-item-type">' + n.icon + ' <strong>' + _esc(n.from) + '</strong> ' + _esc(n.label) + '</div>'
+                + '<div class="notif-item-text"><em>' + _esc(tname) + '</em></div>'
+                + '<div class="notif-item-ts">' + _esc(n.ts) + '</div>'
+                + '</button>';
+        });
+        body.innerHTML = html;
+      })
+      .catch(function(){
+        if (body) body.innerHTML = '<div class="notif-empty">Could not load notifications</div>';
+      });
+  }
+
+  if (bellBtn) bellBtn.addEventListener('click', toggleNotifDropdown);
+
+  document.addEventListener('click', function(e) {
+    var notifTarget = e.target.closest('[data-notif-id][data-notif-url]');
+    if (notifTarget) {
+      e.preventDefault();
+      e.stopPropagation();
+      readNotif(notifTarget.getAttribute('data-notif-id'), notifTarget.getAttribute('data-notif-url'));
+      return;
+    }
+    if (notifDropdown) notifDropdown.classList.remove('open');
+    if (bellBtn) bellBtn.setAttribute('aria-expanded', 'false');
+  });
+
+  document.addEventListener('keydown', function(e){
+    if (e.key !== 'Escape') return;
+    if (!notifDropdown || !notifDropdown.classList.contains('open')) return;
+    notifDropdown.classList.remove('open');
+    if (bellBtn) {
+      bellBtn.setAttribute('aria-expanded', 'false');
+      bellBtn.focus();
     }
   });
-  var f = document.getElementById('reply-form-' + id);
-  if (!f) return;
-  var opening = !f.classList.contains('open');
-  f.classList.toggle('open');
-  if (opening) {
-    var ta = f.querySelector('textarea');
-    if (ta) {
-      if (mentionUser && ta.value === '') {
-        ta.value = '@' + mentionUser + ' ';
+})();
+
+// Comment reply/edit toggle actions.
+(function() {
+  function toggleReplyForm(id, mentionUser) {
+    document.querySelectorAll('.comment-reply-form.open').forEach(function(el) {
+      if (el.id !== 'reply-form-' + id) {
+        el.classList.remove('open');
+        var ta = el.querySelector('textarea');
+        if (ta) ta.value = '';
       }
-      ta.focus();
-      ta.setSelectionRange(ta.value.length, ta.value.length);
+    });
+    var f = document.getElementById('reply-form-' + id);
+    if (!f) return;
+    var opening = !f.classList.contains('open');
+    f.classList.toggle('open');
+    if (opening) {
+      var ta = f.querySelector('textarea');
+      if (ta) {
+        if (mentionUser && ta.value === '') ta.value = '@' + mentionUser + ' ';
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+      }
     }
   }
-}
-function toggleEditForm(id) {
-  var b = document.getElementById('comment-body-' + id);
-  var f = document.getElementById('edit-form-' + id);
-  if (!b || !f) return;
-  var editing = f.classList.contains('open');
-  if (editing) { f.classList.remove('open'); b.style.display = ''; }
-  else { f.classList.add('open'); b.style.display = 'none'; f.querySelector('textarea').focus(); }
-}
+
+  function toggleEditForm(id) {
+    var b = document.getElementById('comment-body-' + id);
+    var f = document.getElementById('edit-form-' + id);
+    if (!b || !f) return;
+    var editing = f.classList.contains('open');
+    if (editing) {
+      f.classList.remove('open');
+      b.style.display = '';
+    } else {
+      f.classList.add('open');
+      b.style.display = 'none';
+      f.querySelector('textarea').focus();
+    }
+  }
+
+  document.addEventListener('click', function(e) {
+    var replyBtn = e.target.closest('[data-reply-id]');
+    if (replyBtn) {
+      e.preventDefault();
+      toggleReplyForm(replyBtn.getAttribute('data-reply-id'), replyBtn.getAttribute('data-reply-user') || '');
+      return;
+    }
+    var editBtn = e.target.closest('[data-edit-id]');
+    if (editBtn) {
+      e.preventDefault();
+      toggleEditForm(editBtn.getAttribute('data-edit-id'));
+    }
+  });
+})();
 function copyMagnet(btn, url) {
   navigator.clipboard.writeText(url).then(function() {
     var orig = btn.innerHTML;
@@ -15191,7 +15225,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     target = f'/manage/bounty/{bid}{anchor}'
                 dropdown_items += (
                     f'<button class="notif-item" '
-                    f'onclick="readNotif({n_id},\'{target}\')"'
+                    f'data-notif-id="{n_id}" data-notif-url="{target}"'
                     f' aria-label="bounty notification from {from_h}">'
                     f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
                     f'<div class="notif-item-text"><em>{tname_h}</em></div>'
@@ -15206,7 +15240,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 topup_label = 'top-up refunded' if n['type'] == 'topup_refunded' else 'top-up credited'
                 dropdown_items += (
                     f'<button class="notif-item" '
-                    f'onclick="readNotif({n_id},\'/manage/topups\')"'
+                    f'data-notif-id="{n_id}" data-notif-url="/manage/topups"'
                     f' aria-label="top-up notification">'
                     f'<div class="notif-item-type">💳 <strong>{from_h}</strong> {topup_label}</div>'
                     f'<div class="notif-item-text"><em>{tname_h}</em></div>'
@@ -15225,7 +15259,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                         target_url = f'/manage/user/{urllib.parse.quote(fu["username"])}'
                 dropdown_items += (
                     f'<button class="notif-item" '
-                    f'onclick="readNotif({n_id},\'{target_url}\')"'
+                    f'data-notif-id="{n_id}" data-notif-url="{target_url}"'
                     f' aria-label="follow notification from {from_h}">'
                     f'<div class="notif-item-type">👥 <strong>{from_h}</strong> is now following you!</div>'
                     f'<div class="notif-item-text"><em>{_h(n["torrent_name"] or "")}</em></div>'
@@ -15239,7 +15273,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 amount_h = _h(n['torrent_name'] or '')
                 dropdown_items += (
                     f'<button class="notif-item" '
-                    f'onclick="readNotif({n_id},\'/manage/profile\')"'
+                    f'data-notif-id="{n_id}" data-notif-url="/manage/profile"'
                     f' aria-label="points transfer from {from_h}">'
                     f'<div class="notif-item-type">💵 <strong>{from_h}</strong> sent you points</div>'
                     f'<div class="notif-item-text"><em>{amount_h}</em></div>'
@@ -15255,7 +15289,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 target_url = f'/manage/admin/security/event/{event_id}' if event_id.isdigit() else '/manage/admin?tab=security'
                 dropdown_items += (
                     f'<button class="notif-item" '
-                    f'onclick="readNotif({n_id},\'{target_url}\')"'
+                    f'data-notif-id="{n_id}" data-notif-url="{target_url}"'
                     f' aria-label="security event notification">'
                     f'<div class="notif-item-type">🛡️ <strong>{from_h}</strong> security event alert</div>'
                     f'<div class="notif-item-text"><em>{msg_h}</em></div>'
@@ -15272,7 +15306,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
                     dropdown_items += (
                         f'<button class="notif-item" '
-                        f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}\')"'
+                        f'data-notif-id="{n_id}" data-notif-url="/manage/torrent/{n_hash}"'
                         f' aria-label="torrent vote by {from_h}">'
                         f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> reacted to your torrent</div>'
                         f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
@@ -15285,7 +15319,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     label = 'upvoted your comment' if n['type'] == 'comment_vote_up' else 'downvoted your comment'
                     dropdown_items += (
                         f'<button class="notif-item" '
-                        f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}#comment-{n_cid}\')"'
+                        f'data-notif-id="{n_id}" data-notif-url="/manage/torrent/{n_hash}#comment-{n_cid}"'
                         f' aria-label="comment vote by {from_h}">'
                         f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
                         f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
@@ -15295,7 +15329,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 elif n['type'] == 'followed_upload':
                     dropdown_items += (
                         f'<button class="notif-item" '
-                        f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}\')"'
+                        f'data-notif-id="{n_id}" data-notif-url="/manage/torrent/{n_hash}"'
                         f' aria-label="new upload by {from_h}">'
                         f'<div class="notif-item-type">📦 <strong>{from_h}</strong> uploaded a new torrent</div>'
                         f'<div class="notif-item-text"><em>{tname_h}</em></div>'
@@ -15308,7 +15342,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     n_cid  = n['comment_id']
                     dropdown_items += (
                         f'<button class="notif-item" '
-                        f'onclick="readNotif({n_id},\'/manage/torrent/{n_hash}#comment-{n_cid}\')"'
+                        f'data-notif-id="{n_id}" data-notif-url="/manage/torrent/{n_hash}#comment-{n_cid}"'
                         f' aria-label="{label} by {from_h} on {tname_h}">'
                         f'<div class="notif-item-type">{icon} <strong>{from_h}</strong> {label}</div>'
                         f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
@@ -15319,7 +15353,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             dropdown_items = '<div class="notif-empty">No unread notifications</div>'
         bell_html = (
             f'<div class="notif-wrap">'
-            f'<button id="nav-bell" class="{bell_cls}" onclick="toggleNotifDropdown(event)" aria-label="Notifications" aria-haspopup="true" aria-controls="notif-dropdown" aria-expanded="false">'
+            f'<button id="nav-bell" class="{bell_cls}" aria-label="Notifications" aria-haspopup="true" aria-controls="notif-dropdown" aria-expanded="false">'
             f'🔔{badge_html}</button>'
             f'<div class="notif-dropdown" id="notif-dropdown">'
             f'<div class="notif-dropdown-header">'
@@ -18088,8 +18122,6 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
                 f'{_render_comment_body(c["body"])}</div>'
             )
 
-            uname_js = uname.replace("'", "\\'")
-            reply_onclick = 'toggleReplyForm(' + str(cid) + ', \'' + uname_js + '\')'
             vm = vote_summaries.get(int(cid), {'up': 0, 'down': 0, 'my_vote': 0})
             up_count = int(vm.get('up', 0) or 0)
             down_count = int(vm.get('down', 0) or 0)
@@ -18123,13 +18155,13 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
             action_btns = []
             if not locked:
                 action_btns.append(
-                    f'<button class="btn-ghost" onclick="{reply_onclick}"'
+                    f'<button class="btn-ghost" data-reply-id="{cid}" data-reply-user="{uname}"'
                     f' aria-label="Reply to {uname}">&#x21A9; Reply</button>'
                 )
             if can_edit and not locked:
                 action_btns.append(
                     f'<button class="btn-ghost"'
-                    f' onclick="toggleEditForm({cid})"'
+                    f' data-edit-id="{cid}"'
                     f' aria-label="Edit your comment">&#x270E; Edit</button>'
                 )
             if can_del:
@@ -18157,7 +18189,7 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
                 f'<div style="display:flex;gap:8px;margin-top:8px">'
                 f'<button type="submit" class="btn btn-primary btn-sm">Save</button>'
                 f'<button type="button" class="btn btn-sm"'
-                f' onclick="toggleEditForm({cid})">Cancel</button>'
+                f' data-edit-id="{cid}">Cancel</button>'
                 f'</div></form></div>'
             )
 
@@ -18174,7 +18206,7 @@ def _render_comments(info_hash: str, viewer, torrent_name: str, locked: bool = F
                 f'<div style="display:flex;gap:8px;margin-top:8px">'
                 f'<button type="submit" class="btn btn-primary btn-sm">Post Reply</button>'
                 f'<button type="button" class="btn btn-sm"'
-                f' onclick="toggleReplyForm({cid})">Cancel</button>'
+                f' data-reply-id="{cid}">Cancel</button>'
                 f'</div></form></div>'
             )
 
@@ -18747,17 +18779,17 @@ def _render_notifications_page(viewer) -> str:
             else:
                 anchor = f'#bcmt-{n["comment_id"]}' if (ntype in ('mention', 'reply', 'comment_vote_up', 'comment_vote_down') and n['comment_id']) else ''
                 url = f'/manage/bounty/{bid}{anchor}'
-            read_js = f"readNotif({n_id},'{url}')"
+            read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
             rows += (
                 f'<div class="notif-page-item{unread_cls}">'
                 f'<div>'
                 f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
                 f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                 f' {label} '
-                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                 f'<div class="notif-page-meta">{ts_h}</div>'
                 f'</div>'
-                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
                 f'</div>'
             )
         elif is_topup:
@@ -18771,7 +18803,7 @@ def _render_notifications_page(viewer) -> str:
                 except Exception:
                     pass
             url = '/manage/topups'
-            read_js = f"readNotif({n_id},'{url}')"
+            read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
             topup_action = 'refunded' if n['type'] == 'topup_refunded' else 'credited'
             rows += (
                 f'<div class="notif-page-item{unread_cls}">'
@@ -18779,10 +18811,10 @@ def _render_notifications_page(viewer) -> str:
                 f'<div style="font-size:0.9rem"><span style="margin-right:6px">💳</span>'
                 f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                 f' {topup_action} top-up #{oid_disp}: '
-                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                 f'<div class="notif-page-meta">{ts_h}</div>'
                 f'</div>'
-                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
                 f'</div>'
             )
         elif is_follow:
@@ -18792,7 +18824,7 @@ def _render_notifications_page(viewer) -> str:
                 fu = REGISTRATION_DB.get_user_by_id(follow_uid)
                 if fu:
                     target_url = f'/manage/user/{urllib.parse.quote(fu["username"])}'
-            read_js = f"readNotif({n_id},'{target_url}')"
+            read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(target_url)}"'
             rows += (
                 f'<div class="notif-page-item{unread_cls}">'
                 f'<div>'
@@ -18801,104 +18833,104 @@ def _render_notifications_page(viewer) -> str:
                 f' is now following you!</div>'
                 f'<div class="notif-page-meta">{ts_h}</div>'
                 f'</div>'
-                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
                 f'</div>'
             )
         elif is_points:
             url = '/manage/profile'
-            read_js = f"readNotif({n_id},'{url}')"
+            read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
             rows += (
                 f'<div class="notif-page-item{unread_cls}">'
                 f'<div>'
                 f'<div style="font-size:0.9rem"><span style="margin-right:6px">💵</span>'
                 f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                 f' sent you points: '
-                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                 f'<div class="notif-page-meta">{ts_h}</div>'
                 f'</div>'
-                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
                 f'</div>'
             )
         elif is_security:
             event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n.get('comment_id') or '')
             url = f'/manage/admin/security/event/{event_id}' if event_id.isdigit() else '/manage/admin?tab=security'
-            read_js = f"readNotif({n_id},'{url}')"
+            read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
             rows += (
                 f'<div class="notif-page-item{unread_cls}">'
                 f'<div>'
                 f'<div style="font-size:0.9rem"><span style="margin-right:6px">🛡️</span>'
                 f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                 f' security event alert: '
-                f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                 f'<div class="notif-page-meta">{ts_h}</div>'
                 f'</div>'
-                f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}">View →</button>'
+                f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
                 f'</div>'
             )
         else:
             if n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
                 icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
                 url = f'/manage/torrent/{n["info_hash"].lower()}'
-                read_js = f"readNotif({n_id},'{url}')"
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
                 rows += (
                     f'<div class="notif-page-item{unread_cls}">'
                     f'<div>'
                     f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
                     f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                     f' reacted to your torrent: '
-                    f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                     f'<div class="notif-page-meta">{ts_h}</div>'
                     f'</div>'
-                    f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs} aria-label="View notification from {from_h}">View →</button>'
                     f'</div>'
                 )
             elif n['type'] in ('comment_vote_up', 'comment_vote_down'):
                 icon = '👍' if n['type'] == 'comment_vote_up' else '👎'
                 label = 'upvoted your comment' if n['type'] == 'comment_vote_up' else 'downvoted your comment'
                 url = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
-                read_js = f"readNotif({n_id},'{url}')"
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
                 rows += (
                     f'<div class="notif-page-item{unread_cls}">'
                     f'<div>'
                     f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
                     f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                     f' {label} on '
-                    f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                     f'<div class="notif-page-meta">{ts_h}</div>'
                     f'</div>'
-                    f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs} aria-label="View notification from {from_h}">View →</button>'
                     f'</div>'
                 )
             elif n['type'] == 'followed_upload':
                 url = f'/manage/torrent/{n["info_hash"].lower()}'
-                read_js = f"readNotif({n_id},'{url}')"
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
                 rows += (
                     f'<div class="notif-page-item{unread_cls}">'
                     f'<div>'
                     f'<div style="font-size:0.9rem"><span style="margin-right:6px">📦</span>'
                     f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                     f' uploaded a new torrent: '
-                    f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                     f'<div class="notif-page-meta">{ts_h}</div>'
                     f'</div>'
-                    f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs} aria-label="View notification from {from_h}">View →</button>'
                     f'</div>'
                 )
             else:
                 icon  = '💬' if n['type'] == 'reply' else '@ '
                 label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
                 url   = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
-                read_js = f"readNotif({n_id},'{url}')"
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
                 rows += (
                     f'<div class="notif-page-item{unread_cls}">'
                     f'<div>'
                     f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
                     f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                     f' {label} on '
-                    f'<a href="{url}" onclick="event.preventDefault();{read_js}" style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                     f'<div class="notif-page-meta">{ts_h}</div>'
                     f'</div>'
-                    f'<button class="btn btn-sm" style="white-space:nowrap" onclick="{read_js}" aria-label="View notification from {from_h}">View →</button>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs} aria-label="View notification from {from_h}">View →</button>'
                     f'</div>'
                 )
 
