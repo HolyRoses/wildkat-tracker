@@ -1282,11 +1282,13 @@ def _pagination_html(current_page: int, total_pages: int, base_url: str,
 
 
 def _user_role(user) -> str:
-    """Return 'super','admin','standard','basic' for a user row."""
+    """Return 'super','admin','editor','standard','basic' for a user row."""
     if user['username'] == SUPER_USER:
         return 'super'
     if user['is_admin']:
         return 'admin'
+    if ('is_editor' in user.keys()) and user['is_editor']:
+        return 'editor'
     if 'is_standard' in user.keys() and user['is_standard']:
         return 'standard'
     return 'basic'
@@ -1320,6 +1322,87 @@ def _validate_password(password: str, settings: dict) -> list[str]:
         if not any(c in symbols for c in password):
             errors.append('At least one symbol (!@#$%^&* etc.)')
     return errors
+
+
+def _normalize_metadata_provider(raw: str) -> str:
+    val = (raw or '').strip().lower()
+    if val in ('imdb', 'tvmaze'):
+        return val
+    return ''
+
+
+def _validate_imdb_id(raw: str) -> str:
+    imdb_id = (raw or '').strip().lower()
+    if re.fullmatch(r'tt[0-9]{4,12}', imdb_id):
+        return imdb_id
+    return ''
+
+
+def _validate_tvmaze_id(raw: str) -> str:
+    tvmaze_id = (raw or '').strip()
+    if re.fullmatch(r'[0-9]{1,12}', tvmaze_id):
+        return tvmaze_id
+    return ''
+
+
+def _infer_tv_season_episode(release_name: str) -> tuple[int | None, int | None]:
+    text = (release_name or '').strip()
+    if not text:
+        return None, None
+    m = re.search(r'(?i)\bS(\d{1,2})E(\d{1,2})\b', text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r'(?i)\b(\d{1,2})x(\d{1,2})\b', text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r'(?i)\bseason[ ._-]*(\d{1,2})[ ._-]*episode[ ._-]*(\d{1,2})\b', text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None, None
+
+
+def _infer_tv_show_query(release_name: str) -> str:
+    text = (release_name or '').strip()
+    if not text:
+        return ''
+    # Strip common release/site prefixes like "www.site.tld - ".
+    text = re.sub(r'(?i)^\s*(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}\s*[-–—]\s*', '', text)
+    s = re.sub(r'[ _]+', '.', text)
+    s = re.sub(r'(?i)[.-]S\d{1,2}E\d{1,2}.*$', '', s)
+    s = re.sub(r'(?i)[.-]\d{1,2}x\d{1,2}.*$', '', s)
+    # Drop common release noise while preserving primary title tokens.
+    s = re.sub(
+        r'(?i)[.-](2160p|1080p|720p|480p|x264|x265|h264|h265|hevc|avc|'
+        r'web[-.]dl|webrip|web|bluray|bdrip|brrip|hdr10\+?|dolby[ .-]?vision|dv|'
+        r'ddp?[0-9.]+|aac|truehd|atmos|proper|repack|internal|extended|'
+        r'nf|amzn|dsnp|hmax|atvp|pcok|roku|multi|dubbed|subbed|'
+        r'19\d{2}|20\d{2}).*$', '', s)
+    s = re.sub(r'\.+', '.', s).strip('.')
+    q = s.replace('.', ' ').strip()
+    return q[:120]
+
+
+def _strip_html_text(raw: str) -> str:
+    text = str(raw or '')
+    if not text:
+        return ''
+    text = re.sub(r'(?is)<br\s*/?>', '\n', text)
+    text = re.sub(r'(?is)<[^>]+>', '', text)
+    text = _html_mod.unescape(text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _normalize_external_image_url(raw: str) -> str:
+    url = str(raw or '').strip()
+    if not url:
+        return ''
+    # Avoid mixed-content blocks for known poster providers.
+    if url.startswith('http://'):
+        host = urllib.parse.urlparse(url).netloc.lower()
+        if any(x in host for x in ('tvmaze.com', 'static.tvmaze.com', 'imdb.com', 'media-amazon.com')):
+            return 'https://' + url[len('http://'):]
+    return url
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -1664,6 +1747,7 @@ class RegistrationDB:
                 password_hash   TEXT    NOT NULL,
                 salt            TEXT    NOT NULL,
                 is_admin        INTEGER NOT NULL DEFAULT 0,
+                is_editor       INTEGER NOT NULL DEFAULT 0,
                 is_standard     INTEGER NOT NULL DEFAULT 0,
                 is_locked       INTEGER NOT NULL DEFAULT 0,
                 locked_at       TEXT,
@@ -1677,6 +1761,7 @@ class RegistrationDB:
                 credits               INTEGER NOT NULL DEFAULT 0,
                 credits_awarded       INTEGER NOT NULL DEFAULT 0,
                 points                INTEGER NOT NULL DEFAULT 0,
+                points_micro          INTEGER NOT NULL DEFAULT 0,
                 login_streak          INTEGER NOT NULL DEFAULT 0,
                 longest_streak        INTEGER NOT NULL DEFAULT 0,
                 last_login_date       TEXT,
@@ -1997,6 +2082,8 @@ class RegistrationDB:
             c.execute('ALTER TABLE users ADD COLUMN last_password_change TEXT')
         if 'is_standard' not in ucols:
             c.execute('ALTER TABLE users ADD COLUMN is_standard INTEGER NOT NULL DEFAULT 0')
+        if 'is_editor' not in ucols:
+            c.execute('ALTER TABLE users ADD COLUMN is_editor INTEGER NOT NULL DEFAULT 0')
         if 'credits' not in ucols:
             c.execute('ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 0')
         if 'credits_awarded' not in ucols:
@@ -2005,6 +2092,8 @@ class RegistrationDB:
             c.execute('ALTER TABLE users ADD COLUMN points INTEGER NOT NULL DEFAULT 0')
             # migrate existing credits balance into points
             c.execute('UPDATE users SET points = credits WHERE credits > 0')
+        if 'points_micro' not in ucols:
+            c.execute('ALTER TABLE users ADD COLUMN points_micro INTEGER NOT NULL DEFAULT 0')
         if 'login_streak' not in ucols:
             c.execute('ALTER TABLE users ADD COLUMN login_streak INTEGER NOT NULL DEFAULT 0')
         if 'longest_streak' not in ucols:
@@ -2246,6 +2335,148 @@ class RegistrationDB:
             );
         ''')
         c.commit()
+        # ── Torrent metadata moderation (migration-safe) ─────
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS torrent_metadata_proposals (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash             TEXT    NOT NULL,
+                provider              TEXT    NOT NULL,
+                proposed_id           TEXT    NOT NULL,
+                proposed_url          TEXT    NOT NULL DEFAULT '',
+                season                INTEGER,
+                episode               INTEGER,
+                proposed_by_user_id   INTEGER NOT NULL,
+                proposed_by_username  TEXT    NOT NULL,
+                status                TEXT    NOT NULL DEFAULT 'pending',
+                decision_reason       TEXT    NOT NULL DEFAULT '',
+                decided_by_user_id    INTEGER,
+                decided_by_username   TEXT,
+                decided_at            TEXT,
+                voting_opened_at      TEXT    NOT NULL,
+                voting_closes_at      TEXT    NOT NULL,
+                auto_finalize_at      TEXT    NOT NULL,
+                rewards_issued_at     TEXT,
+                created_at            TEXT    NOT NULL,
+                updated_at            TEXT    NOT NULL,
+                FOREIGN KEY (proposed_by_user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_tmp_infohash
+              ON torrent_metadata_proposals(info_hash, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_tmp_status_finalize
+              ON torrent_metadata_proposals(status, auto_finalize_at);
+            CREATE INDEX IF NOT EXISTS idx_tmp_provider
+              ON torrent_metadata_proposals(provider, id DESC);
+            DROP INDEX IF EXISTS idx_tmp_unique_target;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tmp_unique_pending_target
+              ON torrent_metadata_proposals(
+                info_hash,
+                provider,
+                proposed_id,
+                COALESCE(season, -1),
+                COALESCE(episode, -1)
+              )
+              WHERE status='pending';
+
+            CREATE TABLE IF NOT EXISTS torrent_metadata_proposal_votes (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id      INTEGER NOT NULL,
+                voter_user_id    INTEGER NOT NULL,
+                voter_username   TEXT    NOT NULL,
+                vote             INTEGER NOT NULL,
+                voted_at         TEXT    NOT NULL,
+                UNIQUE(proposal_id, voter_user_id),
+                FOREIGN KEY (proposal_id) REFERENCES torrent_metadata_proposals(id) ON DELETE CASCADE,
+                FOREIGN KEY (voter_user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_tmpv_proposal
+              ON torrent_metadata_proposal_votes(proposal_id, vote);
+
+            CREATE TABLE IF NOT EXISTS torrent_metadata_links (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash            TEXT    NOT NULL,
+                provider             TEXT    NOT NULL,
+                external_id          TEXT    NOT NULL,
+                canonical_url        TEXT    NOT NULL DEFAULT '',
+                episode_external_id  TEXT,
+                episode_url          TEXT,
+                source_proposal_id   INTEGER,
+                status               TEXT    NOT NULL DEFAULT 'active',
+                created_by_user_id   INTEGER NOT NULL,
+                created_by_username  TEXT    NOT NULL,
+                created_at           TEXT    NOT NULL,
+                revoked_by_user_id   INTEGER,
+                revoked_by_username  TEXT,
+                revoked_reason       TEXT    NOT NULL DEFAULT '',
+                revoked_at           TEXT,
+                FOREIGN KEY (source_proposal_id) REFERENCES torrent_metadata_proposals(id) ON DELETE SET NULL,
+                FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_tml_infohash_status
+              ON torrent_metadata_links(info_hash, status, id DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tml_one_active_per_provider
+              ON torrent_metadata_links(info_hash, provider, status)
+              WHERE status='active';
+
+            CREATE TABLE IF NOT EXISTS torrent_metadata_cache (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider           TEXT    NOT NULL,
+                external_id        TEXT    NOT NULL,
+                episode_external_id TEXT,
+                title              TEXT    NOT NULL DEFAULT '',
+                subtitle           TEXT    NOT NULL DEFAULT '',
+                year               INTEGER,
+                media_type         TEXT    NOT NULL DEFAULT '',
+                genres_json        TEXT    NOT NULL DEFAULT '[]',
+                runtime_minutes    INTEGER,
+                rating_value       REAL,
+                rating_count       INTEGER,
+                network_name       TEXT    NOT NULL DEFAULT '',
+                poster_url         TEXT    NOT NULL DEFAULT '',
+                canonical_url      TEXT    NOT NULL DEFAULT '',
+                episode_url        TEXT    NOT NULL DEFAULT '',
+                fetched_ok         INTEGER NOT NULL DEFAULT 0,
+                fetch_error        TEXT    NOT NULL DEFAULT '',
+                fetched_at         TEXT    NOT NULL,
+                raw_json           TEXT    NOT NULL DEFAULT '{}'
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tmc_unique
+              ON torrent_metadata_cache(provider, external_id, COALESCE(episode_external_id, ''));
+            CREATE INDEX IF NOT EXISTS idx_tmc_lookup
+              ON torrent_metadata_cache(provider, external_id, fetched_at DESC);
+
+            CREATE TABLE IF NOT EXISTS torrent_metadata_fetch_jobs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id     INTEGER NOT NULL,
+                provider        TEXT    NOT NULL,
+                external_id     TEXT    NOT NULL,
+                season          INTEGER,
+                episode         INTEGER,
+                status          TEXT    NOT NULL DEFAULT 'queued',
+                attempt_count   INTEGER NOT NULL DEFAULT 0,
+                last_error      TEXT    NOT NULL DEFAULT '',
+                next_attempt_at TEXT,
+                created_at      TEXT    NOT NULL,
+                updated_at      TEXT    NOT NULL,
+                FOREIGN KEY (proposal_id) REFERENCES torrent_metadata_proposals(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_tmfj_status_next
+              ON torrent_metadata_fetch_jobs(status, next_attempt_at, id);
+            CREATE TABLE IF NOT EXISTS torrent_metadata_rewards (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id      INTEGER NOT NULL,
+                user_id          INTEGER NOT NULL,
+                username         TEXT    NOT NULL,
+                reward_kind      TEXT    NOT NULL,
+                reward_points    REAL    NOT NULL,
+                created_at       TEXT    NOT NULL,
+                UNIQUE(proposal_id, user_id, reward_kind),
+                FOREIGN KEY (proposal_id) REFERENCES torrent_metadata_proposals(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_tmr_user_created
+              ON torrent_metadata_rewards(user_id, id DESC);
+        ''')
+        c.commit()
         # ── DM opt-out column (migration-safe) ───────────────
         try:
             self._conn().execute('ALTER TABLE users ADD COLUMN allow_dms INTEGER NOT NULL DEFAULT 1')
@@ -2482,6 +2713,27 @@ class RegistrationDB:
             'bounty_pending_hours':     '48',
             # ── Leaderboard ───────────────────────────────────
             'leaderboard_top_n':        '10',
+            'metadata_enabled':         '1',
+            'metadata_vote_enabled':    '1',
+            'metadata_vote_window_hours': '24',
+            'metadata_vote_min_unique_voters': '3',
+            'metadata_vote_min_net_score': '3',
+            'metadata_auto_finalize_enabled': '1',
+            'metadata_reward_proposer': '1.0',
+            'metadata_reward_voter':    '0.25',
+            'metadata_reward_daily_cap_points': '5.0',
+            'metadata_reward_max_votes_per_day': '20',
+            'metadata_allow_owner_auto_approve': '1',
+            'metadata_allow_editor_override': '1',
+            'metadata_allow_post_revoke': '1',
+            'metadata_revoke_requires_reason': '1',
+            'metadata_fetch_enabled':    '1',
+            'metadata_fetch_timeout_sec':'5',
+            'metadata_fetch_max_retries':'3',
+            'metadata_fetch_per_cycle':  '2',
+            'metadata_omdb_base_url':    'https://www.omdbapi.com/',
+            'metadata_tvmaze_base_url':  'https://api.tvmaze.com',
+            'metadata_omdb_api_key':     '',
             # ── Admin ─────────────────────────────────────────
             'admin_max_point_grant':    '1000',
             # ── Direct messages ───────────────────────────────
@@ -4400,6 +4652,20 @@ class RegistrationDB:
         self._conn().commit()
         self._log(actor, 'set_standard', username, str(is_standard))
 
+    def set_role(self, username: str, role: str, actor: str):
+        r = (role or '').strip().lower()
+        if r not in ('basic', 'standard', 'editor', 'admin'):
+            return
+        std = 1 if r in ('standard', 'editor', 'admin') else 0
+        ed = 1 if r in ('editor', 'admin') else 0
+        adm = 1 if r == 'admin' else 0
+        self._conn().execute(
+            'UPDATE users SET is_standard=?, is_editor=?, is_admin=? WHERE username=?',
+            (std, ed, adm, username)
+        )
+        self._conn().commit()
+        self._log(actor, 'set_role', username, r)
+
     def delete_all_torrents_for_user(self, user_id: int, actor: str,
                                       target_username: str = ''):
         c = self._conn()
@@ -4650,6 +4916,62 @@ class RegistrationDB:
             (user_id, delta, balance, reason, ref_type, ref_id, self._ts())
         )
         return balance
+
+    def _award_micro_points_tx(self, c, user_id: int, micro_delta: int, reason: str,
+                               ref_type: str = '', ref_id: str = '',
+                               conversion_reason: str = 'micro reward conversion') -> tuple[int, int, int]:
+        """Accumulate milli-points and convert whole points into the standard points ledger.
+
+        Returns `(points_balance, micro_balance, converted_points_delta)`.
+        """
+        micro_delta = int(micro_delta or 0)
+        if micro_delta == 0:
+            row = c.execute('SELECT points, points_micro FROM users WHERE id=?', (user_id,)).fetchone()
+            pts = int((row['points'] if row and 'points' in row.keys() else 0) or 0)
+            mic = int((row['points_micro'] if row and 'points_micro' in row.keys() else 0) or 0)
+            return pts, mic, 0
+        c.execute('UPDATE users SET points_micro = points_micro + ? WHERE id = ?', (micro_delta, user_id))
+        row = c.execute('SELECT points, points_micro FROM users WHERE id=?', (user_id,)).fetchone()
+        points_balance = int((row['points'] if row and 'points' in row.keys() else 0) or 0)
+        micro_balance = int((row['points_micro'] if row and 'points_micro' in row.keys() else 0) or 0)
+        converted = int(micro_balance / 1000)
+        if converted != 0:
+            micro_balance -= converted * 1000
+            c.execute(
+                'UPDATE users SET points = points + ?, points_micro=? WHERE id=?',
+                (converted, micro_balance, user_id)
+            )
+            row2 = c.execute('SELECT points FROM users WHERE id=?', (user_id,)).fetchone()
+            points_balance = int((row2['points'] if row2 and 'points' in row2.keys() else 0) or 0)
+            conv_reason = conversion_reason
+            if reason:
+                conv_reason = f'{conversion_reason}: {str(reason)[:180]}'
+            c.execute(
+                'INSERT INTO points_ledger (user_id,delta,balance_after,reason,ref_type,ref_id,created_at)'
+                ' VALUES (?,?,?,?,?,?,?)',
+                (user_id, converted, points_balance, conv_reason, ref_type, ref_id, self._ts())
+            )
+        return points_balance, micro_balance, converted
+
+    def award_micro_points(self, user_id: int, micro_delta: int, reason: str,
+                           ref_type: str = '', ref_id: str = '',
+                           conversion_reason: str = 'micro reward conversion') -> tuple[int, int, int]:
+        """Public transaction wrapper for micro-point accumulation/conversion."""
+        c = self._conn()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            out = self._award_micro_points_tx(
+                c, user_id, int(micro_delta), reason, ref_type, ref_id,
+                conversion_reason=conversion_reason
+            )
+            c.execute('COMMIT')
+            return out
+        except Exception:
+            try:
+                c.execute('ROLLBACK')
+            except Exception:
+                pass
+            raise
 
     def award_points(self, user_id: int, delta: int, reason: str,
                      ref_type: str = '', ref_id: str = '') -> int:
@@ -4904,6 +5226,827 @@ class RegistrationDB:
         self._conn().commit()
         self._log(created_by_username, 'create_invite', token[:12] + '...')
         return token
+
+    # ── Torrent Metadata Moderation ──────────────────────────
+
+    def get_metadata_config(self) -> dict:
+        settings = self.get_all_settings()
+        def _to_int(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                return max(lo, min(hi, int(settings.get(key, str(default)) or default)))
+            except Exception:
+                return default
+        def _to_float(key: str, default: float, lo: float, hi: float) -> float:
+            try:
+                return max(lo, min(hi, float(settings.get(key, str(default)) or default)))
+            except Exception:
+                return default
+        return {
+            'enabled': settings.get('metadata_enabled', '1') == '1',
+            'vote_enabled': settings.get('metadata_vote_enabled', '1') == '1',
+            'vote_window_hours': _to_int('metadata_vote_window_hours', 24, 1, 168),
+            'vote_min_unique_voters': _to_int('metadata_vote_min_unique_voters', 3, 1, 100),
+            'vote_min_net_score': _to_int('metadata_vote_min_net_score', 3, 1, 100),
+            'auto_finalize_enabled': settings.get('metadata_auto_finalize_enabled', '1') == '1',
+            'reward_proposer': _to_float('metadata_reward_proposer', 1.0, 0.0, 100.0),
+            'reward_voter': _to_float('metadata_reward_voter', 0.25, 0.0, 100.0),
+            'reward_daily_cap_points': _to_float('metadata_reward_daily_cap_points', 5.0, 0.0, 10000.0),
+            'reward_max_votes_per_day': _to_int('metadata_reward_max_votes_per_day', 20, 0, 10000),
+            'allow_owner_auto_approve': settings.get('metadata_allow_owner_auto_approve', '1') == '1',
+            'allow_editor_override': settings.get('metadata_allow_editor_override', '1') == '1',
+            'allow_post_revoke': settings.get('metadata_allow_post_revoke', '1') == '1',
+            'revoke_requires_reason': settings.get('metadata_revoke_requires_reason', '1') == '1',
+            'fetch_enabled': settings.get('metadata_fetch_enabled', '1') == '1',
+            'fetch_timeout_sec': _to_int('metadata_fetch_timeout_sec', 5, 2, 20),
+            'fetch_max_retries': _to_int('metadata_fetch_max_retries', 3, 1, 10),
+            'fetch_per_cycle': _to_int('metadata_fetch_per_cycle', 2, 1, 10),
+            'omdb_base_url': (settings.get('metadata_omdb_base_url', 'https://www.omdbapi.com/') or 'https://www.omdbapi.com/').strip(),
+            'tvmaze_base_url': (settings.get('metadata_tvmaze_base_url', 'https://api.tvmaze.com') or 'https://api.tvmaze.com').strip(),
+            'omdb_api_key': (settings.get('metadata_omdb_api_key', '') or '').strip(),
+        }
+
+    def list_metadata_proposals_for_torrent(self, info_hash: str, limit: int = 20) -> list:
+        ih = (info_hash or '').strip().upper()
+        if not ih:
+            return []
+        return self._conn().execute(
+            '''SELECT * FROM torrent_metadata_proposals
+               WHERE info_hash=?
+               ORDER BY id DESC
+               LIMIT ?''',
+            (ih, max(1, min(200, int(limit))))
+        ).fetchall()
+
+    def get_active_metadata_proposal(self, info_hash: str, provider: str):
+        ih = (info_hash or '').strip().upper()
+        p = _normalize_metadata_provider(provider)
+        if not ih or not p:
+            return None
+        return self._conn().execute(
+            '''SELECT * FROM torrent_metadata_proposals
+               WHERE info_hash=? AND provider=? AND status='pending'
+               ORDER BY id DESC LIMIT 1''',
+            (ih, p)
+        ).fetchone()
+
+    def get_metadata_proposal(self, proposal_id: int):
+        return self._conn().execute(
+            'SELECT * FROM torrent_metadata_proposals WHERE id=?',
+            (int(proposal_id),)
+        ).fetchone()
+
+    def create_metadata_proposal(self, info_hash: str, provider: str, proposed_id: str,
+                                 proposer_user_id: int, proposer_username: str,
+                                 proposed_url: str = '', season: int | None = None,
+                                 episode: int | None = None):
+        ih = (info_hash or '').strip().upper()
+        p = _normalize_metadata_provider(provider)
+        if not ih or not p:
+            return False, 'Invalid metadata provider.'
+        trow = self.get_torrent(ih)
+        if not trow:
+            return False, 'Torrent not found.'
+        if p == 'imdb':
+            ext_id = _validate_imdb_id(proposed_id)
+            if not ext_id:
+                return False, 'Invalid IMDb ID format.'
+        else:
+            ext_id = _validate_tvmaze_id(proposed_id)
+            inferred_season, inferred_episode = _infer_tv_season_episode(str(trow['name'] or ''))
+            if season is None:
+                season = inferred_season
+            if episode is None:
+                episode = inferred_episode
+            if not ext_id:
+                show_query = _infer_tv_show_query(str(trow['name'] or ''))
+                if not show_query:
+                    return False, 'TVMaze show ID is required (auto-detect could not infer show name).'
+                auto_id, auto_name, auto_url = self._search_tvmaze_show(show_query, self.get_metadata_config())
+                if not auto_id:
+                    return False, 'TVMaze show ID is required (auto-detect did not find a unique show).'
+                ext_id = auto_id
+                if not proposed_url:
+                    proposed_url = auto_url
+                self._log(proposer_username, 'metadata_tvmaze_auto_match', ih,
+                          f'query={show_query[:80]} matched={auto_name[:80]} id={ext_id}')
+            if not ext_id:
+                return False, 'Invalid TVMaze show ID format.'
+        cfg = self.get_metadata_config()
+        now = datetime.datetime.now()
+        closes_at = now + datetime.timedelta(hours=cfg['vote_window_hours'])
+        ts_now = self._ts()
+        # Guard: one active proposal per provider per torrent.
+        active = self.get_active_metadata_proposal(ih, p)
+        if active:
+            return False, 'An active proposal already exists for this provider.'
+        c = self._conn()
+        try:
+            c.execute(
+                '''INSERT INTO torrent_metadata_proposals (
+                       info_hash, provider, proposed_id, proposed_url, season, episode,
+                       proposed_by_user_id, proposed_by_username, status,
+                       decision_reason, decided_by_user_id, decided_by_username, decided_at,
+                       voting_opened_at, voting_closes_at, auto_finalize_at,
+                       rewards_issued_at, created_at, updated_at
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (ih, p, ext_id, (proposed_url or '')[:500], season, episode,
+                 int(proposer_user_id), proposer_username[:64], 'pending',
+                 '', None, None, None,
+                 ts_now, closes_at.isoformat(), closes_at.isoformat(),
+                 None, ts_now, ts_now)
+            )
+            c.commit()
+        except sqlite3.IntegrityError:
+            return False, 'This metadata target has already been proposed for this torrent.'
+        proposal_id = int(c.execute('SELECT last_insert_rowid()').fetchone()[0])
+        self._log(proposer_username, 'metadata_propose', ih,
+                  f'proposal_id={proposal_id} provider={p} id={ext_id}')
+        return True, proposal_id
+
+    def cast_metadata_proposal_vote(self, proposal_id: int, voter_user_id: int,
+                                    voter_username: str, vote: int):
+        p = self.get_metadata_proposal(int(proposal_id))
+        if not p:
+            return False, 'Proposal not found.'
+        if (p['status'] or '') != 'pending':
+            return False, 'Proposal is no longer open for voting.'
+        v = 1 if int(vote) > 0 else -1
+        if int(voter_user_id) == int(p['proposed_by_user_id'] or 0):
+            return False, 'You cannot vote on your own proposal.'
+        c = self._conn()
+        # Toggle semantics: same vote removes vote.
+        prev = c.execute(
+            'SELECT vote FROM torrent_metadata_proposal_votes WHERE proposal_id=? AND voter_user_id=?',
+            (int(proposal_id), int(voter_user_id))
+        ).fetchone()
+        if prev and int(prev['vote'] or 0) == v:
+            c.execute(
+                'DELETE FROM torrent_metadata_proposal_votes WHERE proposal_id=? AND voter_user_id=?',
+                (int(proposal_id), int(voter_user_id))
+            )
+            c.execute(
+                'UPDATE torrent_metadata_proposals SET updated_at=? WHERE id=?',
+                (self._ts(), int(proposal_id))
+            )
+            c.commit()
+            self._log(voter_username, 'metadata_vote_remove', str(proposal_id), f'vote={v:+d}')
+            return True, 'Vote removed.'
+        c.execute(
+            '''INSERT INTO torrent_metadata_proposal_votes
+               (proposal_id, voter_user_id, voter_username, vote, voted_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(proposal_id, voter_user_id)
+               DO UPDATE SET vote=excluded.vote, voted_at=excluded.voted_at, voter_username=excluded.voter_username''',
+            (int(proposal_id), int(voter_user_id), voter_username[:64], v, self._ts())
+        )
+        c.execute(
+            'UPDATE torrent_metadata_proposals SET updated_at=? WHERE id=?',
+            (self._ts(), int(proposal_id))
+        )
+        c.commit()
+        self._log(voter_username, 'metadata_vote', str(proposal_id), f'vote={v:+d}')
+        return True, 'Vote recorded.'
+
+    def get_metadata_proposal_vote_summary(self, proposal_id: int, viewer_user_id: int = 0) -> dict:
+        c = self._conn()
+        row = c.execute(
+            '''SELECT
+                 COALESCE(SUM(CASE WHEN vote=1 THEN 1 ELSE 0 END),0) AS up,
+                 COALESCE(SUM(CASE WHEN vote=-1 THEN 1 ELSE 0 END),0) AS down,
+                 COALESCE(COUNT(DISTINCT voter_user_id),0) AS unique_voters
+               FROM torrent_metadata_proposal_votes
+               WHERE proposal_id=?''',
+            (int(proposal_id),)
+        ).fetchone()
+        up = int(row['up'] or 0)
+        down = int(row['down'] or 0)
+        my_vote = 0
+        if int(viewer_user_id or 0) > 0:
+            my = c.execute(
+                'SELECT vote FROM torrent_metadata_proposal_votes WHERE proposal_id=? AND voter_user_id=?',
+                (int(proposal_id), int(viewer_user_id))
+            ).fetchone()
+            if my:
+                my_vote = int(my['vote'] or 0)
+        return {
+            'up': up,
+            'down': down,
+            'net': up - down,
+            'unique_voters': int(row['unique_voters'] or 0),
+            'my_vote': my_vote,
+        }
+
+    def get_metadata_cache_for_link(self, link):
+        if not link:
+            return None
+        provider = str(link['provider'] or '')
+        external_id = str(link['external_id'] or '')
+        if not provider or not external_id:
+            return None
+        epi = str(link['episode_external_id'] or '').strip()
+        if epi:
+            row = self._conn().execute(
+                '''SELECT * FROM torrent_metadata_cache
+                   WHERE provider=? AND external_id=? AND COALESCE(episode_external_id,'')=?
+                   ORDER BY id DESC LIMIT 1''',
+                (provider, external_id, epi)
+            ).fetchone()
+            if row:
+                return row
+        return self._conn().execute(
+            '''SELECT * FROM torrent_metadata_cache
+               WHERE provider=? AND external_id=? AND COALESCE(episode_external_id,'')=''
+               ORDER BY id DESC LIMIT 1''',
+            (provider, external_id)
+        ).fetchone()
+
+    def get_metadata_cache_for_target(self, provider: str, external_id: str,
+                                      season: int | None = None, episode: int | None = None):
+        p = str(provider or '').strip().lower()
+        ext = str(external_id or '').strip()
+        if not p or not ext:
+            return None
+        rows = self._conn().execute(
+            '''SELECT * FROM torrent_metadata_cache
+               WHERE provider=? AND external_id=?
+               ORDER BY id DESC
+               LIMIT 12''',
+            (p, ext)
+        ).fetchall()
+        if not rows:
+            return None
+        if season is None or episode is None:
+            return rows[0]
+        for r in rows:
+            try:
+                raw = json.loads(r['raw_json'] or '{}')
+                ep = (raw.get('episode') or {}) if isinstance(raw, dict) else {}
+                if int(ep.get('season')) == int(season) and int(ep.get('number')) == int(episode):
+                    return r
+            except Exception:
+                continue
+        return rows[0]
+
+    def _upsert_metadata_cache(self, provider: str, external_id: str,
+                               payload: dict, episode_external_id: str = '') -> None:
+        now = self._ts()
+        epi = (episode_external_id or '').strip()
+        self._conn().execute(
+            '''INSERT INTO torrent_metadata_cache (
+                   provider, external_id, episode_external_id, title, subtitle, year, media_type,
+                   genres_json, runtime_minutes, rating_value, rating_count, network_name,
+                   poster_url, canonical_url, episode_url, fetched_ok, fetch_error,
+                   fetched_at, raw_json
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(provider, external_id, COALESCE(episode_external_id,''))
+               DO UPDATE SET
+                 title=excluded.title,
+                 subtitle=excluded.subtitle,
+                 year=excluded.year,
+                 media_type=excluded.media_type,
+                 genres_json=excluded.genres_json,
+                 runtime_minutes=excluded.runtime_minutes,
+                 rating_value=excluded.rating_value,
+                 rating_count=excluded.rating_count,
+                 network_name=excluded.network_name,
+                 poster_url=excluded.poster_url,
+                 canonical_url=excluded.canonical_url,
+                 episode_url=excluded.episode_url,
+                 fetched_ok=excluded.fetched_ok,
+                 fetch_error=excluded.fetch_error,
+                 fetched_at=excluded.fetched_at,
+                 raw_json=excluded.raw_json''',
+            (
+                provider, external_id, epi,
+                str(payload.get('title') or '')[:200],
+                str(payload.get('subtitle') or '')[:300],
+                payload.get('year'),
+                str(payload.get('media_type') or '')[:40],
+                json.dumps(payload.get('genres') or []),
+                payload.get('runtime_minutes'),
+                payload.get('rating_value'),
+                payload.get('rating_count'),
+                str(payload.get('network_name') or '')[:120],
+                str(payload.get('poster_url') or '')[:1000],
+                str(payload.get('canonical_url') or '')[:1000],
+                str(payload.get('episode_url') or '')[:1000],
+                1 if payload.get('fetched_ok', True) else 0,
+                str(payload.get('fetch_error') or '')[:500],
+                now,
+                json.dumps(payload.get('raw') or {}, ensure_ascii=False),
+            )
+        )
+        self._conn().commit()
+
+    def _metadata_http_get_json(self, url: str, timeout_sec: int) -> tuple[bool, dict, str]:
+        req = urllib.request.Request(
+            url,
+            headers={
+                'Accept': 'application/json',
+                'User-Agent': 'wildkat-tracker/metadata-fetch',
+            },
+            method='GET',
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=max(1, int(timeout_sec))) as resp:
+                data = json.loads(resp.read().decode('utf-8', errors='replace') or '{}')
+                return True, (data if isinstance(data, dict) else {}), ''
+        except urllib.error.HTTPError as e:
+            return False, {}, f'HTTP {e.code}'
+        except Exception as e:
+            return False, {}, str(e)
+
+    def _fetch_omdb_metadata(self, imdb_id: str, cfg: dict) -> tuple[bool, dict, str]:
+        api_key = (cfg.get('omdb_api_key') or '').strip()
+        if not api_key:
+            return False, {}, 'OMDb API key is not configured.'
+        base = (cfg.get('omdb_base_url') or 'https://www.omdbapi.com/').rstrip('/')
+        q = urllib.parse.urlencode({'apikey': api_key, 'i': imdb_id, 'plot': 'short'})
+        ok, raw, err = self._metadata_http_get_json(f'{base}/?{q}', int(cfg.get('fetch_timeout_sec', 5)))
+        if not ok:
+            return False, {}, err
+        if str(raw.get('Response', '')).lower() != 'true':
+            return False, {}, str(raw.get('Error') or 'OMDb returned no match.')
+        rating_val = None
+        try:
+            rating_val = float(raw.get('imdbRating')) if raw.get('imdbRating') not in (None, 'N/A', '') else None
+        except Exception:
+            rating_val = None
+        rating_count = None
+        try:
+            rc = str(raw.get('imdbVotes') or '').replace(',', '')
+            rating_count = int(rc) if rc.isdigit() else None
+        except Exception:
+            rating_count = None
+        year = None
+        try:
+            year = int(str(raw.get('Year') or '')[:4])
+        except Exception:
+            year = None
+        runtime = None
+        try:
+            runtime = int(str(raw.get('Runtime') or '').split(' ')[0])
+        except Exception:
+            runtime = None
+        payload = {
+            'title': str(raw.get('Title') or ''),
+            'subtitle': _strip_html_text(str(raw.get('Plot') or '')),
+            'year': year,
+            'media_type': str(raw.get('Type') or ''),
+            'genres': [g.strip() for g in str(raw.get('Genre') or '').split(',') if g.strip()],
+            'runtime_minutes': runtime,
+            'rating_value': rating_val,
+            'rating_count': rating_count,
+            'network_name': '',
+            'poster_url': _normalize_external_image_url('' if str(raw.get('Poster') or '') == 'N/A' else str(raw.get('Poster') or '')),
+            'canonical_url': f'https://www.imdb.com/title/{imdb_id}/',
+            'episode_url': '',
+            'raw': raw,
+            'fetched_ok': True,
+        }
+        return True, payload, ''
+
+    def _search_tvmaze_show(self, query: str, cfg: dict) -> tuple[str, str, str]:
+        q = (query or '').strip()
+        if not q:
+            return '', '', ''
+        base = (cfg.get('tvmaze_base_url') or 'https://api.tvmaze.com').rstrip('/')
+        url = f'{base}/search/shows?q={urllib.parse.quote(q)}'
+        req = urllib.request.Request(
+            url,
+            headers={'Accept': 'application/json', 'User-Agent': 'wildkat-tracker/metadata-fetch'},
+            method='GET',
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=max(1, int(cfg.get('fetch_timeout_sec', 5)))) as resp:
+                data = json.loads(resp.read().decode('utf-8', errors='replace') or '[]')
+        except Exception:
+            return '', '', ''
+        if not isinstance(data, list) or not data:
+            return '', '', ''
+
+        def _norm(s: str) -> str:
+            return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
+
+        qn = _norm(q)
+        best = None
+        best_score = -1
+        for row in data[:10]:
+            show = row.get('show') if isinstance(row, dict) else None
+            if not isinstance(show, dict):
+                continue
+            sid = str(show.get('id') or '')
+            name = str(show.get('name') or '')
+            if not sid.isdigit():
+                continue
+            sn = _norm(name)
+            score = 0
+            if sn == qn:
+                score = 100
+            elif sn.startswith(qn) or qn.startswith(sn):
+                score = 80
+            else:
+                score = 50
+            if score > best_score:
+                best = (sid, name, str(show.get('url') or f'https://www.tvmaze.com/shows/{sid}'))
+                best_score = score
+        return best if best else ('', '', '')
+
+    def _fetch_tvmaze_metadata(self, show_id: str, season: int | None, episode: int | None, cfg: dict) -> tuple[bool, dict, str]:
+        base = (cfg.get('tvmaze_base_url') or 'https://api.tvmaze.com').rstrip('/')
+        timeout_sec = int(cfg.get('fetch_timeout_sec', 5))
+        ok_show, show_raw, err_show = self._metadata_http_get_json(f'{base}/shows/{show_id}', timeout_sec)
+        if not ok_show:
+            return False, {}, err_show
+        if not show_raw or ('id' not in show_raw):
+            return False, {}, 'TVMaze show not found.'
+        episode_raw = {}
+        episode_id = ''
+        episode_url = ''
+        subtitle = _strip_html_text(str(show_raw.get('summary') or ''))
+        title = str(show_raw.get('name') or '')
+        if season is not None and episode is not None:
+            qs = urllib.parse.urlencode({'season': int(season), 'number': int(episode)})
+            ok_ep, ep_raw, err_ep = self._metadata_http_get_json(f'{base}/shows/{show_id}/episodebynumber?{qs}', timeout_sec)
+            if ok_ep and ep_raw and ('id' in ep_raw):
+                episode_raw = ep_raw
+                episode_id = str(ep_raw.get('id') or '')
+                episode_url = str(ep_raw.get('url') or '')
+                subtitle = _strip_html_text(str(ep_raw.get('summary') or subtitle))
+                ep_name = str(ep_raw.get('name') or '').strip()
+                if ep_name:
+                    title = ep_name
+        rating_value = None
+        try:
+            rating_value = float((show_raw.get('rating') or {}).get('average'))
+        except Exception:
+            rating_value = None
+        runtime_minutes = None
+        try:
+            runtime_minutes = int(show_raw.get('runtime'))
+        except Exception:
+            runtime_minutes = None
+        premiered = str(show_raw.get('premiered') or '')
+        year = None
+        if len(premiered) >= 4 and premiered[:4].isdigit():
+            year = int(premiered[:4])
+        payload = {
+            'title': title,
+            'subtitle': subtitle,
+            'year': year,
+            'media_type': str(show_raw.get('type') or 'show'),
+            'genres': show_raw.get('genres') or [],
+            'runtime_minutes': runtime_minutes,
+            'rating_value': rating_value,
+            'rating_count': None,
+            'network_name': str(((show_raw.get('network') or {}).get('name')) or ((show_raw.get('webChannel') or {}).get('name')) or ''),
+            'poster_url': _normalize_external_image_url(str(((show_raw.get('image') or {}).get('original')) or ((show_raw.get('image') or {}).get('medium')) or '')),
+            'canonical_url': str(show_raw.get('url') or ''),
+            'episode_url': episode_url,
+            'episode_external_id': episode_id,
+            'raw': {'show': show_raw, 'episode': episode_raw},
+            'fetched_ok': True,
+        }
+        return True, payload, ''
+
+    def _maybe_issue_metadata_rewards(self, proposal) -> None:
+        if not proposal:
+            return
+        if (proposal['status'] or '') != 'approved':
+            return
+        if proposal['rewards_issued_at']:
+            return
+        cfg = self.get_metadata_config()
+        proposer_reward = float(cfg.get('reward_proposer', 1.0))
+        voter_reward = float(cfg.get('reward_voter', 0.25))
+        proposal_id = int(proposal['id'])
+        proposer_uid = int(proposal['proposed_by_user_id'] or 0)
+        proposer_username = str(proposal['proposed_by_username'] or '')
+        decider_uid = int(proposal['decided_by_user_id'] or 0)
+        decider_name = str(proposal['decided_by_username'] or '')
+
+        # Locked decisions from design: no proposer reward on self-approval; no voter reward on editor/admin override.
+        grant_voters = (decider_name == 'system')
+        grant_proposer = bool(proposer_uid > 0 and proposer_reward > 0 and proposer_uid != decider_uid)
+        now = self._ts()
+        c = self._conn()
+        if grant_proposer:
+            cur = c.execute(
+                '''INSERT OR IGNORE INTO torrent_metadata_rewards
+                   (proposal_id, user_id, username, reward_kind, reward_points, created_at)
+                   VALUES (?,?,?,?,?,?)''',
+                (proposal_id, proposer_uid, proposer_username[:64], 'proposer', proposer_reward, now)
+            )
+            if cur.rowcount and cur.rowcount > 0:
+                micro_delta = int(round(float(proposer_reward) * 1000.0))
+                if micro_delta > 0:
+                    self._award_micro_points_tx(
+                        c, proposer_uid, micro_delta,
+                        f'metadata proposer micro reward (proposal #{proposal_id})',
+                        'metadata_reward', str(proposal_id),
+                        conversion_reason=f'metadata micro reward conversion (proposal #{proposal_id})'
+                    )
+        if grant_voters and voter_reward > 0:
+            rows = c.execute(
+                '''SELECT voter_user_id, voter_username
+                   FROM torrent_metadata_proposal_votes
+                   WHERE proposal_id=? AND vote=1
+                   ORDER BY id ASC''',
+                (proposal_id,)
+            ).fetchall()
+            today = datetime.datetime.now().date().isoformat()
+            for r in rows:
+                uid = int(r['voter_user_id'] or 0)
+                if uid <= 0:
+                    continue
+                usage = c.execute(
+                    '''SELECT COALESCE(SUM(reward_points),0) AS pts,
+                              COALESCE(SUM(CASE WHEN reward_kind='voter' THEN 1 ELSE 0 END),0) AS votes
+                       FROM torrent_metadata_rewards
+                       WHERE user_id=? AND substr(created_at,1,10)=?''',
+                    (uid, today)
+                ).fetchone()
+                used_pts = float(usage['pts'] or 0.0)
+                used_votes = int(usage['votes'] or 0)
+                if used_pts + voter_reward > float(cfg.get('reward_daily_cap_points', 5.0)):
+                    continue
+                if used_votes >= int(cfg.get('reward_max_votes_per_day', 20)):
+                    continue
+                cur = c.execute(
+                    '''INSERT OR IGNORE INTO torrent_metadata_rewards
+                       (proposal_id, user_id, username, reward_kind, reward_points, created_at)
+                       VALUES (?,?,?,?,?,?)''',
+                    (proposal_id, uid, str(r['voter_username'] or '')[:64], 'voter', voter_reward, now)
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    micro_delta = int(round(float(voter_reward) * 1000.0))
+                    if micro_delta > 0:
+                        self._award_micro_points_tx(
+                            c, uid, micro_delta,
+                            f'metadata voter micro reward (proposal #{proposal_id})',
+                            'metadata_reward', str(proposal_id),
+                            conversion_reason=f'metadata micro reward conversion (proposal #{proposal_id})'
+                        )
+        c.execute(
+            'UPDATE torrent_metadata_proposals SET rewards_issued_at=?, updated_at=? WHERE id=? AND rewards_issued_at IS NULL',
+            (now, now, proposal_id)
+        )
+        c.commit()
+
+    def process_metadata_fetch_jobs(self) -> tuple[int, int]:
+        cfg = self.get_metadata_config()
+        if not cfg.get('enabled', True) or not cfg.get('fetch_enabled', True):
+            return 0, 0
+        now_iso = datetime.datetime.now().isoformat()
+        c = self._conn()
+        rows = c.execute(
+            '''SELECT * FROM torrent_metadata_fetch_jobs
+               WHERE status IN ('queued','retry')
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+               ORDER BY id ASC
+               LIMIT ?''',
+            (now_iso, int(cfg.get('fetch_per_cycle', 2)))
+        ).fetchall()
+        ok_count = 0
+        err_count = 0
+        for job in rows:
+            jid = int(job['id'])
+            attempt = int(job['attempt_count'] or 0) + 1
+            c.execute(
+                '''UPDATE torrent_metadata_fetch_jobs
+                   SET status='processing', attempt_count=?, updated_at=?
+                   WHERE id=?''',
+                (attempt, self._ts(), jid)
+            )
+            c.commit()
+            provider = str(job['provider'] or '')
+            external_id = str(job['external_id'] or '')
+            season = int(job['season']) if job['season'] is not None else None
+            episode = int(job['episode']) if job['episode'] is not None else None
+            ok = False
+            payload = {}
+            err = ''
+            if provider == 'imdb':
+                ok, payload, err = self._fetch_omdb_metadata(external_id, cfg)
+            elif provider == 'tvmaze':
+                ok, payload, err = self._fetch_tvmaze_metadata(external_id, season, episode, cfg)
+            else:
+                err = 'Unsupported metadata provider.'
+            if ok:
+                episode_external_id = str(payload.get('episode_external_id') or '')
+                self._upsert_metadata_cache(provider, external_id, payload, episode_external_id=episode_external_id)
+                c.execute(
+                    '''UPDATE torrent_metadata_links
+                       SET canonical_url=?, episode_url=?, episode_external_id=?
+                       WHERE source_proposal_id=? AND status='active' ''',
+                    (str(payload.get('canonical_url') or '')[:1000],
+                     str(payload.get('episode_url') or '')[:1000],
+                     episode_external_id[:64],
+                     int(job['proposal_id']))
+                )
+                c.execute(
+                    '''UPDATE torrent_metadata_fetch_jobs
+                       SET status='done', last_error='', next_attempt_at=NULL, updated_at=?
+                       WHERE id=?''',
+                    (self._ts(), jid)
+                )
+                p = self.get_metadata_proposal(int(job['proposal_id']))
+                self._maybe_issue_metadata_rewards(p)
+                c.commit()
+                ok_count += 1
+                continue
+            max_tries = int(cfg.get('fetch_max_retries', 3))
+            if attempt >= max_tries:
+                c.execute(
+                    '''UPDATE torrent_metadata_fetch_jobs
+                       SET status='failed', last_error=?, next_attempt_at=NULL, updated_at=?
+                       WHERE id=?''',
+                    (str(err or 'fetch failed')[:500], self._ts(), jid)
+                )
+            else:
+                delay = min(300, 10 * attempt)
+                next_try = (datetime.datetime.now() + datetime.timedelta(seconds=delay)).isoformat()
+                c.execute(
+                    '''UPDATE torrent_metadata_fetch_jobs
+                       SET status='retry', last_error=?, next_attempt_at=?, updated_at=?
+                       WHERE id=?''',
+                    (str(err or 'fetch failed')[:500], next_try, self._ts(), jid)
+                )
+            c.commit()
+            err_count += 1
+        return ok_count, err_count
+
+    def get_metadata_curators(self, top_n: int = 10) -> list:
+        return [dict(r) for r in self._conn().execute(
+            '''SELECT username, ROUND(COALESCE(SUM(reward_points),0), 2) AS metadata_score
+               FROM torrent_metadata_rewards
+               GROUP BY username
+               ORDER BY metadata_score DESC, username ASC
+               LIMIT ?''',
+            (max(1, int(top_n)),)
+        ).fetchall()]
+
+    def list_active_metadata_links(self, info_hash: str) -> list:
+        ih = (info_hash or '').strip().upper()
+        if not ih:
+            return []
+        return self._conn().execute(
+            '''SELECT * FROM torrent_metadata_links
+               WHERE info_hash=? AND status='active'
+               ORDER BY id DESC''',
+            (ih,)
+        ).fetchall()
+
+    def has_active_metadata_link(self, info_hash: str, provider: str) -> bool:
+        ih = (info_hash or '').strip().upper()
+        p = _normalize_metadata_provider(provider)
+        if not ih or not p:
+            return False
+        row = self._conn().execute(
+            '''SELECT 1 FROM torrent_metadata_links
+               WHERE info_hash=? AND provider=? AND status='active'
+               LIMIT 1''',
+            (ih, p)
+        ).fetchone()
+        return row is not None
+
+    def _enqueue_metadata_fetch_job(self, proposal) -> None:
+        if not proposal:
+            return
+        self._conn().execute(
+            '''INSERT INTO torrent_metadata_fetch_jobs (
+                   proposal_id, provider, external_id, season, episode, status,
+                   attempt_count, last_error, next_attempt_at, created_at, updated_at
+               ) VALUES (?,?,?,?,?,'queued',0,'',NULL,?,?)''',
+            (int(proposal['id']), proposal['provider'], proposal['proposed_id'],
+             proposal['season'], proposal['episode'], self._ts(), self._ts())
+        )
+        self._conn().commit()
+
+    def _activate_metadata_link_from_proposal(self, proposal, actor_user_id: int,
+                                              actor_username: str) -> None:
+        if not proposal:
+            return
+        ih = str(proposal['info_hash'] or '').upper()
+        provider = str(proposal['provider'] or '')
+        creator_uid = int(actor_user_id) if int(actor_user_id or 0) > 0 else int(proposal['proposed_by_user_id'] or 0)
+        creator_un = (actor_username[:64] if int(actor_user_id or 0) > 0 else str(proposal['proposed_by_username'] or '')[:64])
+        c = self._conn()
+        # Revoke any existing active link for this provider on this torrent.
+        c.execute(
+            '''UPDATE torrent_metadata_links
+               SET status='revoked', revoked_by_user_id=?, revoked_by_username=?,
+                   revoked_reason='superseded by approved proposal', revoked_at=?
+               WHERE info_hash=? AND provider=? AND status='active' ''',
+            (int(actor_user_id), actor_username[:64], self._ts(), ih, provider)
+        )
+        c.execute(
+            '''INSERT INTO torrent_metadata_links (
+                   info_hash, provider, external_id, canonical_url,
+                   episode_external_id, episode_url, source_proposal_id, status,
+                   created_by_user_id, created_by_username, created_at
+               ) VALUES (?,?,?,?,?,?,?,'active',?,?,?)''',
+            (ih, provider, str(proposal['proposed_id'] or ''),
+             str(proposal['proposed_url'] or ''), None, None, int(proposal['id']),
+             creator_uid, creator_un, self._ts())
+        )
+        c.commit()
+
+    def resolve_metadata_proposal(self, proposal_id: int, actor_user_id: int,
+                                  actor_username: str, decision: str,
+                                  reason: str = '') -> tuple[bool, str]:
+        p = self.get_metadata_proposal(int(proposal_id))
+        if not p:
+            return False, 'Proposal not found.'
+        if (p['status'] or '') != 'pending':
+            return False, 'Proposal is no longer pending.'
+        d = (decision or '').strip().lower()
+        if d not in ('approve', 'reject', 'expire'):
+            return False, 'Invalid decision.'
+        target_status = {'approve': 'approved', 'reject': 'rejected', 'expire': 'expired'}[d]
+        now = self._ts()
+        self._conn().execute(
+            '''UPDATE torrent_metadata_proposals
+               SET status=?, decision_reason=?, decided_by_user_id=?, decided_by_username=?,
+                   decided_at=?, updated_at=?
+               WHERE id=? AND status='pending' ''',
+            (target_status, (reason or '')[:500], int(actor_user_id), actor_username[:64],
+             now, now, int(proposal_id))
+        )
+        self._conn().commit()
+        if d == 'approve':
+            p = self.get_metadata_proposal(int(proposal_id))
+            self._activate_metadata_link_from_proposal(p, actor_user_id, actor_username)
+            self._enqueue_metadata_fetch_job(p)
+            # Reward issuance is tied to acceptance/approval event.
+            self._maybe_issue_metadata_rewards(p)
+        else:
+            # Pending previews are rendered as active metadata cards; rejecting/expiring
+            # the proposal should revoke its linked preview card.
+            self._conn().execute(
+                '''UPDATE torrent_metadata_links
+                   SET status='revoked', revoked_by_user_id=?, revoked_by_username=?,
+                       revoked_reason=?, revoked_at=?
+                   WHERE source_proposal_id=? AND status='active' ''',
+                (int(actor_user_id), actor_username[:64], f'proposal {target_status}', self._ts(), int(proposal_id))
+            )
+            self._conn().commit()
+        self._log(actor_username, f'metadata_{target_status}',
+                  str(p['info_hash'] or ''), f'proposal_id={proposal_id} provider={p["provider"]} id={p["proposed_id"]}')
+        return True, f'Proposal {target_status}.'
+
+    def revoke_active_metadata_link(self, info_hash: str, provider: str, actor_user_id: int,
+                                    actor_username: str, reason: str = '') -> tuple[bool, str]:
+        cfg = self.get_metadata_config()
+        p = _normalize_metadata_provider(provider)
+        ih = (info_hash or '').strip().upper()
+        if not ih or not p:
+            return False, 'Invalid metadata target.'
+        if cfg.get('revoke_requires_reason', True) and not (reason or '').strip():
+            return False, 'Reason is required to revoke metadata.'
+        cur = self._conn().execute(
+            '''UPDATE torrent_metadata_links
+               SET status='revoked', revoked_by_user_id=?, revoked_by_username=?,
+                   revoked_reason=?, revoked_at=?
+               WHERE info_hash=? AND provider=? AND status='active' ''',
+            (int(actor_user_id), actor_username[:64], (reason or '')[:500], self._ts(), ih, p)
+        )
+        self._conn().commit()
+        if cur.rowcount < 1:
+            return False, 'No active metadata link to revoke.'
+        self._log(actor_username, 'metadata_revoked', ih, f'provider={p} reason={(reason or "")[:120]}')
+        return True, 'Metadata revoked.'
+
+    def auto_finalize_metadata_proposals(self) -> tuple[int, int]:
+        cfg = self.get_metadata_config()
+        if not cfg.get('enabled', True) or not cfg.get('auto_finalize_enabled', True):
+            return 0, 0
+        now_iso = datetime.datetime.now().isoformat()
+        rows = self._conn().execute(
+            '''SELECT id FROM torrent_metadata_proposals
+               WHERE status='pending' AND auto_finalize_at <= ?
+               ORDER BY id ASC LIMIT 200''',
+            (now_iso,)
+        ).fetchall()
+        approved = 0
+        accepted = 0
+        for r in rows:
+            pid = int(r['id'])
+            summary = self.get_metadata_proposal_vote_summary(pid)
+            if (summary['unique_voters'] >= int(cfg['vote_min_unique_voters']) and
+                    summary['net'] >= int(cfg['vote_min_net_score'])):
+                ok, _ = self.resolve_metadata_proposal(pid, 0, 'system', 'approve', 'auto-finalized by community threshold')
+                if ok:
+                    self.notify_metadata_decision(pid, 'approved', 'system')
+                    approved += 1
+            else:
+                ok, _ = self.resolve_metadata_proposal(pid, 0, 'system', 'approve', 'auto-accepted after vote window elapsed')
+                if ok:
+                    self.notify_metadata_decision(pid, 'approved', 'system')
+                    accepted += 1
+        if approved or accepted:
+            self._log('system', 'metadata_auto_finalize', '', f'approved_by_threshold={approved} auto_accepted={accepted}')
+        return approved, accepted
 
     # ── Bounty System ─────────────────────────────────────────
 
@@ -5332,6 +6475,7 @@ class RegistrationDB:
             'FROM users u LEFT JOIN user_follows f ON f.followed_user_id=u.id '
             'WHERE u.is_standard=1 OR u.is_admin=1 '
             'GROUP BY u.id ORDER BY follower_count DESC, u.username ASC LIMIT ?', top_n)
+        metadata_curators = self.get_metadata_curators(top_n)
 
         return {
             'holders':       holders,
@@ -5341,6 +6485,7 @@ class RegistrationDB:
             'streaks':       streaks,
             'chatty':        chatty,
             'popular':       popular,
+            'metadata_curators': metadata_curators,
         }
 
     def list_bounties_by_user(self, username: str) -> dict:
@@ -5454,10 +6599,60 @@ class RegistrationDB:
         where = ' AND '.join(clauses)
         return where, params
 
+    @staticmethod
+    def _parse_special_torrent_search(query: str) -> tuple[str, str]:
+        q = (query or '').strip()
+        m = re.fullmatch(r'(?i)imdb\s*:\s*(tt[0-9]{4,12})', q)
+        if m:
+            return 'imdb', m.group(1).lower()
+        m = re.fullmatch(r'(?i)tvmaze\s*:\s*([0-9]{1,12})', q)
+        if m:
+            return 'tvmaze', m.group(1)
+        return '', ''
+
     def search_torrents(self, query: str, user_id: int | None = None,
                         page: int = 1, per_page: int = 50) -> list:
+        mode, value = self._parse_special_torrent_search(query)
         where, params = self._build_search_clauses(query)
         offset = (max(1, page) - 1) * per_page
+        if mode == 'imdb':
+            if user_id is None:
+                return self._conn().execute(
+                    '''SELECT t.* FROM torrents t
+                       JOIN torrent_metadata_links l
+                         ON l.info_hash=t.info_hash
+                      WHERE l.status='active' AND l.provider='imdb' AND LOWER(l.external_id)=?
+                      ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
+                    (value, per_page, offset)
+                ).fetchall()
+            return self._conn().execute(
+                '''SELECT t.* FROM torrents t
+                   JOIN torrent_metadata_links l
+                     ON l.info_hash=t.info_hash
+                  WHERE t.uploaded_by_id=? AND l.status='active'
+                    AND l.provider='imdb' AND LOWER(l.external_id)=?
+                  ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
+                (user_id, value, per_page, offset)
+            ).fetchall()
+        if mode == 'tvmaze':
+            if user_id is None:
+                return self._conn().execute(
+                    '''SELECT t.* FROM torrents t
+                       JOIN torrent_metadata_links l
+                         ON l.info_hash=t.info_hash
+                      WHERE l.status='active' AND l.provider='tvmaze' AND l.external_id=?
+                      ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
+                    (value, per_page, offset)
+                ).fetchall()
+            return self._conn().execute(
+                '''SELECT t.* FROM torrents t
+                   JOIN torrent_metadata_links l
+                     ON l.info_hash=t.info_hash
+                  WHERE t.uploaded_by_id=? AND l.status='active'
+                    AND l.provider='tvmaze' AND l.external_id=?
+                  ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
+                (user_id, value, per_page, offset)
+            ).fetchall()
         if user_id is None:
             return self._conn().execute(
                 f'SELECT * FROM torrents WHERE {where} '
@@ -5471,7 +6666,42 @@ class RegistrationDB:
         ).fetchall()
 
     def count_search_torrents(self, query: str, user_id: int | None = None) -> int:
+        mode, value = self._parse_special_torrent_search(query)
         where, params = self._build_search_clauses(query)
+        if mode == 'imdb':
+            if user_id is None:
+                return self._conn().execute(
+                    '''SELECT COUNT(*) FROM torrents t
+                       JOIN torrent_metadata_links l
+                         ON l.info_hash=t.info_hash
+                      WHERE l.status='active' AND l.provider='imdb' AND LOWER(l.external_id)=?''',
+                    (value,)
+                ).fetchone()[0]
+            return self._conn().execute(
+                '''SELECT COUNT(*) FROM torrents t
+                   JOIN torrent_metadata_links l
+                     ON l.info_hash=t.info_hash
+                  WHERE t.uploaded_by_id=? AND l.status='active'
+                    AND l.provider='imdb' AND LOWER(l.external_id)=?''',
+                (user_id, value)
+            ).fetchone()[0]
+        if mode == 'tvmaze':
+            if user_id is None:
+                return self._conn().execute(
+                    '''SELECT COUNT(*) FROM torrents t
+                       JOIN torrent_metadata_links l
+                         ON l.info_hash=t.info_hash
+                      WHERE l.status='active' AND l.provider='tvmaze' AND l.external_id=?''',
+                    (value,)
+                ).fetchone()[0]
+            return self._conn().execute(
+                '''SELECT COUNT(*) FROM torrents t
+                   JOIN torrent_metadata_links l
+                     ON l.info_hash=t.info_hash
+                  WHERE t.uploaded_by_id=? AND l.status='active'
+                    AND l.provider='tvmaze' AND l.external_id=?''',
+                (user_id, value)
+            ).fetchone()[0]
         if user_id is None:
             return self._conn().execute(
                 f'SELECT COUNT(*) FROM torrents WHERE {where}',
@@ -5653,6 +6883,7 @@ class RegistrationDB:
                    credits=0,
                    credits_awarded=0,
                    points=0,
+                   points_micro=0,
                    login_streak=0,
                    longest_streak=0,
                    last_login_date=NULL,
@@ -6752,6 +7983,77 @@ class RegistrationDB:
             recipient_user_id, ntype, voter_username, info_hash.upper(),
             torrent_name, int(comment_id)
         )
+
+    def _metadata_moderator_user_ids(self, info_hash: str) -> list[int]:
+        ih = (info_hash or '').strip().upper()
+        if not ih:
+            return []
+        ids: set[int] = set()
+        t = self.get_torrent(ih)
+        if t and int(t['uploaded_by_id'] or 0) > 0:
+            ids.add(int(t['uploaded_by_id']))
+        rows = self._conn().execute(
+            '''SELECT id FROM users
+               WHERE is_disabled=0
+                 AND (is_admin=1 OR is_editor=1 OR username=?)''',
+            (SUPER_USER,)
+        ).fetchall()
+        for r in rows:
+            ids.add(int(r['id']))
+        return sorted(ids)
+
+    def notify_metadata_proposed(self, proposal_id: int, actor_username: str) -> int:
+        p = self.get_metadata_proposal(int(proposal_id))
+        if not p:
+            return 0
+        t = self.get_torrent(str(p['info_hash'] or '').upper())
+        tname = (t['name'][:120] if t else str(p['info_hash'] or '')[:120])
+        sent = 0
+        for uid in self._metadata_moderator_user_ids(str(p['info_hash'] or '')):
+            if uid == int(p['proposed_by_user_id'] or 0):
+                continue
+            self.add_notification(
+                uid, 'metadata_proposed', actor_username,
+                str(p['info_hash'] or ''), tname, int(proposal_id)
+            )
+            sent += 1
+        return sent
+
+    def notify_metadata_decision(self, proposal_id: int, decision_type: str,
+                                 actor_username: str) -> int:
+        p = self.get_metadata_proposal(int(proposal_id))
+        if not p:
+            return 0
+        ntype = {
+            'approved': 'metadata_approved',
+            'rejected': 'metadata_rejected',
+            'expired': 'metadata_rejected',
+            'revoked': 'metadata_revoked',
+        }.get((decision_type or '').strip().lower())
+        if not ntype:
+            return 0
+        t = self.get_torrent(str(p['info_hash'] or '').upper())
+        tname = (t['name'][:120] if t else str(p['info_hash'] or '')[:120])
+        actor_uid = 0
+        if (actor_username or '').strip().lower() != 'system':
+            a = self.get_user(actor_username)
+            actor_uid = int(a['id'] or 0) if a else 0
+        recipients = {
+            int(p['proposed_by_user_id'] or 0),
+            int(t['uploaded_by_id'] or 0) if t else 0,
+        }
+        sent = 0
+        for uid in recipients:
+            if uid <= 0:
+                continue
+            if actor_uid > 0 and uid == actor_uid:
+                continue
+            self.add_notification(
+                uid, ntype, actor_username,
+                str(p['info_hash'] or ''), tname, int(proposal_id)
+            )
+            sent += 1
+        return sent
 
     def notify_followers_bounty_fulfilled(self, actor_username: str,
                                           bounty_id: int,
@@ -9243,7 +10545,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline'; "
             "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: https://www.gravatar.com https://secure.gravatar.com https://*.gravatar.com"
+            "img-src 'self' data: "
+            "https://www.gravatar.com https://secure.gravatar.com https://*.gravatar.com "
+            "https://static.tvmaze.com https://*.tvmaze.com "
+            "https://m.media-amazon.com https://*.media-amazon.com https://*.imdb.com"
         )
         self._refresh_csrf_cookie()  # ensure wkcsrf is always current
         self.end_headers()
@@ -9867,6 +11172,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_torrent_update_peers()
         elif path == '/manage/torrent/vote':
             self._post_torrent_vote()
+        elif path == '/manage/metadata/propose':
+            self._post_metadata_propose()
+        elif path == '/manage/metadata/vote':
+            self._post_metadata_vote()
+        elif path == '/manage/metadata/approve':
+            self._post_metadata_approve()
+        elif path == '/manage/metadata/reject':
+            self._post_metadata_reject()
+        elif path == '/manage/metadata/revoke':
+            self._post_metadata_revoke()
         elif path == '/manage/password':
             self._post_change_password()
         elif path == '/manage/admin/add-user':
@@ -9893,6 +11208,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_admin_reset_tfa()
         elif path == '/manage/admin/set-admin':
             self._post_set_admin()
+        elif path == '/manage/admin/set-role':
+            self._post_set_role()
         elif path == '/manage/admin/set-standard':
             self._post_set_standard()
         elif path == '/manage/admin/tracker-add':
@@ -11678,6 +12995,204 @@ class ManageHandler(BaseHTTPRequestHandler):
             )
         return self._redirect(f'/manage/torrent/{ih.lower()}')
 
+    def _can_moderate_metadata_for_torrent(self, user, torrent_row) -> bool:
+        if not user or not torrent_row:
+            return False
+        cfg = REGISTRATION_DB.get_metadata_config() if REGISTRATION_DB else {}
+        role = _user_role(user)
+        if role in ('super', 'admin'):
+            return True
+        if role == 'editor' and cfg.get('allow_editor_override', True):
+            return True
+        return int(torrent_row['uploaded_by_id'] or 0) == int(user['id'])
+
+    def _post_metadata_propose(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        role = _user_role(user)
+        if role == 'basic':
+            return self._redirect('/manage/dashboard')
+        cfg = REGISTRATION_DB.get_metadata_config()
+        if not cfg.get('enabled', True):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        provider = fields.get('provider', '').strip().lower()
+        ext_id = fields.get('external_id', '').strip()
+        proposed_url = fields.get('external_url', '').strip()
+        season_raw = fields.get('season', '').strip()
+        episode_raw = fields.get('episode', '').strip()
+        season = int(season_raw) if season_raw.isdigit() else None
+        episode = int(episode_raw) if episode_raw.isdigit() else None
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not t:
+            return self._redirect('/manage/dashboard')
+        can_moderate = self._can_moderate_metadata_for_torrent(user, t)
+        if (not can_moderate) and REGISTRATION_DB.has_active_metadata_link(ih, provider):
+            q = urllib.parse.quote('Metadata is already approved for this provider. Ask an owner/editor/admin to revoke it before submitting a replacement.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        ok, result = REGISTRATION_DB.create_metadata_proposal(
+            ih, provider, ext_id, int(user['id']), user['username'],
+            proposed_url=proposed_url, season=season, episode=episode
+        )
+        if not ok:
+            q = urllib.parse.quote(str(result))
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        proposal_id = int(result)
+        can_auto = self._can_moderate_metadata_for_torrent(user, t)
+        if can_auto and (role in ('super', 'admin', 'editor') or cfg.get('allow_owner_auto_approve', True)):
+            ok_res, _ = REGISTRATION_DB.resolve_metadata_proposal(
+                proposal_id, int(user['id']), user['username'],
+                'approve', 'owner/editor immediate approval'
+            )
+            if ok_res:
+                REGISTRATION_DB.notify_metadata_decision(proposal_id, 'approved', user['username'])
+                try:
+                    REGISTRATION_DB.process_metadata_fetch_jobs()
+                except Exception:
+                    pass
+            q = urllib.parse.quote('Metadata proposal approved and queued for fetch.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
+        # Community proposal path: prefetch metadata immediately for voter context
+        # while keeping proposal pending until vote thresholds are reached.
+        try:
+            prow = REGISTRATION_DB.get_metadata_proposal(proposal_id)
+            if prow:
+                REGISTRATION_DB._activate_metadata_link_from_proposal(prow, int(user['id']), user['username'])
+                REGISTRATION_DB._enqueue_metadata_fetch_job(prow)
+                REGISTRATION_DB.process_metadata_fetch_jobs()
+        except Exception:
+            pass
+        REGISTRATION_DB.notify_metadata_proposed(proposal_id, user['username'])
+        q = urllib.parse.quote('Metadata proposal submitted for community review. Current metadata card now shows the pending proposal.')
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
+
+    def _post_metadata_vote(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
+        cfg = REGISTRATION_DB.get_metadata_config()
+        if not cfg.get('enabled', True) or not cfg.get('vote_enabled', True):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        proposal_id = fields.get('proposal_id', '').strip()
+        vote_raw = fields.get('vote', '').strip().lower()
+        ih = fields.get('info_hash', '').strip().upper()
+        if not proposal_id.isdigit() or vote_raw not in ('up', 'down') or not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        vote_val = 1 if vote_raw == 'up' else -1
+        ok, msg = REGISTRATION_DB.cast_metadata_proposal_vote(
+            int(proposal_id), int(user['id']), user['username'], vote_val
+        )
+        if ok:
+            try:
+                p = REGISTRATION_DB.get_metadata_proposal(int(proposal_id))
+                if p and str(p['status'] or '') == 'pending':
+                    summary = REGISTRATION_DB.get_metadata_proposal_vote_summary(int(proposal_id))
+                    if (int(summary.get('unique_voters', 0)) >= int(cfg.get('vote_min_unique_voters', 3)) and
+                            int(summary.get('net', 0)) >= int(cfg.get('vote_min_net_score', 3))):
+                        ok_res, _ = REGISTRATION_DB.resolve_metadata_proposal(
+                            int(proposal_id), 0, 'system', 'approve',
+                            'community threshold reached'
+                        )
+                        if ok_res:
+                            REGISTRATION_DB.notify_metadata_decision(int(proposal_id), 'approved', 'system')
+                            try:
+                                REGISTRATION_DB.process_metadata_fetch_jobs()
+                            except Exception:
+                                pass
+                            msg = 'Threshold reached. Proposal approved and queued for fetch.'
+            except Exception:
+                pass
+        q = urllib.parse.quote(msg)
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_metadata_approve(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        proposal_id = fields.get('proposal_id', '').strip()
+        if not proposal_id.isdigit():
+            return self._redirect('/manage/dashboard')
+        p = REGISTRATION_DB.get_metadata_proposal(int(proposal_id))
+        if not p:
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(str(p['info_hash'] or '').upper())
+        if not self._can_moderate_metadata_for_torrent(user, t):
+            return self._redirect(f'/manage/torrent/{str(p["info_hash"]).lower()}')
+        ok, msg = REGISTRATION_DB.resolve_metadata_proposal(
+            int(proposal_id), int(user['id']), user['username'],
+            'approve', fields.get('reason', '').strip()
+        )
+        if ok:
+            REGISTRATION_DB.notify_metadata_decision(int(proposal_id), 'approved', user['username'])
+            try:
+                REGISTRATION_DB.process_metadata_fetch_jobs()
+            except Exception:
+                pass
+        q = urllib.parse.quote(msg)
+        return self._redirect(f'/manage/torrent/{str(p["info_hash"]).lower()}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_metadata_reject(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        proposal_id = fields.get('proposal_id', '').strip()
+        if not proposal_id.isdigit():
+            return self._redirect('/manage/dashboard')
+        p = REGISTRATION_DB.get_metadata_proposal(int(proposal_id))
+        if not p:
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(str(p['info_hash'] or '').upper())
+        if not self._can_moderate_metadata_for_torrent(user, t):
+            return self._redirect(f'/manage/torrent/{str(p["info_hash"]).lower()}')
+        ok, msg = REGISTRATION_DB.resolve_metadata_proposal(
+            int(proposal_id), int(user['id']), user['username'],
+            'reject', fields.get('reason', '').strip()
+        )
+        if ok:
+            REGISTRATION_DB.notify_metadata_decision(int(proposal_id), 'rejected', user['username'])
+        q = urllib.parse.quote(msg)
+        return self._redirect(f'/manage/torrent/{str(p["info_hash"]).lower()}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_metadata_revoke(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        provider = fields.get('provider', '').strip().lower()
+        reason = fields.get('reason', '').strip()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not self._can_moderate_metadata_for_torrent(user, t):
+            return self._redirect(f'/manage/torrent/{ih.lower()}')
+        ok, msg = REGISTRATION_DB.revoke_active_metadata_link(
+            ih, provider, int(user['id']), user['username'], reason=reason
+        )
+        if ok:
+            # Reuse most recent proposal for this provider as notification context.
+            proposals = REGISTRATION_DB.list_metadata_proposals_for_torrent(ih, limit=20)
+            for p in proposals:
+                if str(p['provider'] or '') == provider:
+                    REGISTRATION_DB.notify_metadata_decision(int(p['id']), 'revoked', user['username'])
+                    break
+        q = urllib.parse.quote(msg)
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type={"success" if ok else "error"}')
+
     def _get_torrent_detail(self, ih: str):
         user = self._get_session_user()
         if not user:
@@ -11763,10 +13278,15 @@ class ManageHandler(BaseHTTPRequestHandler):
         fields, _ = _parse_multipart(self.headers, body)
         username = fields.get('username', '').strip()
         password = fields.get('password', '')
-        # Role: basic/standard/admin (admin only for super)
-        role_choice     = fields.get('role', 'basic')
-        is_new_admin    = is_super and role_choice == 'admin'
-        is_new_standard = role_choice in ('standard', 'admin')
+        # Role creation policy:
+        # - super can choose basic/standard/editor/admin
+        # - non-super admins can only create basic users
+        role_choice = 'basic'
+        if is_super:
+            requested_role = (fields.get('role', 'basic') or '').strip().lower()
+            if requested_role in ('basic', 'standard', 'editor', 'admin'):
+                role_choice = requested_role
+        is_new_admin = (role_choice == 'admin')
         un_err = _validate_username(username)
         if un_err or not password:
             err = urllib.parse.quote(un_err or 'Password is required.')
@@ -11782,9 +13302,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not ok:
             un = urllib.parse.quote(username)
             return self._redirect(f'/manage/admin?tab=adduser&msg=Unable+to+create+user.+Username+may+already+exist.&msg_type=error&new_username={un}')
-        if ok and is_new_standard and not is_new_admin:
-            REGISTRATION_DB.set_standard(username, True, user['username'])
-        role_txt = 'admin' if is_new_admin else ('standard' if is_new_standard else 'basic')
+        if ok:
+            REGISTRATION_DB.set_role(username, role_choice, user['username'])
+        role_txt = role_choice
         msg = urllib.parse.quote(f'User {username} created as {role_txt}.')
         return self._redirect(f'/manage/admin?tab=adduser&msg={msg}&msg_type=success')
 
@@ -12060,11 +13580,36 @@ class ManageHandler(BaseHTTPRequestHandler):
         fields, _ = _parse_multipart(self.headers, body)
         target   = fields.get('username', '').strip()
         is_admin = fields.get('is_admin', '0') == '1'
+        referer = (fields.get('referer', '') or '').strip()
+        back = referer if referer.startswith('/manage/admin/user/') else '/manage/admin?tab=users'
         if target and target != SUPER_USER:
             REGISTRATION_DB.set_admin(target, is_admin, user['username'])
         role_txt = 'admin' if is_admin else 'member'
-        self._redirect_back_manage('/manage/admin?tab=users',
-                                   msg=f'User {target} set to {role_txt}.', msg_type='success')
+        msg = urllib.parse.quote_plus(f'User {target} set to {role_txt}.')
+        glue = '&' if '?' in back else '?'
+        self._redirect(f'{back}{glue}msg={msg}&msg_type=success')
+
+    def _post_set_role(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if user['username'] != SUPER_USER:
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target = fields.get('username', '').strip()
+        role = (fields.get('role', '') or '').strip().lower()
+        referer = (fields.get('referer', '') or '').strip()
+        back = referer if referer.startswith('/manage/admin/user/') else '/manage/admin?tab=users'
+        if target and target != SUPER_USER and role in ('basic', 'standard', 'editor', 'admin'):
+            REGISTRATION_DB.set_role(target, role, user['username'])
+            msg = urllib.parse.quote_plus(f'User {target} set to {role}.')
+            glue = '&' if '?' in back else '?'
+            self._redirect(f'{back}{glue}msg={msg}&msg_type=success')
+            return
+        msg = urllib.parse.quote_plus('Invalid role update request.')
+        glue = '&' if '?' in back else '?'
+        self._redirect(f'{back}{glue}msg={msg}&msg_type=error')
 
 
     # ── Tracker management handlers ──────────────────────────
@@ -12079,11 +13624,14 @@ class ManageHandler(BaseHTTPRequestHandler):
         fields, _ = _parse_multipart(self.headers, body)
         target = fields.get('username', '').strip()
         is_std = fields.get('is_standard', '0') == '1'
+        referer = (fields.get('referer', '') or '').strip()
+        back = referer if referer.startswith('/manage/admin/user/') else '/manage/admin?tab=users'
         if target and target != SUPER_USER:
             REGISTRATION_DB.set_standard(target, is_std, user['username'])
         tier_txt = 'standard' if is_std else 'basic'
-        self._redirect_back_manage('/manage/admin?tab=users',
-                                   msg=f'User {target} set to {tier_txt}.', msg_type='success')
+        msg = urllib.parse.quote_plus(f'User {target} set to {tier_txt}.')
+        glue = '&' if '?' in back else '?'
+        self._redirect(f'{back}{glue}msg={msg}&msg_type=success')
 
     def _post_delete_all_users(self):
         user = self._get_session_user()
@@ -12857,6 +14405,62 @@ class ManageHandler(BaseHTTPRequestHandler):
                 except Exception:
                     v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
+        elif form_id == 'metadata_settings':
+            fetch_enabled = '1' if fields.get('metadata_fetch_enabled') == '1' else '0'
+            REGISTRATION_DB.set_setting('metadata_fetch_enabled', fetch_enabled, user['username'])
+            omdb_base = (fields.get('metadata_omdb_base_url', 'https://www.omdbapi.com/') or '').strip()
+            tvmaze_base = (fields.get('metadata_tvmaze_base_url', 'https://api.tvmaze.com') or '').strip()
+            if not omdb_base:
+                omdb_base = 'https://www.omdbapi.com/'
+            if not tvmaze_base:
+                tvmaze_base = 'https://api.tvmaze.com'
+            REGISTRATION_DB.set_setting('metadata_omdb_base_url', omdb_base[:500], user['username'])
+            REGISTRATION_DB.set_setting('metadata_tvmaze_base_url', tvmaze_base[:500], user['username'])
+            clear_key = fields.get('metadata_omdb_api_key_clear') == '1'
+            new_key = (fields.get('metadata_omdb_api_key', '') or '').strip()
+            log.debug('METADATA settings save actor=%s clear_key=%s submitted_key_len=%d',
+                      user['username'], clear_key, len(new_key))
+            if clear_key:
+                REGISTRATION_DB.set_setting('metadata_omdb_api_key', '', user['username'])
+            elif new_key:
+                REGISTRATION_DB.set_setting('metadata_omdb_api_key', new_key[:200], user['username'])
+        elif form_id == 'metadata_moderation_settings':
+            for key in (
+                'metadata_enabled',
+                'metadata_vote_enabled',
+                'metadata_auto_finalize_enabled',
+                'metadata_allow_owner_auto_approve',
+                'metadata_allow_editor_override',
+                'metadata_allow_post_revoke',
+                'metadata_revoke_requires_reason',
+            ):
+                REGISTRATION_DB.set_setting(key, '1' if fields.get(key) == '1' else '0', user['username'])
+            for key, default, lo, hi in [
+                ('metadata_vote_window_hours', '24', 1, 168),
+                ('metadata_vote_min_unique_voters', '3', 1, 100),
+                ('metadata_vote_min_net_score', '3', 1, 100),
+                ('metadata_fetch_timeout_sec', '5', 2, 20),
+                ('metadata_fetch_max_retries', '3', 1, 10),
+                ('metadata_fetch_per_cycle', '2', 1, 10),
+                ('metadata_reward_max_votes_per_day', '20', 0, 10000),
+            ]:
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except Exception:
+                    v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
+            for key, default, lo, hi in [
+                ('metadata_reward_proposer', '1.0', 0.0, 100.0),
+                ('metadata_reward_voter', '0.25', 0.0, 100.0),
+                ('metadata_reward_daily_cap_points', '5.0', 0.0, 10000.0),
+            ]:
+                raw = (fields.get(key, default) or '').strip()
+                try:
+                    fv = float(raw)
+                except Exception:
+                    fv = float(default)
+                fv = max(lo, min(hi, fv))
+                REGISTRATION_DB.set_setting(key, f'{fv:.2f}'.rstrip('0').rstrip('.'), user['username'])
         elif form_id == 'topup_settings':
             # PayPal webhook verification policy:
             # enforce=1 -> fail closed and require active env webhook ID when PayPal enabled
@@ -13013,10 +14617,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             'complexity', 'account_lockout', 'free_signup', 'open_tracker', 'comments_enabled',
             'robots_txt', 'torrents_per_page', 'upload_limits', 'stats_persistence',
             'security_policies', 'gravatar_settings', 'webauthn_settings', 'tfa_settings',
+            'metadata_settings', 'metadata_moderation_settings',
         }
         if form_id == 'topup_settings':
             tab = 'topups'
             msg = 'Top-up+settings+saved'
+        elif form_id in ('metadata_settings', 'metadata_moderation_settings'):
+            tab = 'settings'
+            msg = 'Metadata+settings+saved'
         elif form_id in economy_forms:
             tab = 'economy'
             msg = 'Settings+saved'
@@ -13673,7 +15281,24 @@ class ManageHandler(BaseHTTPRequestHandler):
                 else:
                     url = '/manage/admin?tab=security'
             else:
-                if n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
+                if n['type'] == 'metadata_proposed':
+                    icon = '🧩'
+                    label = 'proposed metadata for your torrent'
+                    anchor = f'#metadata-pending-{int(n["comment_id"] or 0)}' if int(n['comment_id'] or 0) > 0 else '#metadata'
+                    url = f'/manage/torrent/{n["info_hash"].lower()}{anchor}'
+                elif n['type'] == 'metadata_approved':
+                    icon = '✅'
+                    label = 'approved metadata on your torrent'
+                    url = f'/manage/torrent/{n["info_hash"].lower()}#metadata'
+                elif n['type'] == 'metadata_rejected':
+                    icon = '✗'
+                    label = 'rejected metadata on your torrent'
+                    url = f'/manage/torrent/{n["info_hash"].lower()}#metadata'
+                elif n['type'] == 'metadata_revoked':
+                    icon = '🛡️'
+                    label = 'revoked metadata on your torrent'
+                    url = f'/manage/torrent/{n["info_hash"].lower()}#metadata'
+                elif n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
                     icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
                     label = 'reacted to your torrent'
                     url = f'/manage/torrent/{n["info_hash"].lower()}'
@@ -14495,6 +16120,10 @@ _MANAGE_CSS = '''
   .btn-danger { border-color: var(--red); color: var(--red); }
   .btn-danger:hover { background: var(--red); color: #fff; }
   .btn-sm { padding: 4px 12px; font-size: 0.72rem; }
+  .btn-id-copy { margin-left:6px; padding:2px 8px; border:1px solid var(--border);
+                 border-radius:999px; background:transparent; color:var(--muted);
+                 font-family:var(--mono); font-size:0.68rem; cursor:pointer; transition:all 0.15s ease; }
+  .btn-id-copy:hover { color:var(--accent); border-color:var(--accent); background:rgba(245,166,35,0.08); }
   .btn-green { border-color: var(--green); color: var(--green); }
   .btn-green:hover { background: var(--green); color: #000; }
   .btn-accent-rev { border-color: var(--accent); color: var(--accent); }
@@ -14540,6 +16169,7 @@ _MANAGE_CSS = '''
   .badge { display: inline-block; font-family: var(--mono); font-size: 0.65rem; letter-spacing: 0.1em;
            padding: 2px 8px; border-radius: 4px; font-weight: 600; }
   .badge-admin    { background: rgba(245,166,35,0.15); color: var(--accent); border: 1px solid rgba(245,166,35,0.3); }
+  .badge-editor   { background: rgba(139,107,217,0.16); color: #cbb6ff; border: 1px solid rgba(139,107,217,0.42); }
   .badge-standard { background: rgba(180,180,200,0.12); color: var(--text); border: 1px solid rgba(180,180,200,0.3); }
   .badge-basic    { background: rgba(62,207,142,0.10); color: var(--green); border: 1px solid rgba(62,207,142,0.3); }
   .user-link { color:var(--text);text-decoration:none;border-bottom:1px solid transparent;transition:color .15s,border-color .15s; }
@@ -15302,7 +16932,49 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
                 n_id   = n['id']
                 n_hash = n['info_hash'].lower()
-                if n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
+                if n['type'] == 'metadata_proposed':
+                    n_pid = int(n['comment_id'] or 0)
+                    anchor = f'#metadata-pending-{n_pid}' if n_pid > 0 else '#metadata'
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'data-notif-id="{n_id}" data-notif-url="/manage/torrent/{n_hash}{anchor}"'
+                        f' aria-label="metadata proposal by {from_h}">'
+                        f'<div class="notif-item-type">🧩 <strong>{from_h}</strong> proposed metadata for your torrent</div>'
+                        f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
+                elif n['type'] == 'metadata_approved':
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'data-notif-id="{n_id}" data-notif-url="/manage/torrent/{n_hash}#metadata"'
+                        f' aria-label="metadata approval by {from_h}">'
+                        f'<div class="notif-item-type">✅ <strong>{from_h}</strong> approved metadata on your torrent</div>'
+                        f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
+                elif n['type'] == 'metadata_rejected':
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'data-notif-id="{n_id}" data-notif-url="/manage/torrent/{n_hash}#metadata"'
+                        f' aria-label="metadata rejection by {from_h}">'
+                        f'<div class="notif-item-type">✗ <strong>{from_h}</strong> rejected metadata on your torrent</div>'
+                        f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
+                elif n['type'] == 'metadata_revoked':
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'data-notif-id="{n_id}" data-notif-url="/manage/torrent/{n_hash}#metadata"'
+                        f' aria-label="metadata revocation by {from_h}">'
+                        f'<div class="notif-item-type">🛡️ <strong>{from_h}</strong> revoked metadata on your torrent</div>'
+                        f'<div class="notif-item-text">on <em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
+                elif n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
                     icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
                     dropdown_items += (
                         f'<button class="notif-item" '
@@ -16713,6 +18385,94 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         </form>
       </div>
       <div class="card">
+        <div class="card-title">Metadata APIs</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Configure external metadata providers. IMDb enrichment requires an OMDb API key.
+          Leave key blank to keep the existing value.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="metadata_settings">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+            <input type="checkbox" name="metadata_fetch_enabled" value="1" {'checked' if settings.get('metadata_fetch_enabled','1')=='1' else ''}> Enable metadata fetch jobs
+          </label>
+          <div class="form-group">
+            <label>OMDb API Key {'(configured)' if (settings.get('metadata_omdb_api_key','') or '').strip() else '(not configured)'}</label>
+            <input type="text" name="metadata_omdb_api_key" value=""
+                   placeholder="Enter OMDb API key (leave blank to keep current)"
+                   autocomplete="off" autocapitalize="off" spellcheck="false">
+          </div>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+            <input type="checkbox" name="metadata_omdb_api_key_clear" value="1"> Clear stored OMDb API key
+          </label>
+          <div class="form-group">
+            <label>OMDb Base URL</label>
+            <input type="url" name="metadata_omdb_base_url" value="{_h(settings.get('metadata_omdb_base_url','https://www.omdbapi.com/'))}">
+          </div>
+          <div class="form-group">
+            <label>TVMaze Base URL</label>
+            <input type="url" name="metadata_tvmaze_base_url" value="{_h(settings.get('metadata_tvmaze_base_url','https://api.tvmaze.com'))}">
+          </div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
+        <div class="card-title">Metadata Moderation</div>
+        <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+          Configure metadata proposal voting, auto-accept behavior, and reward tuning.
+        </p>
+        <form method="POST" action="/manage/admin/save-settings">
+          <input type="hidden" name="form_id" value="metadata_moderation_settings">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="metadata_enabled" value="1" {'checked' if settings.get('metadata_enabled','1')=='1' else ''}> Enable metadata feature
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="metadata_vote_enabled" value="1" {'checked' if settings.get('metadata_vote_enabled','1')=='1' else ''}> Enable community voting
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="metadata_auto_finalize_enabled" value="1" {'checked' if settings.get('metadata_auto_finalize_enabled','1')=='1' else ''}> Enable auto-finalize / auto-accept
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="metadata_allow_owner_auto_approve" value="1" {'checked' if settings.get('metadata_allow_owner_auto_approve','1')=='1' else ''}> Allow owner immediate approve
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="metadata_allow_editor_override" value="1" {'checked' if settings.get('metadata_allow_editor_override','1')=='1' else ''}> Allow editor moderation override
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="metadata_allow_post_revoke" value="1" {'checked' if settings.get('metadata_allow_post_revoke','1')=='1' else ''}> Allow post-approve revoke
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
+            <input type="checkbox" name="metadata_revoke_requires_reason" value="1" {'checked' if settings.get('metadata_revoke_requires_reason','1')=='1' else ''}> Require revoke reason
+          </label>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px">
+            <div class="form-group"><label>Vote window (hours)</label>
+              <input type="number" name="metadata_vote_window_hours" value="{_h(settings.get('metadata_vote_window_hours','24'))}" min="1" max="168"></div>
+            <div class="form-group"><label>Min unique voters</label>
+              <input type="number" name="metadata_vote_min_unique_voters" value="{_h(settings.get('metadata_vote_min_unique_voters','3'))}" min="1" max="100"></div>
+            <div class="form-group"><label>Min net score</label>
+              <input type="number" name="metadata_vote_min_net_score" value="{_h(settings.get('metadata_vote_min_net_score','3'))}" min="1" max="100"></div>
+            <div class="form-group"><label>Fetch timeout (sec)</label>
+              <input type="number" name="metadata_fetch_timeout_sec" value="{_h(settings.get('metadata_fetch_timeout_sec','5'))}" min="2" max="20"></div>
+            <div class="form-group"><label>Fetch max retries</label>
+              <input type="number" name="metadata_fetch_max_retries" value="{_h(settings.get('metadata_fetch_max_retries','3'))}" min="1" max="10"></div>
+            <div class="form-group"><label>Fetch per cycle</label>
+              <input type="number" name="metadata_fetch_per_cycle" value="{_h(settings.get('metadata_fetch_per_cycle','2'))}" min="1" max="10"></div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px">
+            <div class="form-group"><label>Reward proposer</label>
+              <input type="number" step="0.01" name="metadata_reward_proposer" value="{_h(settings.get('metadata_reward_proposer','1.0'))}" min="0" max="100"></div>
+            <div class="form-group"><label>Reward voter</label>
+              <input type="number" step="0.01" name="metadata_reward_voter" value="{_h(settings.get('metadata_reward_voter','0.25'))}" min="0" max="100"></div>
+            <div class="form-group"><label>Reward daily cap</label>
+              <input type="number" step="0.01" name="metadata_reward_daily_cap_points" value="{_h(settings.get('metadata_reward_daily_cap_points','5.0'))}" min="0" max="10000"></div>
+            <div class="form-group"><label>Max rewarded votes/day</label>
+              <input type="number" name="metadata_reward_max_votes_per_day" value="{_h(settings.get('metadata_reward_max_votes_per_day','20'))}" min="0" max="10000"></div>
+          </div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+      <div class="card">
         <div class="card-title">Upload Limits</div>
         <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
           Configure request and file limits for torrent uploads. Requests over the
@@ -17486,6 +19246,8 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             badges += '<span class="badge badge-super">SUPER</span> '
         elif u_is_admin:
             badges += '<span class="badge badge-admin">ADMIN</span> '
+        elif u_role == 'editor':
+            badges += '<span class="badge badge-editor">EDITOR</span> '
         elif u_role == 'standard':
             badges += '<span class="badge badge-standard">STANDARD</span> '
         else:
@@ -17520,37 +19282,63 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
               <button class="btn btn-sm {"btn-green" if u["is_disabled"] else ""}">{dis_label}</button>
             </form>'''
 
-        # Promote/demote -- super only, cannot touch other admins or super
+        # Role ladder (super only): basic <-> standard <-> editor <-> admin
         if is_super and not u_is_super:
-            if u_is_admin:
+            if u_role == 'admin':
                 actions += f'''
-                <form method="POST" action="/manage/admin/set-admin" style="display:inline"
-                      data-confirm="Remove admin from {uname_h}?">
+                <form method="POST" action="/manage/admin/set-role" style="display:inline"
+                      data-confirm="Demote {uname_h} to editor?">
                   <input type="hidden" name="username" value="{uname_h}">
-                  <input type="hidden" name="is_admin" value="0">
-                  <button class="btn btn-sm">&#8595; To Standard</button>
+                  <input type="hidden" name="role" value="editor">
+                  <button class="btn btn-sm">&#8595; Editor</button>
+                </form>'''
+            elif u_role == 'editor':
+                actions += f'''
+                <form method="POST" action="/manage/admin/set-role" style="display:inline"
+                      data-confirm="Demote {uname_h} to standard?">
+                  <input type="hidden" name="username" value="{uname_h}">
+                  <input type="hidden" name="role" value="standard">
+                  <button class="btn btn-sm">&#8595; Standard</button>
+                </form>
+                <form method="POST" action="/manage/admin/set-role" style="display:inline"
+                      data-confirm="Promote {uname_h} to admin?">
+                  <input type="hidden" name="username" value="{uname_h}">
+                  <input type="hidden" name="role" value="admin">
+                  <button class="btn btn-sm btn-green">&#8593; Admin</button>
+                </form>'''
+            elif u_role == 'standard':
+                actions += f'''
+                <form method="POST" action="/manage/admin/set-role" style="display:inline"
+                      data-confirm="Demote {uname_h} to basic?">
+                  <input type="hidden" name="username" value="{uname_h}">
+                  <input type="hidden" name="role" value="basic">
+                  <button class="btn btn-sm">&#8595; Basic</button>
+                </form>
+                <form method="POST" action="/manage/admin/set-role" style="display:inline"
+                      data-confirm="Promote {uname_h} to editor?">
+                  <input type="hidden" name="username" value="{uname_h}">
+                  <input type="hidden" name="role" value="editor">
+                  <button class="btn btn-sm btn-green">&#8593; Editor</button>
                 </form>'''
             else:
                 actions += f'''
-                <form method="POST" action="/manage/admin/set-admin" style="display:inline"
-                      data-confirm="Promote {uname_h} to admin?">
+                <form method="POST" action="/manage/admin/set-role" style="display:inline"
+                      data-confirm="Promote {uname_h} to standard?">
                   <input type="hidden" name="username" value="{uname_h}">
-                  <input type="hidden" name="is_admin" value="1">
-                  <button class="btn btn-sm btn-green">&#8593; Admin</button>
+                  <input type="hidden" name="role" value="standard">
+                  <button class="btn btn-sm btn-green">&#8593; Standard</button>
                 </form>'''
-
-        # Delete -- admin can delete standard users; super can delete admins and users
-        # Promote/demote standard -- super and admins can do this for non-admin users
-        if not u_is_super and not u_is_admin and (is_super or user['is_admin']):
+        # Admins (non-super) can still manage basic/standard only for non-admin users.
+        elif not u_is_super and not u_is_admin and user['is_admin']:
             if u_role == 'standard':
                 actions += f'''
                 <form method="POST" action="/manage/admin/set-standard" style="display:inline"
                       data-confirm="Demote {uname_h} to basic?">
                   <input type="hidden" name="username" value="{uname_h}">
                   <input type="hidden" name="is_standard" value="0">
-                  <button class="btn btn-sm">&#8595; Demote</button>
+                  <button class="btn btn-sm">&#8595; Basic</button>
                 </form>'''
-            else:
+            elif u_role == 'basic':
                 actions += f'''
                 <form method="POST" action="/manage/admin/set-standard" style="display:inline"
                       data-confirm="Promote {uname_h} to standard?">
@@ -17912,6 +19700,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   font-family:var(--mono);font-size:0.88rem">
             <option value="basic">Basic</option>
             <option value="standard">Standard</option>
+            <option value="editor">Editor</option>
             <option value="admin">Admin</option>
           </select>
         </div>"""}
@@ -18737,6 +20526,8 @@ def _render_notifications_page(viewer) -> str:
         return _manage_page('Notifications', '<p>Unavailable</p>', user=viewer)
     notifs = REGISTRATION_DB.get_all_notifications(viewer['id'])
     unread_count = sum(1 for n in notifs if not n['is_read'])
+    token = _session_token_for(viewer)
+    csrf = _csrf_token(token) if token else ''
 
     rows = ''
     for n in notifs:
@@ -18868,7 +20659,92 @@ def _render_notifications_page(viewer) -> str:
                 f'</div>'
             )
         else:
-            if n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
+            if n['type'] == 'metadata_proposed':
+                pid = int(n['comment_id'] or 0)
+                url = f'/manage/torrent/{n["info_hash"].lower()}#metadata-pending-{pid}' if pid > 0 else f'/manage/torrent/{n["info_hash"].lower()}#metadata'
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
+                actions = f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                if pid > 0:
+                    p = REGISTRATION_DB.get_metadata_proposal(pid)
+                    can_mod = False
+                    if p:
+                        t = REGISTRATION_DB.get_torrent(str(p['info_hash'] or '').upper())
+                        vrole = _user_role(viewer)
+                        can_mod = (vrole in ('super', 'admin') or
+                                   (vrole == 'editor' and REGISTRATION_DB.get_metadata_config().get('allow_editor_override', True)) or
+                                   (t and int(t['uploaded_by_id'] or 0) == int(viewer['id'])))
+                    if can_mod:
+                        actions = (
+                            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+                            f'<form method="POST" action="/manage/metadata/approve" style="display:inline">'
+                            f'<input type="hidden" name="proposal_id" value="{pid}">'
+                            f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                            '<button class="btn btn-sm btn-green">Approve</button></form>'
+                            f'<form method="POST" action="/manage/metadata/reject" style="display:inline">'
+                            f'<input type="hidden" name="proposal_id" value="{pid}">'
+                            f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                            '<button class="btn btn-sm btn-danger">Reject</button></form>'
+                            f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                            '</div>'
+                        )
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">🧩</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' proposed metadata for your torrent: '
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'{actions}'
+                    f'</div>'
+                )
+            elif n['type'] == 'metadata_approved':
+                url = f'/manage/torrent/{n["info_hash"].lower()}#metadata'
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">✅</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' approved metadata on '
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                    f'</div>'
+                )
+            elif n['type'] == 'metadata_rejected':
+                url = f'/manage/torrent/{n["info_hash"].lower()}#metadata'
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">✗</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' rejected metadata on '
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                    f'</div>'
+                )
+            elif n['type'] == 'metadata_revoked':
+                url = f'/manage/torrent/{n["info_hash"].lower()}#metadata'
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">🛡️</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' revoked metadata on '
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                    f'</div>'
+                )
+            elif n['type'] in ('torrent_vote_up', 'torrent_vote_down'):
                 icon = '👍' if n['type'] == 'torrent_vote_up' else '👎'
                 url = f'/manage/torrent/{n["info_hash"].lower()}'
                 read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
@@ -19146,6 +21022,314 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         '</div>'
         '</div>'
     )
+    metadata_card = ''
+    if REGISTRATION_DB:
+        meta_cfg = REGISTRATION_DB.get_metadata_config()
+        meta_enabled = bool(meta_cfg.get('enabled', True))
+        can_meta_suggest = vrole != 'basic'
+        can_meta_vote = can_meta_suggest and bool(meta_cfg.get('vote_enabled', True))
+        can_meta_moderate = (vrole in ('super', 'admin') or
+                             (vrole == 'editor' and meta_cfg.get('allow_editor_override', True)) or
+                             is_owner)
+        active_links = REGISTRATION_DB.list_active_metadata_links(ih) if meta_enabled else []
+        proposals = REGISTRATION_DB.list_metadata_proposals_for_torrent(ih, limit=20) if meta_enabled else []
+        active_blocks = ''
+        for link in active_links:
+            provider = str(link['provider'] or '')
+            ext_id = str(link['external_id'] or '')
+            cache = REGISTRATION_DB.get_metadata_cache_for_link(link)
+            title = _h((cache['title'] if cache and cache['title'] else ext_id) or ext_id)
+            subtitle = _h(_strip_html_text(str(cache['subtitle'] or '')) if cache else '')
+            canonical_url = str(link['canonical_url'] or (cache['canonical_url'] if cache else '') or '')
+            episode_url = str(link['episode_url'] or (cache['episode_url'] if cache else '') or '')
+            poster_url = str(cache['poster_url'] or '') if cache else ''
+            genres = []
+            if cache:
+                try:
+                    genres = [str(g) for g in json.loads(cache['genres_json'] or '[]') if str(g).strip()]
+                except Exception:
+                    genres = []
+            genre_html = ''.join(
+                f'<span style="display:inline-block;padding:2px 8px;border:1px solid var(--border);'
+                f'border-radius:999px;font-size:0.72rem;color:var(--muted)">{_h(g)}</span>'
+                for g in genres[:8]
+            )
+            rating = ''
+            if cache and cache['rating_value'] is not None:
+                rating = f'<span class="hash">Rating: {float(cache["rating_value"]):.1f}</span>'
+            year = ''
+            if cache and cache['year']:
+                year = f'<span class="hash">Year: {int(cache["year"])}</span>'
+            runtime = ''
+            if cache and cache['runtime_minutes']:
+                runtime = f'<span class="hash">Runtime: {int(cache["runtime_minutes"])} min</span>'
+            network = ''
+            if cache and cache['network_name']:
+                network = f'<span class="hash">Network: {_h(cache["network_name"])}</span>'
+            provider_label = 'IMDb' if provider == 'imdb' else 'TVMaze'
+            external_link = canonical_url or (f'https://www.imdb.com/title/{ext_id}/' if provider == 'imdb' else f'https://www.tvmaze.com/shows/{ext_id}')
+            show_name = ''
+            episode_name = ''
+            season_num = None
+            episode_num = None
+            if provider == 'tvmaze' and cache:
+                try:
+                    raw_payload = json.loads(cache['raw_json'] or '{}')
+                except Exception:
+                    raw_payload = {}
+                if isinstance(raw_payload, dict):
+                    show_name = str((raw_payload.get('show') or {}).get('name') or '').strip()
+                    episode_name = str((raw_payload.get('episode') or {}).get('name') or '').strip()
+                    try:
+                        season_num = int((raw_payload.get('episode') or {}).get('season'))
+                    except Exception:
+                        season_num = None
+                    try:
+                        episode_num = int((raw_payload.get('episode') or {}).get('number'))
+                    except Exception:
+                        episode_num = None
+            if provider == 'tvmaze' and show_name:
+                search_q = urllib.parse.quote(f'tvmaze:{ext_id}')
+                header_link = (
+                    f'<a href="/manage/search?q={search_q}" class="user-link" '
+                    f'title="Find torrents tagged to this TVMaze show">{_h(show_name)}</a>'
+                )
+            elif provider == 'imdb':
+                search_q = urllib.parse.quote(f'imdb:{ext_id.lower()}')
+                header_link = (
+                    f'<a href="/manage/search?q={search_q}" class="user-link" '
+                    f'title="Find torrents tagged to this IMDb id">{title}</a>'
+                )
+            else:
+                header_link = f'<a href="{_h(external_link)}" target="_blank" rel="noopener" class="user-link">{title}</a>' if external_link else title
+            season_episode_suffix = ''
+            if provider == 'tvmaze' and season_num is not None and episode_num is not None:
+                season_episode_suffix = f' (S{season_num:02d}E{episode_num:02d})'
+            episode_name_html = ''
+            if provider == 'tvmaze' and episode_name:
+                season_sep = ''
+                if season_episode_suffix:
+                    season_sep = ' <span style="opacity:0.65;font-size:0.9em">·</span> '
+                if episode_url:
+                    episode_name_html = (
+                        f'<div class="hash" style="margin-top:4px">Episode: '
+                        f'<a href="{_h(episode_url)}" target="_blank" rel="noopener" class="user-link">{_h(episode_name)}</a>'
+                        f'{season_sep}{_h(season_episode_suffix)}'
+                        f'</div>'
+                    )
+                else:
+                    episode_name_html = (
+                        f'<div class="hash" style="margin-top:4px">Episode: {_h(episode_name)}'
+                        f'{season_sep}{_h(season_episode_suffix)}</div>'
+                    )
+            provider_meta_line = ''
+            if provider == 'tvmaze':
+                show_url = canonical_url or f'https://www.tvmaze.com/shows/{ext_id}'
+                provider_meta_line = (
+                    f'{provider_label} id: '
+                    f'<a href="{_h(show_url)}" target="_blank" rel="noopener" class="user-link">{_h(ext_id)}</a>'
+                    f' <button type="button" onclick="copyHash(this,{repr(ext_id)})" '
+                    f'title="Copy ID" '
+                    f'class="btn-id-copy">Copy</button>'
+                )
+            elif provider == 'imdb':
+                imdb_url = canonical_url or f'https://www.imdb.com/title/{ext_id}/'
+                provider_meta_line = (
+                    f'{provider_label} id: '
+                    f'<a href="{_h(imdb_url)}" target="_blank" rel="noopener" class="user-link">{_h(ext_id)}</a>'
+                    f' <button type="button" onclick="copyHash(this,{repr(ext_id)})" '
+                    f'title="Copy ID" '
+                    f'class="btn-id-copy">Copy</button>'
+                )
+            else:
+                provider_meta_line = f'{provider_label} · {_h(ext_id)}'
+            revoke_html = ''
+            if can_meta_moderate and meta_cfg.get('allow_post_revoke', True):
+                revoke_html = (
+                    f'<form method="POST" action="/manage/metadata/revoke" '
+                    f'style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">'
+                    f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
+                    f'<input type="hidden" name="provider" value="{_h(provider)}">'
+                    f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                    f'<input type="text" name="reason" maxlength="200" placeholder="Revoke reason" '
+                    f'style="padding:7px 10px;background:var(--card2);border:1px solid var(--border);'
+                    f'border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.78rem;min-width:220px">'
+                    f'<button class="btn btn-sm btn-danger">Revoke</button>'
+                    f'</form>'
+                )
+            poster_html = ''
+            if poster_url:
+                poster_html = (
+                    f'<img src="{_h(poster_url)}" alt="Poster" loading="lazy" referrerpolicy="no-referrer" '
+                    f'style="width:120px;max-width:100%;border-radius:8px;border:1px solid var(--border)">'
+                )
+            subtitle_html = (
+                f'<div style="margin-top:8px;color:var(--muted);font-size:0.86rem;line-height:1.5">{subtitle}</div>'
+                if subtitle else ''
+            )
+            active_blocks += (
+                '<div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;'
+                'padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--card2)">'
+                f'{poster_html}'
+                '<div style="flex:1;min-width:280px">'
+                f'<div style="font-size:1rem;font-weight:700">{header_link}</div>'
+                f'{episode_name_html}'
+                f'<div class="hash" style="margin-top:4px">{provider_meta_line}</div>'
+                f'{subtitle_html}'
+                f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">{year}{runtime}{rating}{network}</div>'
+                f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">{genre_html}</div>'
+                f'{revoke_html}'
+                '</div>'
+                '</div>'
+            )
+        if not active_blocks and meta_enabled:
+            active_blocks = '<div style="color:var(--muted);font-size:0.86rem">No approved metadata linked yet.</div>'
+
+        pending_blocks = ''
+        for p in proposals:
+            status = str(p['status'] or '')
+            pid = int(p['id'])
+            provider = str(p['provider'] or '')
+            ext_id = str(p['proposed_id'] or '')
+            p_season = int(p['season']) if p['season'] is not None else None
+            p_episode = int(p['episode']) if p['episode'] is not None else None
+            summary = REGISTRATION_DB.get_metadata_proposal_vote_summary(pid, viewer_user_id=int(viewer['id']))
+            up = int(summary['up'])
+            down = int(summary['down'])
+            my_vote = int(summary['my_vote'])
+            status_color = {
+                'pending': 'var(--accent)',
+                'approved': 'var(--green)',
+                'rejected': 'var(--danger)',
+                'expired': 'var(--muted)',
+            }.get(status, 'var(--muted)')
+            provider_label = 'IMDb' if provider == 'imdb' else 'TVMaze'
+            target_url = str(p['proposed_url'] or '')
+            if not target_url:
+                target_url = (f'https://www.imdb.com/title/{ext_id}/' if provider == 'imdb'
+                              else f'https://www.tvmaze.com/shows/{ext_id}')
+            controls = ''
+            if status == 'pending':
+                if can_meta_vote:
+                    controls += (
+                        '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+                        f'<form method="POST" action="/manage/metadata/vote" style="display:inline">'
+                        f'<input type="hidden" name="proposal_id" value="{pid}">'
+                        f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
+                        f'<input type="hidden" name="vote" value="up">'
+                        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                        f'<button class="btn btn-sm {"btn-green" if my_vote == 1 else ""}">👍 {up}</button>'
+                        '</form>'
+                        f'<form method="POST" action="/manage/metadata/vote" style="display:inline">'
+                        f'<input type="hidden" name="proposal_id" value="{pid}">'
+                        f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
+                        f'<input type="hidden" name="vote" value="down">'
+                        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                        f'<button class="btn btn-sm {"btn-danger" if my_vote == -1 else ""}">👎 {down}</button>'
+                        '</form>'
+                        '</div>'
+                    )
+                if can_meta_moderate:
+                    controls += (
+                        '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+                        f'<form method="POST" action="/manage/metadata/approve" style="display:inline">'
+                        f'<input type="hidden" name="proposal_id" value="{pid}">'
+                        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                        '<button class="btn btn-sm btn-green">Approve</button>'
+                        '</form>'
+                        f'<form method="POST" action="/manage/metadata/reject" style="display:inline">'
+                        f'<input type="hidden" name="proposal_id" value="{pid}">'
+                        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                        '<button class="btn btn-sm btn-danger">Reject</button>'
+                        '</form>'
+                        '</div>'
+                    )
+            decided_by = _h(str(p['decided_by_username'] or ''))
+            decided_at = _h(str(p['decided_at'] or '')[:16].replace('T', ' '))
+            decision_meta = f' · by {decided_by} at {decided_at}' if decided_by or decided_at else ''
+            preview_state_html = '<div class="hash" style="margin-top:8px">Current metadata card reflects this pending proposal preview.</div>' if status == 'pending' else ''
+            pending_blocks += (
+                f'<div id="metadata-pending-{pid}" style="padding:10px;border:1px solid var(--border);'
+                f'border-radius:8px;background:var(--card2)">'
+                f'<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">'
+                f'<div style="font-size:0.86rem">'
+                f'<strong>{provider_label}</strong> '
+                f'<a href="{_h(target_url)}" target="_blank" rel="noopener" class="user-link">{_h(ext_id)}</a>'
+                f' by <a href="/manage/user/{_h(p["proposed_by_username"])}" class="user-link">{_h(p["proposed_by_username"])}</a>'
+                f'</div>'
+                f'<span style="font-family:var(--mono);font-size:0.7rem;letter-spacing:0.08em;'
+                f'padding:2px 8px;border:1px solid {status_color};border-radius:999px;color:{status_color};text-transform:uppercase">{_h(status)}</span>'
+                f'</div>'
+                f'<div class="hash" style="margin-top:6px">Votes {up} / {down} (net {up-down}) · voters {summary["unique_voters"]}{decision_meta}</div>'
+                f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">{controls}</div>'
+                f'{preview_state_html}'
+                f'</div>'
+            )
+        if not pending_blocks:
+            pending_blocks = '<div style="color:var(--muted);font-size:0.84rem">No recent metadata proposals.</div>'
+
+        propose_controls = ''
+        if meta_enabled and can_meta_suggest:
+            guessed_season, guessed_episode = _infer_tv_season_episode(str(t['name'] or ''))
+            default_provider = 'tvmaze' if (guessed_season is not None and guessed_episode is not None) else 'imdb'
+            propose_controls = (
+                '<form method="POST" action="/manage/metadata/propose" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">'
+                f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
+                f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                '<label style="display:flex;flex-direction:column;gap:4px;font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">Provider'
+                '<select name="provider" onchange="toggleMetadataProviderFields(this)" style="min-width:110px;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
+                f'<option value="imdb"{" selected" if default_provider == "imdb" else ""}>IMDb</option>'
+                f'<option value="tvmaze"{" selected" if default_provider == "tvmaze" else ""}>TVMaze</option>'
+                '</select></label>'
+                '<label style="display:flex;flex-direction:column;gap:4px;font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">ID'
+                '<input type="text" name="external_id" placeholder="tt1234567 or show id (optional for TVMaze)" style="min-width:240px;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
+                '</label>'
+                '<label style="display:flex;flex-direction:column;gap:4px;font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">URL (optional)'
+                '<input type="url" name="external_url" placeholder="https://..." style="min-width:220px;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
+                '</label>'
+                '<label class="tvmaze-only" style="display:none;flex-direction:column;gap:4px;font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">Season'
+                '<input type="number" name="season" min="1" placeholder="2" style="width:78px;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
+                '</label>'
+                '<label class="tvmaze-only" style="display:none;flex-direction:column;gap:4px;font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">Episode'
+                '<input type="number" name="episode" min="1" placeholder="8" style="width:78px;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
+                '</label>'
+                '<button class="btn btn-sm btn-primary" type="submit">Submit Metadata</button>'
+                '</form>'
+                '<script>'
+                f'var _metaReleaseName={json.dumps(str(t["name"] or ""))};'
+                'function _metaGuessSE(name){if(!name)return null;'
+                'var m=name.match(/\\bS(\\d{1,2})E(\\d{1,2})\\b/i);if(m)return {s:parseInt(m[1],10),e:parseInt(m[2],10)};'
+                'm=name.match(/\\b(\\d{1,2})x(\\d{1,2})\\b/i);if(m)return {s:parseInt(m[1],10),e:parseInt(m[2],10)};'
+                'm=name.match(/\\bseason[ ._-]*(\\d{1,2})[ ._-]*episode[ ._-]*(\\d{1,2})\\b/i);if(m)return {s:parseInt(m[1],10),e:parseInt(m[2],10)};'
+                'return null;}'
+                'function toggleMetadataProviderFields(sel){'
+                'var on=(sel&&sel.value==="tvmaze");'
+                'document.querySelectorAll(".tvmaze-only").forEach(function(el){el.style.display=on?"flex":"none";});'
+                'if(!on)return;'
+                'var form=document.querySelector(\'form[action="/manage/metadata/propose"]\');if(!form)return;'
+                'var s=form.querySelector(\'input[name="season"]\');var e=form.querySelector(\'input[name="episode"]\');'
+                'if((!s.value||!e.value)){var g=_metaGuessSE(_metaReleaseName);if(g){if(!s.value)s.value=g.s;if(!e.value)e.value=g.e;}}'
+                '}'
+                'document.addEventListener("DOMContentLoaded",function(){'
+                'var s=document.querySelector(\'form[action="/manage/metadata/propose"] select[name="provider"]\');'
+                'if(s)toggleMetadataProviderFields(s);'
+                '});'
+                '</script>'
+            )
+
+        metadata_card = (
+            '<div class="card" id="metadata">'
+            '<div class="card-title">Metadata</div>'
+            + ('<div style="color:var(--danger);font-size:0.84rem">Metadata features are disabled by configuration.</div>' if not meta_enabled else '')
+            + (f'<div style="margin-bottom:14px">{propose_controls}</div>' if propose_controls else '')
+            + '<div style="display:flex;flex-direction:column;gap:14px">'
+            + '<div><div style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Active Metadata</div>'
+            f'{active_blocks}</div>'
+            + '<div><div style="font-family:var(--mono);font-size:0.72rem;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Recent Proposals</div>'
+            f'{pending_blocks}</div>'
+            '</div>'
+            '</div>'
+        )
 
     body = f'''
   <div class="page-title">{t["name"]}</div>
@@ -19209,6 +21393,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
   </div>
 
   {swarm_card}
+  {metadata_card}
 
   <div class="card">
     {files_html}
@@ -19387,6 +21572,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     role_badge = {
         'super':    '<span class="badge badge-super">SUPER</span>',
         'admin':    '<span class="badge badge-admin">ADMIN</span>',
+        'editor':   '<span class="badge badge-editor">EDITOR</span>',
         'standard': '<span class="badge badge-standard">STANDARD</span>',
         'basic':    '<span class="badge badge-basic">BASIC</span>',
     }[t_role]
@@ -19871,7 +22057,8 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + '</div>'
         )
     elif viewer_role in ('super', 'admin'):
-        hi = '<input type="hidden" name="username" value="' + uname_h + '">'
+        hi = ('<input type="hidden" name="username" value="' + uname_h + '">'
+              '<input type="hidden" name="referer" value="/manage/admin/user/' + uname_h + '">')
         pw_form = ''
         if not t_is_super:
             pw_form = (
@@ -19894,19 +22081,38 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             )
         role_btns = ''
         if is_super and not t_is_super:
-            if t_is_admin:
+            t_role = _user_role(target_user)
+            if t_role == 'admin':
                 role_btns += (
-                    f'<form method="POST" action="/manage/admin/set-admin" style="display:inline" data-confirm="Remove admin from {uname_h}?">'
-                    + hi + '<input type="hidden" name="is_admin" value="0">'
+                    f'<form method="POST" action="/manage/admin/set-role" style="display:inline" data-confirm="Demote {uname_h} to editor?">'
+                    + hi + '<input type="hidden" name="role" value="editor">'
+                    + '<button class="btn btn-sm">&#8595; Demote to Editor</button></form>'
+                )
+            elif t_role == 'editor':
+                role_btns += (
+                    f'<form method="POST" action="/manage/admin/set-role" style="display:inline" data-confirm="Demote {uname_h} to standard?">'
+                    + hi + '<input type="hidden" name="role" value="standard">'
                     + '<button class="btn btn-sm">&#8595; Demote to Standard</button></form>'
+                    f'<form method="POST" action="/manage/admin/set-role" style="display:inline" data-confirm="Promote {uname_h} to admin?">'
+                    + hi + '<input type="hidden" name="role" value="admin">'
+                    + '<button class="btn btn-sm btn-green">&#8593; Promote to Admin</button></form>'
+                )
+            elif t_role == 'standard':
+                role_btns += (
+                    f'<form method="POST" action="/manage/admin/set-role" style="display:inline" data-confirm="Demote {uname_h} to basic?">'
+                    + hi + '<input type="hidden" name="role" value="basic">'
+                    + '<button class="btn btn-sm">&#8595; Demote to Basic</button></form>'
+                    f'<form method="POST" action="/manage/admin/set-role" style="display:inline" data-confirm="Promote {uname_h} to editor?">'
+                    + hi + '<input type="hidden" name="role" value="editor">'
+                    + '<button class="btn btn-sm btn-green">&#8593; Promote to Editor</button></form>'
                 )
             else:
                 role_btns += (
-                    f'<form method="POST" action="/manage/admin/set-admin" style="display:inline" data-confirm="Promote {uname_h} to admin?">'
-                    + hi + '<input type="hidden" name="is_admin" value="1">'
-                    + '<button class="btn btn-sm btn-green">&#8593; Promote to Admin</button></form>'
+                    f'<form method="POST" action="/manage/admin/set-role" style="display:inline" data-confirm="Promote {uname_h} to standard?">'
+                    + hi + '<input type="hidden" name="role" value="standard">'
+                    + '<button class="btn btn-sm btn-green">&#8593; Promote to Standard</button></form>'
                 )
-        if not t_is_super and not t_is_admin and viewer_role in ('super', 'admin'):
+        elif not t_is_super and not t_is_admin and viewer_role in ('admin',):
             t_std = (_user_role(target_user) == 'standard')
             if t_std:
                 role_btns += (
@@ -21079,6 +23285,20 @@ def main():
                 except Exception as _e:
                     log.warning('expire_bounties failed (non-fatal): %s', _e)
                 try:
+                    _meta_approved, _meta_expired = REGISTRATION_DB.auto_finalize_metadata_proposals()
+                    if _meta_approved or _meta_expired:
+                        log.info('metadata reconcile: approved=%d expired=%d',
+                                 _meta_approved, _meta_expired)
+                except Exception as _e:
+                    log.warning('auto_finalize_metadata_proposals failed (non-fatal): %s', _e)
+                try:
+                    _meta_fetch_ok, _meta_fetch_err = REGISTRATION_DB.process_metadata_fetch_jobs()
+                    if _meta_fetch_ok or _meta_fetch_err:
+                        log.info('metadata fetch reconcile: success=%d failed=%d',
+                                 _meta_fetch_ok, _meta_fetch_err)
+                except Exception as _e:
+                    log.warning('process_metadata_fetch_jobs failed (non-fatal): %s', _e)
+                try:
                     expired = REGISTRATION_DB.expire_account_delete_challenges()
                     if expired:
                         log.info('account delete reconcile: expired %d challenge(s)', expired)
@@ -21240,6 +23460,7 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
     cols_streaks  = [('Streak',       'login_streak',   streak_fmt)]
     cols_chatty   = [('Comments',     'comment_count',  count('comments'))]
     cols_popular  = [('Followers',    'follower_count', count('followers'))]
+    cols_meta     = [('Score',        'metadata_score', lambda v: f'<span style="color:var(--accent);font-weight:700">{v}</span>')]
 
     def _card(title, icon, rows, cols, desc):
         return (f'<div class="card">'
@@ -21262,6 +23483,8 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
                            "Most comments posted — the voices of the community.")
     card_popular   = _card("Most Followed",    "👥", data["popular"],        cols_popular,
                            "Most followed members in the community.")
+    card_meta      = _card("Metadata Curators", "🧩", data.get("metadata_curators", []), cols_meta,
+                           "Combined metadata contribution score (propose + winning votes).")
 
     body = f'''
     <div class="page-title">🏆 Leaderboard</div>
@@ -21279,6 +23502,7 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
       {card_streaks}
       {card_chatty}
       {card_popular}
+      {card_meta}
     </div>'''
 
     return _manage_page('Leaderboard', body, user=viewer)
