@@ -6664,7 +6664,10 @@ class RegistrationDB:
             'LEFT JOIN users ru ON ru.id=r.reporter_user_id '
             'LEFT JOIN users au ON au.id=r.assigned_user_id '
             'LEFT JOIN torrents t ON t.info_hash=r.info_hash '
-            f'{where} ORDER BY CASE WHEN r.severity=\'high\' THEN 0 ELSE 1 END, r.id DESC LIMIT ? OFFSET ?'
+            f"{where} ORDER BY CASE "
+            "WHEN r.severity='high' AND r.status IN ('open','in_review') THEN 0 "
+            "WHEN r.status IN ('open','in_review') THEN 1 "
+            "ELSE 2 END, r.id DESC LIMIT ? OFFSET ?"
         )
         rows = self._conn().execute(sql, params + [int(limit), int(offset)]).fetchall()
         total = self._conn().execute(
@@ -6899,8 +6902,18 @@ class RegistrationDB:
             'in_review': 'torrent_report_reviewing',
             'resolved': 'torrent_report_resolved',
             'dismissed': 'torrent_report_dismissed',
-            'assign': 'torrent_report_assigned',
-            'unassign': 'torrent_report_assigned',
+            'assign': 'torrent_report_assigned_to_reporter',
+            'unassign': 'torrent_report_unassigned_from_reporter',
+            'note': 'torrent_report_noted',
+        }
+        generic_type_map = {
+            'open': 'torrent_report_open_generic',
+            'in_review': 'torrent_report_reviewing_generic',
+            'resolved': 'torrent_report_resolved_generic',
+            'dismissed': 'torrent_report_dismissed_generic',
+            'assign': 'torrent_report_assigned_generic',
+            'unassign': 'torrent_report_unassigned_generic',
+            'note': 'torrent_report_noted',
         }
         action_key = (update_label or '').strip().lower()
         sent = 0
@@ -6909,7 +6922,7 @@ class RegistrationDB:
                 continue
             if actor_uid > 0 and uid == actor_uid:
                 continue
-            ntype = reporter_type_map.get(action_key, 'torrent_report_update') if uid == reporter_uid else 'torrent_report_update'
+            ntype = reporter_type_map.get(action_key, 'torrent_report_update') if uid == reporter_uid else generic_type_map.get(action_key, 'torrent_report_update')
             if self._add_notification_with_retry(uid, ntype, actor_username, ih, tname, rid):
                 sent += 1
             else:
@@ -6918,6 +6931,32 @@ class RegistrationDB:
         self._log(actor_username, 'report_notify_update', ih,
                   f'report_id={rid} action={update_label[:32]} recipients={sent}')
         return sent
+
+    def notify_torrent_report_note_assignee(self, report_id: int, actor_username: str) -> int:
+        report = self.get_torrent_report(int(report_id))
+        if not report:
+            return 0
+        rid = int(report.get('id') or 0)
+        ih = str(report.get('info_hash') or '').upper()
+        tname = str(report.get('torrent_name') or ih)[:120]
+        assignee_uid = int(report.get('assigned_user_id') or 0)
+        if assignee_uid <= 0:
+            return 0
+        actor_uid = 0
+        if (actor_username or '').strip().lower() != 'system':
+            a = self.get_user(actor_username)
+            actor_uid = int(a['id'] or 0) if a else 0
+        if actor_uid > 0 and assignee_uid == actor_uid:
+            return 0
+        if self._add_notification_with_retry(
+            assignee_uid, 'torrent_report_noted_assignee', actor_username, ih, tname, rid
+        ):
+            self._log(actor_username, 'report_notify_note', ih,
+                      f'report_id={rid} recipient={assignee_uid}')
+            return 1
+        log.warning('notify_torrent_report_note_assignee skipped recipient due to db lock: report_id=%s uid=%s',
+                    rid, assignee_uid)
+        return 0
 
     # ── Bounty System ─────────────────────────────────────────
 
@@ -12686,6 +12725,14 @@ class ManageHandler(BaseHTTPRequestHandler):
                     log.warning('notify_torrent_report_update failed (non-fatal): report_id=%s err=%s', report_id, e)
                 else:
                     raise
+        elif ok and action == 'note':
+            try:
+                REGISTRATION_DB.notify_torrent_report_note_assignee(report_id, user['username'])
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower():
+                    log.warning('notify_torrent_report_note_assignee failed (non-fatal): report_id=%s err=%s', report_id, e)
+                else:
+                    raise
         q = urllib.parse.quote_plus(msg)
         return self._redirect(f'/manage/admin/report/{report_id}?msg={q}&msg_type={"success" if ok else "error"}')
 
@@ -13938,7 +13985,11 @@ class ManageHandler(BaseHTTPRequestHandler):
                     'torrent_report_open', 'torrent_report_high', 'torrent_report_update',
                     'torrent_report_opened', 'torrent_report_reviewing',
                     'torrent_report_resolved', 'torrent_report_dismissed',
-                    'torrent_report_assigned'
+                    'torrent_report_assigned', 'torrent_report_noted', 'torrent_report_noted_assignee',
+                    'torrent_report_assigned_to_reporter', 'torrent_report_unassigned_from_reporter',
+                    'torrent_report_open_generic', 'torrent_report_reviewing_generic',
+                    'torrent_report_resolved_generic', 'torrent_report_dismissed_generic',
+                    'torrent_report_assigned_generic', 'torrent_report_unassigned_generic'
                 ):
                     rid = int(n['comment_id'] or 0)
                     if _can_open_report_detail(user, rid):
@@ -16509,10 +16560,14 @@ class ManageHandler(BaseHTTPRequestHandler):
                     'torrent_report_open', 'torrent_report_high', 'torrent_report_update',
                     'torrent_report_opened', 'torrent_report_reviewing',
                     'torrent_report_resolved', 'torrent_report_dismissed',
-                    'torrent_report_assigned'
+                    'torrent_report_assigned', 'torrent_report_noted', 'torrent_report_noted_assignee',
+                    'torrent_report_assigned_to_reporter', 'torrent_report_unassigned_from_reporter',
+                    'torrent_report_open_generic', 'torrent_report_reviewing_generic',
+                    'torrent_report_resolved_generic', 'torrent_report_dismissed_generic',
+                    'torrent_report_assigned_generic', 'torrent_report_unassigned_generic'
                 ):
                     rid = int(n['comment_id'] or 0)
-                    icon = '🚨' if n['type'] == 'torrent_report_high' else ('✅' if n['type'] == 'torrent_report_resolved' else '🚩')
+                    icon = '🚨' if n['type'] == 'torrent_report_high' else ('✅' if n['type'] in ('torrent_report_resolved', 'torrent_report_resolved_generic') else '🚩')
                     report_labels = {
                         'torrent_report_open': 'filed a torrent report',
                         'torrent_report_high': 'filed a HIGH priority report',
@@ -16522,8 +16577,28 @@ class ManageHandler(BaseHTTPRequestHandler):
                         'torrent_report_resolved': 'has resolved your torrent report',
                         'torrent_report_dismissed': 'has dismissed your torrent report',
                         'torrent_report_assigned': 'updated assignment on your torrent report',
+                        'torrent_report_noted': 'added a note to torrent report',
+                        'torrent_report_noted_assignee': 'added a note to your assigned report',
+                        'torrent_report_assigned_to_reporter': 'has been assigned to your torrent report',
+                        'torrent_report_unassigned_from_reporter': 'has been unassigned from your torrent report',
+                        'torrent_report_open_generic': 'opened a torrent report',
+                        'torrent_report_reviewing_generic': 'is reviewing a torrent report',
+                        'torrent_report_resolved_generic': 'resolved a torrent report',
+                        'torrent_report_dismissed_generic': 'dismissed a torrent report',
+                        'torrent_report_assigned_generic': 'assigned a torrent report',
+                        'torrent_report_unassigned_generic': 'unassigned a torrent report',
                     }
                     label = report_labels.get(n['type'], 'updated a torrent report')
+                    if n['type'] in ('torrent_report_assigned_to_reporter', 'torrent_report_assigned_generic'):
+                        assignee = ''
+                        if rid > 0 and REGISTRATION_DB:
+                            rinfo = REGISTRATION_DB.get_torrent_report(rid)
+                            assignee = str((rinfo or {}).get('assigned_username') or '').strip()
+                        assignee_disp = assignee or 'a moderator'
+                        if n['type'] == 'torrent_report_assigned_to_reporter':
+                            label = f'has assigned {assignee_disp} to your torrent report'
+                        else:
+                            label = f'assigned {assignee_disp} to torrent report'
                     if _can_open_report_detail(user, rid):
                         url = f'/manage/admin/report/{rid}'
                     else:
@@ -22205,10 +22280,14 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
                 'torrent_report_open', 'torrent_report_high', 'torrent_report_update',
                 'torrent_report_opened', 'torrent_report_reviewing',
                 'torrent_report_resolved', 'torrent_report_dismissed',
-                'torrent_report_assigned'
+                'torrent_report_assigned', 'torrent_report_noted', 'torrent_report_noted_assignee',
+                'torrent_report_assigned_to_reporter', 'torrent_report_unassigned_from_reporter',
+                'torrent_report_open_generic', 'torrent_report_reviewing_generic',
+                'torrent_report_resolved_generic', 'torrent_report_dismissed_generic',
+                'torrent_report_assigned_generic', 'torrent_report_unassigned_generic'
             ):
                 rid = int(n['comment_id'] or 0)
-                icon = '🚨' if n['type'] == 'torrent_report_high' else ('✅' if n['type'] == 'torrent_report_resolved' else '🚩')
+                icon = '🚨' if n['type'] == 'torrent_report_high' else ('✅' if n['type'] in ('torrent_report_resolved', 'torrent_report_resolved_generic') else '🚩')
                 report_labels = {
                     'torrent_report_open': 'filed a torrent report on',
                     'torrent_report_high': 'filed a HIGH priority report on',
@@ -22218,8 +22297,34 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
                     'torrent_report_resolved': 'has resolved your torrent report on',
                     'torrent_report_dismissed': 'has dismissed your torrent report on',
                     'torrent_report_assigned': 'updated assignment on your torrent report for',
+                    'torrent_report_noted': 'added a note to torrent report on',
+                    'torrent_report_noted_assignee': 'added a note to your assigned report on',
+                    'torrent_report_assigned_to_reporter': 'has been assigned to your torrent report on',
+                    'torrent_report_unassigned_from_reporter': 'has been unassigned from your torrent report on',
+                    'torrent_report_open_generic': 'opened a torrent report on',
+                    'torrent_report_reviewing_generic': 'is reviewing a torrent report on',
+                    'torrent_report_resolved_generic': 'resolved a torrent report on',
+                    'torrent_report_dismissed_generic': 'dismissed a torrent report on',
+                    'torrent_report_assigned_generic': 'assigned a torrent report on',
+                    'torrent_report_unassigned_generic': 'unassigned a torrent report on',
                 }
                 label = report_labels.get(n['type'], 'updated a torrent report on')
+                label_html = _h(label)
+                if n['type'] in ('torrent_report_assigned_to_reporter', 'torrent_report_assigned_generic'):
+                    assignee = ''
+                    if rid > 0 and REGISTRATION_DB:
+                        rinfo = REGISTRATION_DB.get_torrent_report(rid)
+                        assignee = str((rinfo or {}).get('assigned_username') or '').strip()
+                    if assignee:
+                        assignee_h = _h(assignee)
+                        assignee_url = f'/manage/user/{urllib.parse.quote(assignee)}'
+                        assignee_disp_html = f'<a href="{assignee_url}" class="user-link">{assignee_h}</a>'
+                    else:
+                        assignee_disp_html = 'a moderator'
+                    if n['type'] == 'torrent_report_assigned_to_reporter':
+                        label_html = f'has assigned {assignee_disp_html} to your torrent report on'
+                    else:
+                        label_html = f'assigned {assignee_disp_html} to torrent report on'
                 if _can_open_report_detail(viewer, rid):
                     url = f'/manage/admin/report/{rid}'
                 else:
@@ -22230,7 +22335,7 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
                     f'<div>'
                     f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
                     f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
-                    f' {label} '
+                    f' {label_html} '
                     f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
                     f'<div class="notif-page-meta">{ts_h}</div>'
                     f'</div>'
