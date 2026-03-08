@@ -18990,16 +18990,17 @@ def _torrent_row(t, viewer_role: str, viewer_id: int,
 
 def _render_search(user, torrents: list, query: str = '',
                    page: int = 1, total_pages: int = 1, total: int = 0) -> str:
-    is_admin = _user_role(user) in ('admin', 'super')
+    role = _user_role(user)
+    show_owner = role in ('super', 'admin', 'editor', 'standard')
 
-    srole = _user_role(user)
+    srole = role
     t_rows = ''.join(
-        _torrent_row(t, srole, user['id'], show_owner=is_admin, show_delete=False,
+        _torrent_row(t, srole, user['id'], show_owner=show_owner, show_delete=False,
                      hide_info_hash=True)
         for t in torrents
     )
     if not t_rows:
-        cols = 5 if is_admin else 4
+        cols = 5 if show_owner else 4
         t_rows = f'<tr><td colspan="{cols}" class="empty">No results found</td></tr>'
 
     q_enc = urllib.parse.quote(query)
@@ -19027,7 +19028,7 @@ def _render_search(user, torrents: list, query: str = '',
        style="padding:6px 12px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem;width:220px">
     </div>
     <div class="table-wrap"><table id="search-torrent-table" class="torrent-table">
-      {_torrent_header(show_owner=is_admin, hide_info_hash=True)}
+      {_torrent_header(show_owner=show_owner, hide_info_hash=True)}
       {t_rows}
     </table></div>
     {pagination}
@@ -19040,16 +19041,16 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
     is_super = user['username'] == SUPER_USER
     role = _user_role(user)
     is_admin = role in ('admin','super')
-    is_standard = role in ('admin','super','standard')
+    show_owner = role in ('super', 'admin', 'editor', 'standard')
 
     viewer_role = _user_role(user)
     torrent_rows = ''.join(
-        _torrent_row(t, viewer_role, user['id'], show_owner=is_standard, show_delete=is_super,
+        _torrent_row(t, viewer_role, user['id'], show_owner=show_owner, show_delete=is_super,
                      hide_info_hash=True)
         for t in torrents
     )
     if not torrent_rows:
-        cols = 5 if is_standard else 4
+        cols = 5 if show_owner else 4
         torrent_rows = f'<tr><td colspan="{cols}" class="empty">No torrents registered yet</td></tr>'
 
     admin_link = (
@@ -19110,7 +19111,7 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
        style="padding:6px 12px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem;width:240px">
     </div>
     <div class="table-wrap"><table id="dash-torrent-table" class="torrent-table">
-      {_torrent_header(is_standard, hide_info_hash=True)}
+      {_torrent_header(show_owner, hide_info_hash=True)}
       {torrent_rows}
     </table></div>
     {_pagination_html(page, total_pages, '/manage/dashboard')}
