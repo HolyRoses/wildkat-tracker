@@ -119,6 +119,7 @@ DEFAULT_UDP_PORT    = 6969
 DEFAULT_INTERVAL    = 1800   # seconds
 DEFAULT_MIN_INTERVAL = 60
 PEER_SCRAPE_MIN_INTERVAL_SECONDS = 3 * 60 * 60
+METADATA_REFRESH_COOLDOWN_SECONDS = 24 * 60 * 60
 ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES = 5
 WEBAUTHN_CHALLENGE_TTL_SECONDS = 300
 TFA_CHALLENGE_TTL_SECONDS = 300
@@ -2558,6 +2559,16 @@ class RegistrationDB:
             );
             CREATE INDEX IF NOT EXISTS idx_tmfj_status_next
               ON torrent_metadata_fetch_jobs(status, next_attempt_at, id);
+            CREATE TABLE IF NOT EXISTS torrent_metadata_refresh_requests (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash             TEXT    NOT NULL,
+                requested_by_user_id  INTEGER NOT NULL,
+                requested_by_username TEXT    NOT NULL,
+                last_requested_at     TEXT    NOT NULL,
+                UNIQUE(info_hash, requested_by_user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tmrr_user_time
+              ON torrent_metadata_refresh_requests(requested_by_user_id, last_requested_at DESC);
             CREATE TABLE IF NOT EXISTS torrent_metadata_rewards (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 proposal_id      INTEGER NOT NULL,
@@ -5771,6 +5782,32 @@ class RegistrationDB:
         except Exception as e:
             return False, {}, str(e)
 
+    def _metadata_http_url_exists(self, url: str, timeout_sec: int) -> bool:
+        target = (url or '').strip()
+        if not target:
+            return False
+        headers = {'User-Agent': 'wildkat-tracker/metadata-fetch'}
+        try:
+            req = urllib.request.Request(target, headers=headers, method='HEAD')
+            with urllib.request.urlopen(req, timeout=max(1, int(timeout_sec))) as resp:
+                return int(getattr(resp, 'status', 200) or 200) < 400
+        except urllib.error.HTTPError as e:
+            # Some origins do not allow HEAD; do a lightweight GET probe instead.
+            if int(getattr(e, 'code', 500) or 500) in (403, 405):
+                try:
+                    req = urllib.request.Request(
+                        target,
+                        headers={**headers, 'Range': 'bytes=0-0'},
+                        method='GET',
+                    )
+                    with urllib.request.urlopen(req, timeout=max(1, int(timeout_sec))) as resp:
+                        return int(getattr(resp, 'status', 200) or 200) < 400
+                except Exception:
+                    return False
+            return False
+        except Exception:
+            return False
+
     def _fetch_omdb_metadata(self, imdb_id: str, cfg: dict) -> tuple[bool, dict, str]:
         api_key = (cfg.get('omdb_api_key') or '').strip()
         if not api_key:
@@ -6104,6 +6141,11 @@ class RegistrationDB:
             else:
                 err = 'Unsupported metadata provider.'
             if ok:
+                poster_candidate = str(payload.get('poster_url') or '').strip()
+                if poster_candidate and not self._metadata_http_url_exists(
+                    poster_candidate, int(cfg.get('fetch_timeout_sec', 5))
+                ):
+                    payload['poster_url'] = ''
                 episode_external_id = str(payload.get('episode_external_id') or '')
                 self._upsert_metadata_cache(provider, external_id, payload, episode_external_id=episode_external_id)
                 c.execute(
@@ -6180,6 +6222,146 @@ class RegistrationDB:
             (ih, p)
         ).fetchone()
         return row is not None
+
+    def get_metadata_refresh_remaining_seconds(self, info_hash: str,
+                                               is_privileged: bool = False) -> int:
+        if is_privileged:
+            return 0
+        ih = (info_hash or '').strip().upper()
+        if not ih:
+            return 0
+        row = self._conn().execute(
+            '''SELECT MAX(last_requested_at) AS last_requested_at
+               FROM torrent_metadata_refresh_requests
+               WHERE info_hash=?''',
+            (ih,)
+        ).fetchone()
+        if not row:
+            return 0
+        try:
+            last_dt = datetime.datetime.fromisoformat(str(row['last_requested_at'] or ''))
+        except Exception:
+            return 0
+        elapsed = (datetime.datetime.now() - last_dt).total_seconds()
+        return max(0, int(METADATA_REFRESH_COOLDOWN_SECONDS - elapsed))
+
+    def request_torrent_metadata_refresh(self, info_hash: str, actor_user_id: int,
+                                         actor_username: str, is_privileged: bool = False) -> tuple[bool, str, int]:
+        ih = (info_hash or '').strip().upper()
+        uid = int(actor_user_id or 0)
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return False, 'Invalid torrent hash.', 0
+        if uid <= 0:
+            return False, 'Invalid actor.', 0
+        t = self.get_torrent(ih)
+        if not t:
+            return False, 'Torrent not found.', 0
+        links = self.list_active_metadata_links(ih)
+        if not links:
+            return False, 'No active metadata is linked to this torrent.', 0
+        c = self._conn()
+        now = self._ts()
+        for attempt in range(8):
+            try:
+                c.execute('BEGIN IMMEDIATE')
+                if not is_privileged:
+                    row = c.execute(
+                        '''SELECT MAX(last_requested_at) AS last_requested_at
+                           FROM torrent_metadata_refresh_requests
+                           WHERE info_hash=?''',
+                        (ih,)
+                    ).fetchone()
+                    if row:
+                        try:
+                            last_dt = datetime.datetime.fromisoformat(str(row['last_requested_at'] or ''))
+                            rem = max(0, int(METADATA_REFRESH_COOLDOWN_SECONDS - (datetime.datetime.now() - last_dt).total_seconds()))
+                        except Exception:
+                            rem = 0
+                        if rem > 0:
+                            c.execute('ROLLBACK')
+                            h = rem // 3600
+                            m = (rem % 3600) // 60
+                            return False, f'Metadata can be refreshed again in {h}h {m}m.', 0
+                c.execute(
+                    '''INSERT INTO torrent_metadata_refresh_requests (
+                           info_hash, requested_by_user_id, requested_by_username, last_requested_at
+                       ) VALUES (?,?,?,?)
+                       ON CONFLICT(info_hash, requested_by_user_id)
+                       DO UPDATE SET requested_by_username=excluded.requested_by_username,
+                                     last_requested_at=excluded.last_requested_at''',
+                    (ih, uid, (actor_username or '')[:64], now)
+                )
+                queued = 0
+                already_queued = 0
+                for link in links:
+                    provider = str(link['provider'] or '')
+                    external_id = str(link['external_id'] or '')
+                    proposal_id = int(link['source_proposal_id'] or 0)
+                    season = None
+                    episode = None
+                    if proposal_id > 0:
+                        prow = c.execute(
+                            'SELECT season, episode FROM torrent_metadata_proposals WHERE id=?',
+                            (proposal_id,)
+                        ).fetchone()
+                    else:
+                        prow = c.execute(
+                            '''SELECT id, season, episode
+                               FROM torrent_metadata_proposals
+                               WHERE info_hash=? AND provider=? AND proposed_id=?
+                               ORDER BY id DESC
+                               LIMIT 1''',
+                            (ih, provider, external_id)
+                        ).fetchone()
+                        if prow:
+                            proposal_id = int(prow['id'] or 0)
+                    if proposal_id <= 0:
+                        continue
+                    if prow:
+                        season = prow['season'] if 'season' in prow.keys() else None
+                        episode = prow['episode'] if 'episode' in prow.keys() else None
+                    existing = c.execute(
+                        '''SELECT 1 FROM torrent_metadata_fetch_jobs
+                           WHERE proposal_id=? AND provider=? AND external_id=?
+                             AND COALESCE(season,-1)=COALESCE(?, -1)
+                             AND COALESCE(episode,-1)=COALESCE(?, -1)
+                             AND status IN ('queued','retry','processing')
+                           LIMIT 1''',
+                        (proposal_id, provider, external_id, season, episode)
+                    ).fetchone()
+                    if existing:
+                        already_queued += 1
+                        continue
+                    c.execute(
+                        '''INSERT INTO torrent_metadata_fetch_jobs (
+                               proposal_id, provider, external_id, season, episode, status,
+                               attempt_count, last_error, next_attempt_at, created_at, updated_at
+                           ) VALUES (?,?,?,?,?,'queued',0,'',NULL,?,?)''',
+                        (proposal_id, provider, external_id, season, episode, now, now)
+                    )
+                    queued += 1
+                c.execute('COMMIT')
+                self._log(actor_username, 'metadata_refresh_manual', ih,
+                          f'queued={queued} already_queued={already_queued} privileged={1 if is_privileged else 0}')
+                if queued > 0:
+                    return True, f'Metadata refresh queued for {queued} provider(s).', queued
+                if already_queued > 0:
+                    return True, 'Metadata refresh already queued.', 0
+                return False, 'No metadata refresh jobs could be queued.', 0
+            except sqlite3.OperationalError as e:
+                try:
+                    c.execute('ROLLBACK')
+                except Exception:
+                    pass
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.08 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    log.warning('request_torrent_metadata_refresh lock after retries (non-fatal): ih=%s user=%s err=%s',
+                                ih, actor_username, e)
+                    return False, 'Database is busy, please retry metadata refresh.', 0
+                raise
+        return False, 'Database is busy, please retry metadata refresh.', 0
 
     def _enqueue_metadata_fetch_job(self, proposal) -> None:
         if not proposal:
@@ -11924,6 +12106,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_toggle_comments_lock(False)
         elif path == '/manage/torrent/update-peers':
             self._post_torrent_update_peers()
+        elif path == '/manage/torrent/update-metadata':
+            self._post_torrent_update_metadata()
         elif path == '/manage/torrent/vote':
             self._post_torrent_vote()
         elif path == '/manage/torrent/report':
@@ -13849,7 +14033,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not cfg.get('active'):
             q = urllib.parse.quote('Peer query is disabled or not fully configured.')
             return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
-        rem = _peer_refresh_remaining_seconds(t)
+        role = _user_role(user)
+        rem = 0 if role in ('super', 'admin') else _peer_refresh_remaining_seconds(t)
         if rem > 0:
             h = rem // 3600
             m = (rem % 3600) // 60
@@ -13868,6 +14053,48 @@ class ManageHandler(BaseHTTPRequestHandler):
             user['username']
         )
         q = urllib.parse.quote(f'Peer stats updated: seeds={details["seeds"]}, peers={details["peers"]}.')
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
+
+    def _post_torrent_update_metadata(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        if not ih or not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not t:
+            return self._redirect('/manage/dashboard')
+        cfg = REGISTRATION_DB.get_metadata_config()
+        if not cfg.get('enabled', True):
+            q = urllib.parse.quote('Metadata features are disabled.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        if not cfg.get('fetch_enabled', True):
+            q = urllib.parse.quote('Metadata fetch jobs are disabled.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        role = _user_role(user)
+        is_privileged = role in ('super', 'admin')
+        ok, msg, _queued = REGISTRATION_DB.request_torrent_metadata_refresh(
+            ih, int(user['id']), user['username'], is_privileged=is_privileged
+        )
+        if not ok:
+            q = urllib.parse.quote(msg)
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        processed_ok = 0
+        processed_err = 0
+        try:
+            for _ in range(3):
+                okc, errc = REGISTRATION_DB.process_metadata_fetch_jobs()
+                processed_ok += int(okc or 0)
+                processed_err += int(errc or 0)
+                if (okc + errc) == 0:
+                    break
+        except Exception:
+            pass
+        detail = f' Processed now: success={processed_ok}, failed={processed_err}.' if (processed_ok or processed_err) else ''
+        q = urllib.parse.quote(msg + detail)
         return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
 
     def _post_torrent_vote(self):
@@ -22283,7 +22510,8 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     peer_cfg = REGISTRATION_DB.get_peer_query_config() if REGISTRATION_DB else {'active': False}
     peer_update_btn = ''
     if peer_cfg.get('active'):
-        rem = _peer_refresh_remaining_seconds(t)
+        peer_privileged = vrole in ('super', 'admin')
+        rem = 0 if peer_privileged else _peer_refresh_remaining_seconds(t)
         if rem > 0:
             h = rem // 3600
             m = (rem % 3600) // 60
@@ -22301,6 +22529,40 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 f'<button type="submit" class="btn btn-green">Refresh Seeds/Peers</button>'
                 f'</form>'
             )
+    metadata_update_btn = ''
+    if REGISTRATION_DB:
+        meta_cfg_action = REGISTRATION_DB.get_metadata_config()
+        if meta_cfg_action.get('enabled', True) and meta_cfg_action.get('fetch_enabled', True):
+            active_meta_for_refresh = REGISTRATION_DB.list_active_metadata_links(ih)
+            if active_meta_for_refresh:
+                is_meta_privileged = vrole in ('super', 'admin')
+                rem = REGISTRATION_DB.get_metadata_refresh_remaining_seconds(
+                    ih, is_privileged=is_meta_privileged
+                )
+                if rem > 0:
+                    h = rem // 3600
+                    m = (rem % 3600) // 60
+                    metadata_update_btn = (
+                        f'<button type="button" class="btn btn-sm btn-accent-rev" disabled '
+                        f'style="opacity:0.95;cursor:not-allowed" '
+                        f'title="Available in {h}h {m}m">'
+                        f'Refresh Metadata ({h}h {m}m)</button>'
+                    )
+                else:
+                    metadata_update_btn = (
+                        f'<form method="POST" action="/manage/torrent/update-metadata" style="display:inline">'
+                        f'<input type="hidden" name="info_hash" value="{ih}">'
+                        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                        f'<button type="submit" class="btn btn-sm btn-accent-rev">Refresh Metadata</button>'
+                        f'</form>'
+                    )
+            else:
+                metadata_update_btn = (
+                    '<button type="button" class="btn btn-sm btn-accent-rev" disabled '
+                    'style="opacity:0.75;cursor:not-allowed" '
+                    'title="No active metadata linked">'
+                    'Refresh Metadata</button>'
+                )
 
     # Delete button
     del_btn = ''
@@ -22574,7 +22836,13 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                     f'<button class="btn btn-sm btn-danger">Revoke</button>'
                     f'</form>'
                 )
-            poster_html = ''
+            poster_html = (
+                '<div style="width:120px;min-height:170px;border-radius:8px;'
+                'border:1px solid var(--border);display:flex;align-items:center;'
+                'justify-content:center;text-align:center;padding:8px;'
+                'color:var(--muted);font-size:0.74rem;line-height:1.35;'
+                'font-family:var(--mono);background:var(--card)">Poster not available</div>'
+            )
             if poster_url:
                 poster_html = (
                     f'<img src="{_h(poster_url)}" alt="Poster" loading="lazy" referrerpolicy="no-referrer" '
@@ -22817,6 +23085,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         {vote_controls}
         <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet Link</button>
         {peer_update_btn}
+        {metadata_update_btn}
         {del_btn}
         {lock_btn}
         {del_comments_btn}
