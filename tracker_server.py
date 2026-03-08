@@ -1360,7 +1360,7 @@ def _validate_password(password: str, settings: dict) -> list[str]:
 
 def _normalize_metadata_provider(raw: str) -> str:
     val = (raw or '').strip().lower()
-    if val in ('imdb', 'tvmaze'):
+    if val in ('imdb', 'tvmaze', 'steam'):
         return val
     return ''
 
@@ -1376,6 +1376,13 @@ def _validate_tvmaze_id(raw: str) -> str:
     tvmaze_id = (raw or '').strip()
     if re.fullmatch(r'[0-9]{1,12}', tvmaze_id):
         return tvmaze_id
+    return ''
+
+
+def _validate_steam_app_id(raw: str) -> str:
+    app_id = (raw or '').strip()
+    if re.fullmatch(r'[0-9]{1,12}', app_id):
+        return app_id
     return ''
 
 
@@ -1434,7 +1441,11 @@ def _normalize_external_image_url(raw: str) -> str:
     # Avoid mixed-content blocks for known poster providers.
     if url.startswith('http://'):
         host = urllib.parse.urlparse(url).netloc.lower()
-        if any(x in host for x in ('tvmaze.com', 'static.tvmaze.com', 'imdb.com', 'media-amazon.com')):
+        if any(x in host for x in (
+            'tvmaze.com', 'static.tvmaze.com',
+            'imdb.com', 'media-amazon.com',
+            'steamstatic.com', 'steampowered.com', 'akamaihd.net',
+        )):
             return 'https://' + url[len('http://'):]
     return url
 
@@ -5339,39 +5350,49 @@ class RegistrationDB:
         p = _normalize_metadata_provider(provider)
         if not ih or not p:
             return False, 'Invalid metadata provider.'
-        # Anti-spam guardrails for community proposal volume.
-        uid = int(proposer_user_id or 0)
-        if uid > 0:
-            now = datetime.datetime.now()
-            cutoff_24h = (now - datetime.timedelta(hours=24)).isoformat()
-            cutoff_10m = (now - datetime.timedelta(minutes=10)).isoformat()
-            c = self._conn()
-            day_count = int(c.execute(
-                '''SELECT COUNT(*) FROM torrent_metadata_proposals
-                   WHERE proposed_by_user_id=? AND created_at>=?''',
-                (uid, cutoff_24h)
-            ).fetchone()[0] or 0)
-            burst_count = int(c.execute(
-                '''SELECT COUNT(*) FROM torrent_metadata_proposals
-                   WHERE proposed_by_user_id=? AND created_at>=?''',
-                (uid, cutoff_10m)
-            ).fetchone()[0] or 0)
-            if day_count >= 10:
-                self._log(proposer_username, 'metadata_propose_rate_limited', str(uid),
-                          f'window=24h count={day_count}')
-                return False, 'Proposal rate limit reached (10 per 24h). Please try again later.'
-            if burst_count >= 3:
-                self._log(proposer_username, 'metadata_propose_rate_limited', str(uid),
-                          f'window=10m count={burst_count}')
-                return False, 'Proposal burst limit reached (3 per 10 minutes). Please wait and try again.'
         trow = self.get_torrent(ih)
         if not trow:
             return False, 'Torrent not found.'
+        # Anti-spam guardrails for community proposal volume.
+        uid = int(proposer_user_id or 0)
+        if uid > 0:
+            proposer = self.get_user_by_id(uid)
+            is_owner = int(trow['uploaded_by_id'] or 0) == int(uid)
+            is_privileged = bool(
+                proposer and (
+                    str(proposer['username'] or '') == SUPER_USER or
+                    int(proposer['is_admin'] or 0) == 1 or
+                    int(proposer['is_editor'] or 0) == 1
+                )
+            )
+            if not is_privileged and not is_owner:
+                now = datetime.datetime.now()
+                cutoff_24h = (now - datetime.timedelta(hours=24)).isoformat()
+                cutoff_10m = (now - datetime.timedelta(minutes=10)).isoformat()
+                c = self._conn()
+                day_count = int(c.execute(
+                    '''SELECT COUNT(*) FROM torrent_metadata_proposals
+                       WHERE proposed_by_user_id=? AND created_at>=?''',
+                    (uid, cutoff_24h)
+                ).fetchone()[0] or 0)
+                burst_count = int(c.execute(
+                    '''SELECT COUNT(*) FROM torrent_metadata_proposals
+                       WHERE proposed_by_user_id=? AND created_at>=?''',
+                    (uid, cutoff_10m)
+                ).fetchone()[0] or 0)
+                if day_count >= 10:
+                    self._log(proposer_username, 'metadata_propose_rate_limited', str(uid),
+                              f'window=24h count={day_count}')
+                    return False, 'Proposal rate limit reached (10 per 24h). Please try again later.'
+                if burst_count >= 3:
+                    self._log(proposer_username, 'metadata_propose_rate_limited', str(uid),
+                              f'window=10m count={burst_count}')
+                    return False, 'Proposal burst limit reached (3 per 10 minutes). Please wait and try again.'
         if p == 'imdb':
             ext_id = _validate_imdb_id(proposed_id)
             if not ext_id:
                 return False, 'Invalid IMDb ID format.'
-        else:
+        elif p == 'tvmaze':
             ext_id = _validate_tvmaze_id(proposed_id)
             inferred_season, inferred_episode = _infer_tv_season_episode(str(trow['name'] or ''))
             if season is None:
@@ -5392,6 +5413,12 @@ class RegistrationDB:
                           f'query={show_query[:80]} matched={auto_name[:80]} id={ext_id}')
             if not ext_id:
                 return False, 'Invalid TVMaze show ID format.'
+        else:
+            ext_id = _validate_steam_app_id(proposed_id)
+            if not ext_id:
+                return False, 'Invalid Steam app ID format.'
+            season = None
+            episode = None
         cfg = self.get_metadata_config()
         now = datetime.datetime.now()
         closes_at = now + datetime.timedelta(hours=cfg['vote_window_hours'])
@@ -5781,6 +5808,60 @@ class RegistrationDB:
         }
         return True, payload, ''
 
+    def _fetch_steam_metadata(self, app_id: str, cfg: dict) -> tuple[bool, dict, str]:
+        timeout_sec = int(cfg.get('fetch_timeout_sec', 5))
+        url = f'https://store.steampowered.com/api/appdetails?appids={urllib.parse.quote(str(app_id))}'
+        ok, raw, err = self._metadata_http_get_json(url, timeout_sec)
+        if not ok:
+            return False, {}, err
+        entry = raw.get(str(app_id)) if isinstance(raw, dict) else None
+        if not isinstance(entry, dict):
+            return False, {}, 'Steam returned no app data.'
+        if not bool(entry.get('success')):
+            return False, {}, 'Steam app not found.'
+        data = entry.get('data')
+        if not isinstance(data, dict):
+            return False, {}, 'Steam app payload invalid.'
+        title = str(data.get('name') or '').strip()
+        if not title:
+            return False, {}, 'Steam app title missing.'
+        subtitle = _strip_html_text(str(data.get('short_description') or ''))
+        year = None
+        release_date = str((data.get('release_date') or {}).get('date') or '')
+        m = re.search(r'(19|20)\d{2}', release_date)
+        if m:
+            year = int(m.group(0))
+        genres = []
+        for g in (data.get('genres') or []):
+            if isinstance(g, dict):
+                desc = str(g.get('description') or '').strip()
+                if desc:
+                    genres.append(desc)
+        rating_value = None
+        try:
+            score = int((data.get('metacritic') or {}).get('score'))
+            if score > 0:
+                rating_value = round(score / 10.0, 1)
+        except Exception:
+            rating_value = None
+        payload = {
+            'title': title,
+            'subtitle': subtitle,
+            'year': year,
+            'media_type': 'game',
+            'genres': genres,
+            'runtime_minutes': None,
+            'rating_value': rating_value,
+            'rating_count': None,
+            'network_name': '',
+            'poster_url': _normalize_external_image_url(str(data.get('header_image') or '')),
+            'canonical_url': f'https://store.steampowered.com/app/{app_id}/',
+            'episode_url': '',
+            'raw': raw,
+            'fetched_ok': True,
+        }
+        return True, payload, ''
+
     def _maybe_issue_metadata_rewards(self, proposal) -> None:
         if not proposal:
             return
@@ -5902,6 +5983,8 @@ class RegistrationDB:
                 ok, payload, err = self._fetch_omdb_metadata(external_id, cfg)
             elif provider == 'tvmaze':
                 ok, payload, err = self._fetch_tvmaze_metadata(external_id, season, episode, cfg)
+            elif provider == 'steam':
+                ok, payload, err = self._fetch_steam_metadata(external_id, cfg)
             else:
                 err = 'Unsupported metadata provider.'
             if ok:
@@ -6686,6 +6769,9 @@ class RegistrationDB:
         m = re.fullmatch(r'(?i)tvmaze\s*:\s*([0-9]{1,12})', q)
         if m:
             return 'tvmaze', m.group(1)
+        m = re.fullmatch(r'(?i)steam\s*:\s*([0-9]{1,12})', q)
+        if m:
+            return 'steam', m.group(1)
         return '', ''
 
     def search_torrents(self, query: str, user_id: int | None = None,
@@ -6728,6 +6814,25 @@ class RegistrationDB:
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
                     AND l.provider='tvmaze' AND l.external_id=?
+                  ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
+                (user_id, value, per_page, offset)
+            ).fetchall()
+        if mode == 'steam':
+            if user_id is None:
+                return self._conn().execute(
+                    '''SELECT t.* FROM torrents t
+                       JOIN torrent_metadata_links l
+                         ON l.info_hash=t.info_hash
+                      WHERE l.status='active' AND l.provider='steam' AND l.external_id=?
+                      ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
+                    (value, per_page, offset)
+                ).fetchall()
+            return self._conn().execute(
+                '''SELECT t.* FROM torrents t
+                   JOIN torrent_metadata_links l
+                     ON l.info_hash=t.info_hash
+                  WHERE t.uploaded_by_id=? AND l.status='active'
+                    AND l.provider='steam' AND l.external_id=?
                   ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
                 (user_id, value, per_page, offset)
             ).fetchall()
@@ -6778,6 +6883,23 @@ class RegistrationDB:
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
                     AND l.provider='tvmaze' AND l.external_id=?''',
+                (user_id, value)
+            ).fetchone()[0]
+        if mode == 'steam':
+            if user_id is None:
+                return self._conn().execute(
+                    '''SELECT COUNT(*) FROM torrents t
+                       JOIN torrent_metadata_links l
+                         ON l.info_hash=t.info_hash
+                      WHERE l.status='active' AND l.provider='steam' AND l.external_id=?''',
+                    (value,)
+                ).fetchone()[0]
+            return self._conn().execute(
+                '''SELECT COUNT(*) FROM torrents t
+                   JOIN torrent_metadata_links l
+                     ON l.info_hash=t.info_hash
+                  WHERE t.uploaded_by_id=? AND l.status='active'
+                    AND l.provider='steam' AND l.external_id=?''',
                 (user_id, value)
             ).fetchone()[0]
         if user_id is None:
@@ -10654,7 +10776,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             "img-src 'self' data: "
             "https://www.gravatar.com https://secure.gravatar.com https://*.gravatar.com "
             "https://static.tvmaze.com https://*.tvmaze.com "
-            "https://m.media-amazon.com https://*.media-amazon.com https://*.imdb.com"
+            "https://m.media-amazon.com https://*.media-amazon.com https://*.imdb.com "
+            "https://store.steampowered.com https://steamcdn-a.akamaihd.net https://*.steamstatic.com"
         )
         self._refresh_csrf_cookie()  # ensure wkcsrf is always current
         self.end_headers()
@@ -18508,6 +18631,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <div class="card-title">Metadata APIs</div>
         <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
           Configure external metadata providers. IMDb enrichment requires an OMDb API key.
+          TVMaze and Steam fetches do not require API keys.
           Leave key blank to keep the existing value.
         </p>
         <form method="POST" action="/manage/admin/save-settings">
@@ -21192,8 +21316,13 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             network = ''
             if cache and cache['network_name']:
                 network = f'<span class="hash">Network: {_h(cache["network_name"])}</span>'
-            provider_label = 'IMDb' if provider == 'imdb' else 'TVMaze'
-            external_link = canonical_url or (f'https://www.imdb.com/title/{ext_id}/' if provider == 'imdb' else f'https://www.tvmaze.com/shows/{ext_id}')
+            provider_label = {'imdb': 'IMDb', 'tvmaze': 'TVMaze', 'steam': 'Steam'}.get(provider, provider.upper())
+            if provider == 'imdb':
+                external_link = canonical_url or f'https://www.imdb.com/title/{ext_id}/'
+            elif provider == 'tvmaze':
+                external_link = canonical_url or f'https://www.tvmaze.com/shows/{ext_id}'
+            else:
+                external_link = canonical_url or f'https://store.steampowered.com/app/{ext_id}/'
             show_name = ''
             episode_name = ''
             season_num = None
@@ -21225,6 +21354,12 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 header_link = (
                     f'<a href="/manage/search?q={search_q}" class="user-link" '
                     f'title="Find torrents tagged to this IMDb id">{title}</a>'
+                )
+            elif provider == 'steam':
+                search_q = urllib.parse.quote(f'steam:{ext_id}')
+                header_link = (
+                    f'<a href="/manage/search?q={search_q}" class="user-link" '
+                    f'title="Find torrents tagged to this Steam app id">{title}</a>'
                 )
             else:
                 header_link = f'<a href="{_h(external_link)}" target="_blank" rel="noopener" class="user-link">{title}</a>' if external_link else title
@@ -21263,6 +21398,15 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 provider_meta_line = (
                     f'{provider_label} id: '
                     f'<a href="{_h(imdb_url)}" target="_blank" rel="noopener" class="user-link">{_h(ext_id)}</a>'
+                    f' <button type="button" onclick="copyHash(this,{repr(ext_id)})" '
+                    f'title="Copy ID" '
+                    f'class="btn-id-copy">Copy</button>'
+                )
+            elif provider == 'steam':
+                steam_url = canonical_url or f'https://store.steampowered.com/app/{ext_id}/'
+                provider_meta_line = (
+                    f'{provider_label} id: '
+                    f'<a href="{_h(steam_url)}" target="_blank" rel="noopener" class="user-link">{_h(ext_id)}</a>'
                     f' <button type="button" onclick="copyHash(this,{repr(ext_id)})" '
                     f'title="Copy ID" '
                     f'class="btn-id-copy">Copy</button>'
@@ -21329,11 +21473,15 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 'rejected': 'var(--danger)',
                 'expired': 'var(--muted)',
             }.get(status, 'var(--muted)')
-            provider_label = 'IMDb' if provider == 'imdb' else 'TVMaze'
+            provider_label = {'imdb': 'IMDb', 'tvmaze': 'TVMaze', 'steam': 'Steam'}.get(provider, provider.upper())
             target_url = str(p['proposed_url'] or '')
             if not target_url:
-                target_url = (f'https://www.imdb.com/title/{ext_id}/' if provider == 'imdb'
-                              else f'https://www.tvmaze.com/shows/{ext_id}')
+                if provider == 'imdb':
+                    target_url = f'https://www.imdb.com/title/{ext_id}/'
+                elif provider == 'tvmaze':
+                    target_url = f'https://www.tvmaze.com/shows/{ext_id}'
+                else:
+                    target_url = f'https://store.steampowered.com/app/{ext_id}/'
             controls = ''
             if status == 'pending':
                 if can_meta_vote:
@@ -21406,6 +21554,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 '<select name="provider" onchange="toggleMetadataProviderFields(this)" style="min-width:110px;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
                 f'<option value="imdb"{" selected" if default_provider == "imdb" else ""}>IMDb</option>'
                 f'<option value="tvmaze"{" selected" if default_provider == "tvmaze" else ""}>TVMaze</option>'
+                '<option value="steam">Steam</option>'
                 '</select></label>'
                 '<label style="display:flex;flex-direction:column;gap:4px;font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">ID'
                 '<input type="text" name="external_id" placeholder="tt1234567 or show id (optional for TVMaze)" style="min-width:240px;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
@@ -21429,10 +21578,16 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 'm=name.match(/\\bseason[ ._-]*(\\d{1,2})[ ._-]*episode[ ._-]*(\\d{1,2})\\b/i);if(m)return {s:parseInt(m[1],10),e:parseInt(m[2],10)};'
                 'return null;}'
                 'function toggleMetadataProviderFields(sel){'
+                'var form=document.querySelector(\'form[action="/manage/metadata/propose"]\');if(!form)return;'
+                'var idField=form.querySelector(\'input[name="external_id"]\');'
+                'if(idField){'
+                ' if(sel&&sel.value==="imdb")idField.placeholder="tt1234567";'
+                ' else if(sel&&sel.value==="steam")idField.placeholder="app id (e.g. 730)";'
+                ' else idField.placeholder="show id (optional for TVMaze)";'
+                '}'
                 'var on=(sel&&sel.value==="tvmaze");'
                 'document.querySelectorAll(".tvmaze-only").forEach(function(el){el.style.display=on?"flex":"none";});'
                 'if(!on)return;'
-                'var form=document.querySelector(\'form[action="/manage/metadata/propose"]\');if(!form)return;'
                 'var s=form.querySelector(\'input[name="season"]\');var e=form.querySelector(\'input[name="episode"]\');'
                 'if((!s.value||!e.value)){var g=_metaGuessSE(_metaReleaseName);if(g){if(!s.value)s.value=g.s;if(!e.value)e.value=g.e;}}'
                 '}'

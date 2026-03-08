@@ -442,6 +442,12 @@ The search engine splits your query into individual tokens and matches each one 
 - `ubuntu 24 desktop` does not match — `desktop` is not in the name
 - Searching by info hash fragment also works
 
+You can also search by linked metadata IDs:
+
+- `imdb:tt0050083` finds torrents tagged with that IMDb ID
+- `tvmaze:44458` finds torrents tagged with that TVMaze show ID
+- `steam:730` finds torrents tagged with that Steam app ID
+
 All tokens must match (AND logic). The search is case-insensitive.
 
 Basic users see only their own torrents in search results. Standard and above see all torrents on the tracker.
