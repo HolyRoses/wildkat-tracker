@@ -41,10 +41,11 @@ Every account has one of four roles. Your role badge is shown next to your usern
 |------|-------|-------------|
 | **Basic** | green BASIC | Starting role. Can upload torrents and manage your own dashboard. Cannot view other users' profiles, access the Bounty Board, or see the Leaderboard. |
 | **Standard** | grey STANDARD | Can view public profiles and torrent lists of other users. Full access to the Bounty Board, point transfers, and Leaderboard. |
+| **Editor** | violet EDITOR | Metadata moderator role. Can review and immediately approve/reject/revoke metadata proposals on torrents. |
 | **Admin** | orange ADMIN | Full access to the Admin Panel. Can manage users, view all torrents, change settings, generate invite codes. Cannot manage other admins or the superuser. |
 | **Super** | blue SUPER | The superuser. Single account with unrestricted access. Cannot be deleted, locked, or demoted. |
 
-Role promotions flow upward — Basic → Standard → Admin. The superuser account is fixed and cannot be changed through the interface.
+Role promotions flow upward — Basic → Standard → Editor → Admin. The superuser account is fixed and cannot be changed through the interface.
 
 **Auto-promotion:** If enabled by an admin, Basic users are automatically promoted to Standard once they have uploaded a configured number of torrents. The threshold is configurable.
 
@@ -168,6 +169,40 @@ The **Delete** button appears if you own the torrent or are an Admin/Super.
 > **Tip:** The click-to-copy info hash is especially useful when filling out a Bounty claim — copy the hash directly from the torrent page rather than selecting and right-clicking.
 
 If comments are enabled site-wide, a **Comments** section appears below the file list. See [Section 6](#6-comments-and-notifications).
+
+### Metadata Card (IMDb / TVMaze / Steam)
+
+Torrent detail pages include a **Metadata** card with proposal, review, and active-link display.
+
+**Providers currently supported:**
+
+- **IMDb** using IMDb IDs (`tt...`)
+- **TVMaze** using show IDs (numeric)
+- **Steam** using app IDs (numeric, e.g. `730`)
+
+**Submitting metadata:**
+
+- Use **Provider** + **ID** + optional **URL**
+- TVMaze also supports optional **Season/Episode** fields
+- If TVMaze is selected and season/episode markers are detected in torrent name, fields auto-fill
+
+**How approval works:**
+
+- **Owner / Editor / Admin / Super** can approve immediately
+- **Community proposals** can be voted up/down and auto-finalized by configured policy
+- Approved metadata becomes the active card entry for that provider on that torrent
+
+**Active metadata display:**
+
+- Provider label and linked provider ID line (`IMDb id`, `TVMaze id`, `Steam id`)
+- **Copy** button for ID
+- Poster, summary, and normalized details when fetch succeeds
+- TVMaze entries may include show/episode details and season/episode notation
+
+**Replacing or removing metadata:**
+
+- If post-revoke is enabled, owner/editor/admin/super can revoke active metadata and submit replacement
+- Community users cannot replace already-active metadata directly
 
 ---
 
@@ -441,6 +476,12 @@ The search engine splits your query into individual tokens and matches each one 
 - `ubuntu 24 server` also matches — all three tokens must be present
 - `ubuntu 24 desktop` does not match — `desktop` is not in the name
 - Searching by info hash fragment also works
+
+You can also search by linked metadata IDs:
+
+- `imdb:tt0050083` finds torrents tagged with that IMDb ID
+- `tvmaze:44458` finds torrents tagged with that TVMaze show ID
+- `steam:730` finds torrents tagged with that Steam app ID
 
 All tokens must match (AND logic). The search is case-insensitive.
 
@@ -741,6 +782,53 @@ When **on**, Basic users are automatically promoted to Standard once they have r
 ### Comments & Notifications
 
 When **on**, the full comment and notification system is active. When **off**, the comments section is completely removed from all torrent pages and the notification bell disappears from the navbar. Default: on.
+
+### Metadata APIs
+
+Metadata fetch and enrichment runs through three providers:
+
+- **IMDb** (via OMDb API; requires OMDb API key)
+- **TVMaze** (no API key required)
+- **Steam** (no API key required)
+
+Available settings:
+
+- Enable/disable metadata fetch jobs
+- OMDb API key (set/clear)
+- OMDb base URL
+- TVMaze base URL
+
+Behavior notes:
+
+- If OMDb key is missing, IMDb proposals can still be submitted, but IMDb fetch will fail until a key is configured.
+- TVMaze and Steam proposals do not require keys and can fetch immediately when jobs run.
+
+### Metadata Moderation
+
+Metadata moderation settings control proposal workflow on torrent detail pages:
+
+- Enable metadata feature (master switch)
+- Enable community voting
+- Enable auto-finalize / auto-accept
+- Allow owner immediate approve
+- Allow editor moderation override
+- Allow post-approve revoke
+- Require revoke reason
+
+Tuning fields:
+
+- Vote window hours
+- Minimum unique voters
+- Fetch timeout / retry count / jobs per cycle
+- Proposer and voter reward values
+- Reward daily cap and max rewarded votes per day
+
+Behavior notes:
+
+- Owner, Editor, Admin, and Super can immediately approve metadata.
+- Community proposals can be voted and auto-finalized by policy.
+- Community users are blocked from replacing already-active metadata directly; owner/editor/admin/super can revoke and replace.
+- Proposal anti-spam limits apply to non-privileged non-owner users; owner/editor/admin/super proposals are exempt.
 
 ### robots.txt
 
