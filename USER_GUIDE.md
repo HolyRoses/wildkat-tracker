@@ -30,6 +30,7 @@ It focuses on UI operations and behavior. Server deployment and OS-level setup a
 21. [Passwords](#21-passwords)
 22. [Top-ups and Payments](#22-top-ups-and-payments)
 23. [Followers System](#23-followers-system)
+24. [Torrent Reporting System](#24-torrent-reporting-system)
 
 ---
 
@@ -41,7 +42,7 @@ Every account has one of four roles. Your role badge is shown next to your usern
 |------|-------|-------------|
 | **Basic** | green BASIC | Starting role. Can upload torrents and manage your own dashboard. Cannot view other users' profiles, access the Bounty Board, or see the Leaderboard. |
 | **Standard** | grey STANDARD | Can view public profiles and torrent lists of other users. Full access to the Bounty Board, point transfers, and Leaderboard. |
-| **Editor** | violet EDITOR | Metadata moderator role. Can review and immediately approve/reject/revoke metadata proposals on torrents. |
+| **Editor** | violet EDITOR | Metadata and report moderator role. Can review and immediately approve/reject/revoke metadata proposals, and can action `bad_metadata` torrent reports. |
 | **Admin** | orange ADMIN | Full access to the Admin Panel. Can manage users, view all torrents, change settings, generate invite codes. Cannot manage other admins or the superuser. |
 | **Super** | blue SUPER | The superuser. Single account with unrestricted access. Cannot be deleted, locked, or demoted. |
 
@@ -165,6 +166,18 @@ If peer-query settings are enabled by Super, the torrent Actions card includes *
 If there are confidently linked active members in the swarm, a full-width **Members Currently Sharing This Torrent** card appears with member links and last activity times. If no linked members are active, the card is not shown.
 
 The **Delete** button appears if you own the torrent or are an Admin/Super.
+
+### Report Torrent
+
+The torrent Actions card includes a **🚩 Report Torrent** control.
+
+- Any authenticated user who can view the torrent can submit a report.
+- Report reasons are typed (`bad_metadata`, `copyright`, `spam`, `abuse`, `csam`, `other`).
+- `csam` reports are marked **high severity**.
+- Duplicate open reports by the same user for the same reason are blocked.
+- Reporter cooldown is enforced per user+target to reduce spam bursts.
+
+After submit, moderators and relevant stakeholders are notified and can process the report from the moderation workflow.
 
 > **Tip:** The click-to-copy info hash is especially useful when filling out a Bounty claim — copy the hash directly from the torrent page rather than selecting and right-clicking.
 
@@ -605,7 +618,7 @@ Top 3 in each category receive 🥇🥈🥉 medals. All usernames link to public
 
 Accessible to Admin and Super only via the **⚙ Admin Panel** link (visible on the dashboard for admins).
 
-The Admin Panel has twelve tabs:
+The Admin Panel has thirteen tabs:
 
 ### Torrents Tab
 
@@ -617,7 +630,7 @@ All registered accounts with role badges, creation date, login count, and last l
 
 ### Add User Tab
 
-Create a new account by specifying username, password, and role (Basic, Standard, or Admin).
+Create a new account by specifying username, password, and role (Basic, Standard, Editor, or Admin).
 
 ### Trackers Tab
 
@@ -688,6 +701,27 @@ Use the **✕ Clear** button to reset all filters and return to the full unfilte
 The Security tab shows detected abuse events (404 bursts, login fail bursts, WebAuthn/TFA fail bursts, etc.), linked bans, and action history.
 
 You can open an event detail view, review attribution confidence, and perform remediation actions such as clearing active bans or disabling/enabling attributed member accounts.
+
+### Reports Tab
+
+The Reports tab is the moderation queue for torrent reports.
+
+- High-severity active reports (`open` / `in_review`) are pinned first.
+- Closed reports (`resolved` / `dismissed`) are not pinned in the top high-priority segment.
+- Filters include status, severity, reason, reporter, info hash, and owner.
+
+Permissions:
+
+- **Admin/Super**: full queue visibility and full report actions.
+- **Editor**: no full Admin panel access; can open and action `bad_metadata` report detail pages only.
+
+Report detail actions:
+
+- Status: `open`, `in_review`, `resolved`, `dismissed`
+- Assignment: assign/unassign moderator
+- Notes: timeline notes for internal handling
+
+Each action is written to the report timeline and event log.
 
 ---
 
@@ -1280,3 +1314,81 @@ Notification clicks redirect directly to the related profile, torrent, or bounty
 - Basic users cannot browse arbitrary public profiles.
 - Basic users can still use the followers page and follow-back actions when another member has followed them.
 - Standard/Admin/Super users can follow from profile pages directly.
+
+---
+
+## 24. Torrent Reporting System
+
+This section covers the full reporting workflow across users, moderators, and notifications.
+
+### Reasons and Severity
+
+Valid report reasons:
+
+- `bad_metadata`
+- `copyright`
+- `spam`
+- `abuse`
+- `csam`
+- `other`
+
+Severity mapping:
+
+- `csam` => `high`
+- all other reasons => `normal`
+
+### Who Gets Notified on Report Create
+
+When a report is created, the reporter does not receive their own create notification.
+
+Recipients:
+
+- Torrent owner
+- Admin/Super moderators
+- Editors for `bad_metadata` reports only
+
+Notification types:
+
+- `torrent_report_open` for normal-severity creates
+- `torrent_report_high` for high-severity creates
+
+### Moderation Actions and Notifications
+
+Supported moderation actions:
+
+- `open`
+- `in_review`
+- `resolved`
+- `dismissed`
+- `assign`
+- `unassign`
+- `note`
+
+Status/assignment actions notify stakeholders with contextual wording (reporter-targeted and generic variants).
+
+Note action behavior:
+
+- Note content is not sent in notifications.
+- A note sends `torrent_report_noted_assignee` only to the current assignee.
+- No assignee note notification is sent if the actor is also the assignee.
+
+### Editor Boundaries
+
+Editors are intentionally scoped:
+
+- Editors cannot browse the full Admin panel queue.
+- Editors can access and action report detail only when reason is `bad_metadata`.
+- Editors cannot review non-`bad_metadata` reports.
+
+### Notification Navigation
+
+Report notifications route context-aware:
+
+- If recipient can access report detail, click opens `/manage/admin/report/<id>`.
+- Otherwise click opens torrent detail anchored to the report card (`#torrent-report`).
+
+### Operational Notes
+
+- Report writes are lock-retry aware to reduce transient SQLite lock failures.
+- Notification fan-out writes are lock-tolerant and skip-retry safely when needed.
+- The event log records report create and report action transitions for audit.
