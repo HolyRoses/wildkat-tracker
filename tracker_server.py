@@ -18033,6 +18033,24 @@ function copyMagnet(btn, url) {
     prompt('Copy this magnet link:', url);
   });
 }
+function launchMagnet(btn, url) {
+  var orig = btn.innerHTML;
+  btn.innerHTML = '&#x1F680; Launching!';
+  btn.style.borderColor = 'var(--green)';
+  btn.style.color = 'var(--green)';
+  btn.style.background = 'transparent';
+  try {
+    window.location.href = url;
+  } catch (e) {
+    prompt('Open this magnet link:', url);
+  }
+  setTimeout(function() {
+    btn.innerHTML = orig;
+    btn.style.borderColor = '';
+    btn.style.color = '';
+    btn.style.background = '';
+  }, 2000);
+}
 // ── Global background poll: updates nav bell + mail badges every 30s ─────────
 (function(){
   var _prevNotifs = -1;
@@ -18981,7 +18999,8 @@ def _torrent_row(t, viewer_role: str, viewer_id: int,
         f'<td class="hash" style="white-space:nowrap">{size_str}</td>'
         f'<td class="hash">{reg_date}</td>'
         f'<td><div class="actions">'
-        f'<button class="btn btn-sm btn-green" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Magnet</button>'
+        f'<button class="btn btn-sm btn-green" onclick="launchMagnet(this,{repr(magnet)})">&#x1F680; Launch</button>'
+        f'<button class="btn btn-sm btn-green" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy</button>'
         f' {del_btn}'
         f'</div></td>'
         f'</tr>'
@@ -23189,7 +23208,8 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
       <div style="display:flex;flex-direction:column;gap:12px;align-items:flex-start">
         {report_controls}
         {vote_controls}
-        <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet Link</button>
+        <button class="btn btn-primary" onclick="launchMagnet(this,{repr(magnet)})">&#x1F680; Launch Magnet</button>
+        <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet</button>
         {peer_update_btn}
         {metadata_update_btn}
         {del_btn}
