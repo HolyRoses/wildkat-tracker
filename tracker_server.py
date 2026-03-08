@@ -4486,18 +4486,17 @@ class RegistrationDB:
 
     def build_magnet(self, ih: str, name: str, total_size: int) -> str:
         """Build a magnet link using enabled trackers in sort order."""
-        params = [
-            ('xt', f'urn:btih:{ih.lower()}'),
-            ('dn', name),
-        ]
+        ih_norm = (ih or '').strip().lower()
+        parts = [f'xt=urn:btih:{ih_norm}']
+        parts.append('dn=' + urllib.parse.quote(str(name or ''), safe=''))
         if total_size:
-            params.append(('xl', str(total_size)))
+            parts.append('xl=' + urllib.parse.quote(str(total_size), safe=''))
         trackers = self._conn().execute(
             'SELECT url FROM magnet_trackers WHERE is_enabled=1 ORDER BY sort_order,id'
         ).fetchall()
         for t in trackers:
-            params.append(('tr', t[0]))
-        return 'magnet:?' + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+            parts.append('tr=' + urllib.parse.quote(str(t[0] or ''), safe=''))
+        return 'magnet:?' + '&'.join(parts)
 
     def _ts(self) -> str:
         return datetime.datetime.now().isoformat(timespec='seconds')
