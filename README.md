@@ -35,11 +35,12 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Torrent peer snapshots** — manual Seeds/Peers refresh from torrent detail pages (3-hour cooldown) plus optional auto-queued refresh after upload with configurable cap
 - **Direct messages** — threaded inbox/sent/compose/blocked flow with optional point cost and daily limits
 - **Comments and notifications** — threaded torrent/bounty comments, comment upvote/downvote controls, @mentions, bell dropdown, and full notifications page
+- **Torrent reporting subsystem** — in-page torrent reports with typed reasons, moderator workflow, assignment, notes, and contextual notifications
 - **Points economy** — earning, spending, transfers, streaks, and ledger-backed accounting
 - **Points top-ups** — fixed-amount purchases with provider-based checkout and order tracking
 - **Bounty board** — posting, claiming, confirming, contributing, voting, and payout splitting
 - **Leaderboard** — ranked categories for points, uploads, streaks, and bounty activity
-- **Admin panel** — torrents, users, add user, trackers, settings, database, economy, top-ups, invites, danger, events
+- **Admin panel** — torrents, users, add user, trackers, settings, database, economy, top-ups, invites, danger, events, security, reports
 - **Operational controls** — IP allowlists, open-tracker switch, configurable `robots.txt`, database backup/restore
 
 For full operational detail, see [USER_GUIDE.md](USER_GUIDE.md). For deployment and hardening steps, see [INSTALL.md](INSTALL.md).

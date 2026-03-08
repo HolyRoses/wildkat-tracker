@@ -119,6 +119,7 @@ DEFAULT_UDP_PORT    = 6969
 DEFAULT_INTERVAL    = 1800   # seconds
 DEFAULT_MIN_INTERVAL = 60
 PEER_SCRAPE_MIN_INTERVAL_SECONDS = 3 * 60 * 60
+METADATA_REFRESH_COOLDOWN_SECONDS = 24 * 60 * 60
 ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES = 5
 WEBAUTHN_CHALLENGE_TTL_SECONDS = 300
 TFA_CHALLENGE_TTL_SECONDS = 300
@@ -132,6 +133,9 @@ MAX_PEERS_PER_REPLY  = 200
 MAX_SCRAPE_HASHES    = 5      # max info_hashes per scrape request
 ALLOW_FULL_SCRAPE    = False  # allow scrape with no info_hash (exposes all torrents)
 DEFAULT_TRACKER_ID  = 'Wildkat'
+REPORT_REASONS = ('bad_metadata', 'copyright', 'spam', 'abuse', 'csam', 'other')
+REPORT_STATUSES = ('open', 'in_review', 'resolved', 'dismissed')
+REPORT_SUBMISSION_COOLDOWN_SECONDS = 300
 TRUSTED_PROXY_CIDRS_RAW = ''
 TRUSTED_PROXY_NETWORKS: list = []
 
@@ -1365,6 +1369,20 @@ def _normalize_metadata_provider(raw: str) -> str:
     return ''
 
 
+def _normalize_report_reason(raw: str) -> str:
+    reason = (raw or '').strip().lower()
+    return reason if reason in REPORT_REASONS else ''
+
+
+def _normalize_report_status(raw: str) -> str:
+    status = (raw or '').strip().lower()
+    return status if status in REPORT_STATUSES else ''
+
+
+def _report_reason_severity(reason: str) -> str:
+    return 'high' if (reason or '').strip().lower() == 'csam' else 'normal'
+
+
 def _validate_imdb_id(raw: str) -> str:
     imdb_id = (raw or '').strip().lower()
     if re.fullmatch(r'tt[0-9]{4,12}', imdb_id):
@@ -2541,6 +2559,16 @@ class RegistrationDB:
             );
             CREATE INDEX IF NOT EXISTS idx_tmfj_status_next
               ON torrent_metadata_fetch_jobs(status, next_attempt_at, id);
+            CREATE TABLE IF NOT EXISTS torrent_metadata_refresh_requests (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash             TEXT    NOT NULL,
+                requested_by_user_id  INTEGER NOT NULL,
+                requested_by_username TEXT    NOT NULL,
+                last_requested_at     TEXT    NOT NULL,
+                UNIQUE(info_hash, requested_by_user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tmrr_user_time
+              ON torrent_metadata_refresh_requests(requested_by_user_id, last_requested_at DESC);
             CREATE TABLE IF NOT EXISTS torrent_metadata_rewards (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 proposal_id      INTEGER NOT NULL,
@@ -2555,6 +2583,44 @@ class RegistrationDB:
             );
             CREATE INDEX IF NOT EXISTS idx_tmr_user_created
               ON torrent_metadata_rewards(user_id, id DESC);
+        ''')
+        c.commit()
+        # ── Torrent reports (migration-safe) ────────────────
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS torrent_reports (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash          TEXT    NOT NULL,
+                reporter_user_id   INTEGER NOT NULL,
+                reason             TEXT    NOT NULL,
+                notes              TEXT    NOT NULL DEFAULT '',
+                severity           TEXT    NOT NULL DEFAULT 'normal',
+                status             TEXT    NOT NULL DEFAULT 'open',
+                assigned_user_id   INTEGER,
+                created_at         TEXT    NOT NULL,
+                updated_at         TEXT    NOT NULL,
+                resolved_at        TEXT
+            );
+            CREATE TABLE IF NOT EXISTS torrent_report_actions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id       INTEGER NOT NULL,
+                actor_user_id   INTEGER NOT NULL,
+                actor_username  TEXT    NOT NULL,
+                action          TEXT    NOT NULL,
+                from_status     TEXT    NOT NULL DEFAULT '',
+                to_status       TEXT    NOT NULL DEFAULT '',
+                note            TEXT    NOT NULL DEFAULT '',
+                created_at      TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tr_status_sev_created
+              ON torrent_reports(status, severity, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_tr_infohash_created
+              ON torrent_reports(info_hash, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_tr_reporter_created
+              ON torrent_reports(reporter_user_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_tr_assigned_created
+              ON torrent_reports(assigned_user_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_tra_report_created
+              ON torrent_report_actions(report_id, id DESC);
         ''')
         c.commit()
         # ── DM opt-out column (migration-safe) ───────────────
@@ -4755,6 +4821,9 @@ class RegistrationDB:
             c.executemany('DELETE FROM comments WHERE info_hash=?', [(h,) for h in hashes])
             c.executemany('DELETE FROM notifications WHERE info_hash=?', [(h,) for h in hashes])
             c.executemany('DELETE FROM torrent_votes WHERE info_hash=?', [(h,) for h in hashes])
+            c.executemany('DELETE FROM torrent_report_actions WHERE report_id IN (SELECT id FROM torrent_reports WHERE info_hash=?)',
+                          [(h,) for h in hashes])
+            c.executemany('DELETE FROM torrent_reports WHERE info_hash=?', [(h,) for h in hashes])
         self._conn().commit()
         detail = f'deleted all torrents for {target_username}' if target_username else f'deleted all torrents for user_id={user_id}'
         self._log(actor, 'delete_all_torrents_user', target_username or str(user_id), detail)
@@ -4765,6 +4834,8 @@ class RegistrationDB:
         c.execute('DELETE FROM comments')
         c.execute('DELETE FROM notifications')
         c.execute('DELETE FROM torrent_votes')
+        c.execute('DELETE FROM torrent_report_actions')
+        c.execute('DELETE FROM torrent_reports')
         c.commit()
         self._log(actor, 'delete_all_torrents', 'ALL', 'deleted entire torrent database')
 
@@ -5711,6 +5782,32 @@ class RegistrationDB:
         except Exception as e:
             return False, {}, str(e)
 
+    def _metadata_http_url_exists(self, url: str, timeout_sec: int) -> bool:
+        target = (url or '').strip()
+        if not target:
+            return False
+        headers = {'User-Agent': 'wildkat-tracker/metadata-fetch'}
+        try:
+            req = urllib.request.Request(target, headers=headers, method='HEAD')
+            with urllib.request.urlopen(req, timeout=max(1, int(timeout_sec))) as resp:
+                return int(getattr(resp, 'status', 200) or 200) < 400
+        except urllib.error.HTTPError as e:
+            # Some origins do not allow HEAD; do a lightweight GET probe instead.
+            if int(getattr(e, 'code', 500) or 500) in (403, 405):
+                try:
+                    req = urllib.request.Request(
+                        target,
+                        headers={**headers, 'Range': 'bytes=0-0'},
+                        method='GET',
+                    )
+                    with urllib.request.urlopen(req, timeout=max(1, int(timeout_sec))) as resp:
+                        return int(getattr(resp, 'status', 200) or 200) < 400
+                except Exception:
+                    return False
+            return False
+        except Exception:
+            return False
+
     def _fetch_omdb_metadata(self, imdb_id: str, cfg: dict) -> tuple[bool, dict, str]:
         api_key = (cfg.get('omdb_api_key') or '').strip()
         if not api_key:
@@ -6044,6 +6141,11 @@ class RegistrationDB:
             else:
                 err = 'Unsupported metadata provider.'
             if ok:
+                poster_candidate = str(payload.get('poster_url') or '').strip()
+                if poster_candidate and not self._metadata_http_url_exists(
+                    poster_candidate, int(cfg.get('fetch_timeout_sec', 5))
+                ):
+                    payload['poster_url'] = ''
                 episode_external_id = str(payload.get('episode_external_id') or '')
                 self._upsert_metadata_cache(provider, external_id, payload, episode_external_id=episode_external_id)
                 c.execute(
@@ -6120,6 +6222,146 @@ class RegistrationDB:
             (ih, p)
         ).fetchone()
         return row is not None
+
+    def get_metadata_refresh_remaining_seconds(self, info_hash: str,
+                                               is_privileged: bool = False) -> int:
+        if is_privileged:
+            return 0
+        ih = (info_hash or '').strip().upper()
+        if not ih:
+            return 0
+        row = self._conn().execute(
+            '''SELECT MAX(last_requested_at) AS last_requested_at
+               FROM torrent_metadata_refresh_requests
+               WHERE info_hash=?''',
+            (ih,)
+        ).fetchone()
+        if not row:
+            return 0
+        try:
+            last_dt = datetime.datetime.fromisoformat(str(row['last_requested_at'] or ''))
+        except Exception:
+            return 0
+        elapsed = (datetime.datetime.now() - last_dt).total_seconds()
+        return max(0, int(METADATA_REFRESH_COOLDOWN_SECONDS - elapsed))
+
+    def request_torrent_metadata_refresh(self, info_hash: str, actor_user_id: int,
+                                         actor_username: str, is_privileged: bool = False) -> tuple[bool, str, int]:
+        ih = (info_hash or '').strip().upper()
+        uid = int(actor_user_id or 0)
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return False, 'Invalid torrent hash.', 0
+        if uid <= 0:
+            return False, 'Invalid actor.', 0
+        t = self.get_torrent(ih)
+        if not t:
+            return False, 'Torrent not found.', 0
+        links = self.list_active_metadata_links(ih)
+        if not links:
+            return False, 'No active metadata is linked to this torrent.', 0
+        c = self._conn()
+        now = self._ts()
+        for attempt in range(8):
+            try:
+                c.execute('BEGIN IMMEDIATE')
+                if not is_privileged:
+                    row = c.execute(
+                        '''SELECT MAX(last_requested_at) AS last_requested_at
+                           FROM torrent_metadata_refresh_requests
+                           WHERE info_hash=?''',
+                        (ih,)
+                    ).fetchone()
+                    if row:
+                        try:
+                            last_dt = datetime.datetime.fromisoformat(str(row['last_requested_at'] or ''))
+                            rem = max(0, int(METADATA_REFRESH_COOLDOWN_SECONDS - (datetime.datetime.now() - last_dt).total_seconds()))
+                        except Exception:
+                            rem = 0
+                        if rem > 0:
+                            c.execute('ROLLBACK')
+                            h = rem // 3600
+                            m = (rem % 3600) // 60
+                            return False, f'Metadata can be refreshed again in {h}h {m}m.', 0
+                c.execute(
+                    '''INSERT INTO torrent_metadata_refresh_requests (
+                           info_hash, requested_by_user_id, requested_by_username, last_requested_at
+                       ) VALUES (?,?,?,?)
+                       ON CONFLICT(info_hash, requested_by_user_id)
+                       DO UPDATE SET requested_by_username=excluded.requested_by_username,
+                                     last_requested_at=excluded.last_requested_at''',
+                    (ih, uid, (actor_username or '')[:64], now)
+                )
+                queued = 0
+                already_queued = 0
+                for link in links:
+                    provider = str(link['provider'] or '')
+                    external_id = str(link['external_id'] or '')
+                    proposal_id = int(link['source_proposal_id'] or 0)
+                    season = None
+                    episode = None
+                    if proposal_id > 0:
+                        prow = c.execute(
+                            'SELECT season, episode FROM torrent_metadata_proposals WHERE id=?',
+                            (proposal_id,)
+                        ).fetchone()
+                    else:
+                        prow = c.execute(
+                            '''SELECT id, season, episode
+                               FROM torrent_metadata_proposals
+                               WHERE info_hash=? AND provider=? AND proposed_id=?
+                               ORDER BY id DESC
+                               LIMIT 1''',
+                            (ih, provider, external_id)
+                        ).fetchone()
+                        if prow:
+                            proposal_id = int(prow['id'] or 0)
+                    if proposal_id <= 0:
+                        continue
+                    if prow:
+                        season = prow['season'] if 'season' in prow.keys() else None
+                        episode = prow['episode'] if 'episode' in prow.keys() else None
+                    existing = c.execute(
+                        '''SELECT 1 FROM torrent_metadata_fetch_jobs
+                           WHERE proposal_id=? AND provider=? AND external_id=?
+                             AND COALESCE(season,-1)=COALESCE(?, -1)
+                             AND COALESCE(episode,-1)=COALESCE(?, -1)
+                             AND status IN ('queued','retry','processing')
+                           LIMIT 1''',
+                        (proposal_id, provider, external_id, season, episode)
+                    ).fetchone()
+                    if existing:
+                        already_queued += 1
+                        continue
+                    c.execute(
+                        '''INSERT INTO torrent_metadata_fetch_jobs (
+                               proposal_id, provider, external_id, season, episode, status,
+                               attempt_count, last_error, next_attempt_at, created_at, updated_at
+                           ) VALUES (?,?,?,?,?,'queued',0,'',NULL,?,?)''',
+                        (proposal_id, provider, external_id, season, episode, now, now)
+                    )
+                    queued += 1
+                c.execute('COMMIT')
+                self._log(actor_username, 'metadata_refresh_manual', ih,
+                          f'queued={queued} already_queued={already_queued} privileged={1 if is_privileged else 0}')
+                if queued > 0:
+                    return True, f'Metadata refresh queued for {queued} provider(s).', queued
+                if already_queued > 0:
+                    return True, 'Metadata refresh already queued.', 0
+                return False, 'No metadata refresh jobs could be queued.', 0
+            except sqlite3.OperationalError as e:
+                try:
+                    c.execute('ROLLBACK')
+                except Exception:
+                    pass
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.08 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    log.warning('request_torrent_metadata_refresh lock after retries (non-fatal): ih=%s user=%s err=%s',
+                                ih, actor_username, e)
+                    return False, 'Database is busy, please retry metadata refresh.', 0
+                raise
+        return False, 'Database is busy, please retry metadata refresh.', 0
 
     def _enqueue_metadata_fetch_job(self, proposal) -> None:
         if not proposal:
@@ -6264,6 +6506,457 @@ class RegistrationDB:
         if approved or rejected:
             self._log('system', 'metadata_auto_finalize', '', f'approved={approved} rejected={rejected}')
         return approved, rejected
+
+    # ── Torrent Reports ───────────────────────────────────────
+
+    def _report_moderator_rows(self) -> list:
+        return self._conn().execute(
+            '''SELECT id, username FROM users
+               WHERE is_disabled=0 AND (username=? OR is_admin=1 OR is_editor=1)
+               ORDER BY CASE
+                 WHEN username=? THEN 0
+                 WHEN is_admin=1 THEN 1
+                 WHEN is_editor=1 THEN 2
+                 ELSE 3 END,
+               username ASC''',
+            (SUPER_USER, SUPER_USER)
+        ).fetchall()
+
+    def _report_editor_rows(self) -> list:
+        return self._conn().execute(
+            '''SELECT id, username FROM users
+               WHERE is_disabled=0 AND is_editor=1
+               ORDER BY username ASC'''
+        ).fetchall()
+
+    def _report_moderator_user_ids(self) -> list[int]:
+        return [int(r['id']) for r in self._report_moderator_rows()]
+
+    def _report_editor_user_ids(self) -> list[int]:
+        return [int(r['id']) for r in self._report_editor_rows()]
+
+    def list_report_moderators(self) -> list:
+        return [dict(r) for r in self._report_moderator_rows()]
+
+    def list_report_editors(self) -> list:
+        return [dict(r) for r in self._report_editor_rows()]
+
+    def create_torrent_report(self, info_hash: str, reporter_user_id: int,
+                              reporter_username: str, reason: str,
+                              notes: str = '') -> tuple[bool, str, int]:
+        ih = (info_hash or '').strip().upper()
+        uid = int(reporter_user_id or 0)
+        normalized_reason = _normalize_report_reason(reason)
+        if not ih or not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return False, 'Invalid info hash.', 0
+        if uid <= 0:
+            return False, 'Invalid reporter.', 0
+        if not normalized_reason:
+            return False, 'Invalid report reason.', 0
+        clean_notes = (notes or '').strip()[:1000]
+        if normalized_reason == 'other' and not clean_notes:
+            return False, 'Reason details are required when selecting Other.', 0
+        severity = _report_reason_severity(normalized_reason)
+        now_dt = datetime.datetime.now()
+        now_ts = self._ts()
+        cooldown_cutoff = (now_dt - datetime.timedelta(seconds=REPORT_SUBMISSION_COOLDOWN_SECONDS)).isoformat()
+        c = self._conn()
+        for attempt in range(8):
+            try:
+                c.execute('BEGIN IMMEDIATE')
+                t = c.execute(
+                    'SELECT info_hash,name FROM torrents WHERE info_hash=?',
+                    (ih,)
+                ).fetchone()
+                if not t:
+                    c.execute('ROLLBACK')
+                    return False, 'Torrent not found.', 0
+                existing = c.execute(
+                    '''SELECT id FROM torrent_reports
+                       WHERE info_hash=? AND reporter_user_id=? AND reason=?
+                         AND status IN ('open','in_review')
+                       ORDER BY id DESC LIMIT 1''',
+                    (ih, uid, normalized_reason)
+                ).fetchone()
+                if existing:
+                    c.execute('ROLLBACK')
+                    return False, 'You already have an open report for this reason on this torrent.', 0
+                recent = c.execute(
+                    '''SELECT id FROM torrent_reports
+                       WHERE info_hash=? AND reporter_user_id=? AND created_at>=?
+                       ORDER BY id DESC LIMIT 1''',
+                    (ih, uid, cooldown_cutoff)
+                ).fetchone()
+                if recent:
+                    c.execute('ROLLBACK')
+                    return False, 'Report cooldown active. Please wait before submitting again.', 0
+                c.execute(
+                    '''INSERT INTO torrent_reports (
+                           info_hash, reporter_user_id, reason, notes, severity,
+                           status, assigned_user_id, created_at, updated_at, resolved_at
+                       ) VALUES (?,?,?,?,?,'open',NULL,?,?,NULL)''',
+                    (ih, uid, normalized_reason, clean_notes, severity, now_ts, now_ts)
+                )
+                report_id = int(c.execute('SELECT last_insert_rowid()').fetchone()[0])
+                c.execute(
+                    '''INSERT INTO torrent_report_actions (
+                           report_id, actor_user_id, actor_username, action,
+                           from_status, to_status, note, created_at
+                       ) VALUES (?,?,?,?,?,?,?,?)''',
+                    (report_id, uid, reporter_username[:64], 'created', '', 'open', clean_notes, now_ts)
+                )
+                c.execute(
+                    'INSERT INTO events (timestamp,actor,action,target,detail) VALUES (?,?,?,?,?)',
+                    (now_ts, reporter_username[:64], 'report_create', ih,
+                     f'report_id={report_id} reason={normalized_reason} severity={severity}')
+                )
+                c.execute('COMMIT')
+                return True, 'Report submitted.', report_id
+            except sqlite3.OperationalError as e:
+                try:
+                    c.execute('ROLLBACK')
+                except Exception:
+                    pass
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.08 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    log.warning('create_torrent_report lock after retries (non-fatal): ih=%s uid=%s err=%s',
+                                ih, uid, e)
+                    return False, 'Database is busy, please retry report submission.', 0
+                raise
+        return False, 'Database is busy, please retry report submission.', 0
+
+    def list_torrent_reports(self, limit: int = 50, offset: int = 0,
+                             q_status: str = '', q_severity: str = '', q_reason: str = '',
+                             q_reporter: str = '', q_info_hash: str = '', q_owner: str = '') -> tuple[list, int]:
+        clauses = []
+        params: list[Any] = []
+        status = _normalize_report_status(q_status)
+        if status:
+            clauses.append('r.status=?')
+            params.append(status)
+        sev = (q_severity or '').strip().lower()
+        if sev in ('normal', 'high'):
+            clauses.append('r.severity=?')
+            params.append(sev)
+        reason = _normalize_report_reason(q_reason)
+        if reason:
+            clauses.append('r.reason=?')
+            params.append(reason)
+        if q_reporter:
+            clauses.append('ru.username LIKE ?')
+            params.append(f'%{q_reporter.strip()}%')
+        if q_info_hash:
+            clauses.append('r.info_hash LIKE ?')
+            params.append(f'%{q_info_hash.strip().upper()}%')
+        if q_owner:
+            clauses.append('t.uploaded_by_username LIKE ?')
+            params.append(f'%{q_owner.strip()}%')
+        where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        sql = (
+            'SELECT r.*, '
+            ' ru.username AS reporter_username, '
+            ' au.username AS assigned_username, '
+            ' t.name AS torrent_name, '
+            ' t.uploaded_by_username AS owner_username '
+            'FROM torrent_reports r '
+            'LEFT JOIN users ru ON ru.id=r.reporter_user_id '
+            'LEFT JOIN users au ON au.id=r.assigned_user_id '
+            'LEFT JOIN torrents t ON t.info_hash=r.info_hash '
+            f"{where} ORDER BY CASE "
+            "WHEN r.severity='high' AND r.status IN ('open','in_review') THEN 0 "
+            "WHEN r.status IN ('open','in_review') THEN 1 "
+            "ELSE 2 END, r.id DESC LIMIT ? OFFSET ?"
+        )
+        rows = self._conn().execute(sql, params + [int(limit), int(offset)]).fetchall()
+        total = self._conn().execute(
+            'SELECT COUNT(*) FROM torrent_reports r '
+            'LEFT JOIN users ru ON ru.id=r.reporter_user_id '
+            'LEFT JOIN torrents t ON t.info_hash=r.info_hash '
+            f'{where}',
+            params
+        ).fetchone()[0]
+        return [dict(r) for r in rows], int(total)
+
+    def get_torrent_report(self, report_id: int):
+        row = self._conn().execute(
+            '''SELECT r.*,
+                      ru.username AS reporter_username,
+                      au.username AS assigned_username,
+                      t.name AS torrent_name,
+                      t.uploaded_by_id AS owner_user_id,
+                      t.uploaded_by_username AS owner_username
+               FROM torrent_reports r
+               LEFT JOIN users ru ON ru.id=r.reporter_user_id
+               LEFT JOIN users au ON au.id=r.assigned_user_id
+               LEFT JOIN torrents t ON t.info_hash=r.info_hash
+               WHERE r.id=?''',
+            (int(report_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_torrent_report_actions(self, report_id: int, limit: int = 200) -> list:
+        rows = self._conn().execute(
+            '''SELECT a.*, u.username AS actor_username_current
+               FROM torrent_report_actions a
+               LEFT JOIN users u ON u.id=a.actor_user_id
+               WHERE a.report_id=?
+               ORDER BY a.id DESC LIMIT ?''',
+            (int(report_id), int(limit))
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def apply_torrent_report_action(self, report_id: int, actor_user_id: int,
+                                    actor_username: str, action: str,
+                                    note: str = '', assign_user_id: int = 0) -> tuple[bool, str]:
+        rid = int(report_id or 0)
+        uid = int(actor_user_id or 0)
+        act = (action or '').strip().lower()
+        clean_note = (note or '').strip()[:500]
+        if rid <= 0 or uid <= 0:
+            return False, 'Invalid report action.'
+        if act not in ('open', 'in_review', 'resolved', 'dismissed', 'assign', 'unassign', 'note'):
+            return False, 'Invalid report action.'
+        now = self._ts()
+        c = self._conn()
+        for attempt in range(8):
+            try:
+                c.execute('BEGIN IMMEDIATE')
+                row = c.execute(
+                    'SELECT * FROM torrent_reports WHERE id=?',
+                    (rid,)
+                ).fetchone()
+                if not row:
+                    c.execute('ROLLBACK')
+                    return False, 'Report not found.'
+                old_status = str(row['status'] or 'open')
+                changed = False
+                event_action = ''
+                event_detail = ''
+                if act in ('open', 'in_review', 'resolved', 'dismissed'):
+                    if old_status != act:
+                        resolved_at = now if act in ('resolved', 'dismissed') else None
+                        c.execute(
+                            'UPDATE torrent_reports SET status=?,updated_at=?,resolved_at=? WHERE id=?',
+                            (act, now, resolved_at, rid)
+                        )
+                        c.execute(
+                            '''INSERT INTO torrent_report_actions (
+                                   report_id, actor_user_id, actor_username, action,
+                                   from_status, to_status, note, created_at
+                               ) VALUES (?,?,?,?,?,?,?,?)''',
+                            (rid, uid, actor_username[:64], 'status_change', old_status, act, clean_note, now)
+                        )
+                        event_action = 'report_status_change'
+                        event_detail = f'report_id={rid} from={old_status} to={act}'
+                        if clean_note:
+                            event_detail += f' note={clean_note[:120]}'
+                        changed = True
+                elif act in ('assign', 'unassign'):
+                    to_uid = int(assign_user_id or 0) if act == 'assign' else 0
+                    if to_uid > 0:
+                        valid_mod = c.execute(
+                            'SELECT 1 FROM users WHERE id=? AND is_disabled=0 AND (username=? OR is_admin=1 OR is_editor=1)',
+                            (to_uid, SUPER_USER)
+                        ).fetchone()
+                        if not valid_mod:
+                            c.execute('ROLLBACK')
+                            return False, 'Selected assignee is not an active moderator.'
+                    c.execute(
+                        'UPDATE torrent_reports SET assigned_user_id=?,updated_at=? WHERE id=?',
+                        (to_uid if to_uid > 0 else None, now, rid)
+                    )
+                    c.execute(
+                        '''INSERT INTO torrent_report_actions (
+                               report_id, actor_user_id, actor_username, action,
+                               from_status, to_status, note, created_at
+                           ) VALUES (?,?,?,?,?,?,?,?)''',
+                        (rid, uid, actor_username[:64], 'assign', '', '', f'assigned_user_id={to_uid}', now)
+                    )
+                    event_action = 'report_assign'
+                    event_detail = f'report_id={rid} assigned_user_id={to_uid}'
+                    changed = True
+                elif act == 'note':
+                    if not clean_note:
+                        c.execute('ROLLBACK')
+                        return False, 'Note is required.'
+                    c.execute(
+                        'UPDATE torrent_reports SET updated_at=? WHERE id=?',
+                        (now, rid)
+                    )
+                    c.execute(
+                        '''INSERT INTO torrent_report_actions (
+                               report_id, actor_user_id, actor_username, action,
+                               from_status, to_status, note, created_at
+                           ) VALUES (?,?,?,?,?,?,?,?)''',
+                        (rid, uid, actor_username[:64], 'note', '', '', clean_note, now)
+                    )
+                    event_action = 'report_note'
+                    event_detail = f'report_id={rid} note={clean_note[:120]}'
+                    changed = True
+                if changed:
+                    c.execute(
+                        'INSERT INTO events (timestamp,actor,action,target,detail) VALUES (?,?,?,?,?)',
+                        (now, actor_username[:64], event_action, str(row['info_hash'] or ''), event_detail)
+                    )
+                c.execute('COMMIT')
+                return True, 'Report updated.' if changed else 'No changes applied.'
+            except sqlite3.OperationalError as e:
+                try:
+                    c.execute('ROLLBACK')
+                except Exception:
+                    pass
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.08 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    log.warning('apply_torrent_report_action lock after retries (non-fatal): report_id=%s actor=%s err=%s',
+                                rid, actor_username, e)
+                    return False, 'Database is busy, please retry this report action.'
+                raise
+        return False, 'Database is busy, please retry this report action.'
+
+    def _add_notification_with_retry(self, user_id: int, ntype: str, from_username: str,
+                                     info_hash: str, torrent_name: str, comment_id: int,
+                                     retries: int = 5) -> bool:
+        for attempt in range(max(1, int(retries))):
+            try:
+                self.add_notification(user_id, ntype, from_username, info_hash, torrent_name, comment_id)
+                return True
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower() and attempt < (max(1, int(retries)) - 1):
+                    time.sleep(0.06 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    return False
+                raise
+        return False
+
+    def notify_torrent_report_created(self, report_id: int, actor_username: str) -> int:
+        report = self.get_torrent_report(int(report_id))
+        if not report:
+            return 0
+        rid = int(report.get('id') or 0)
+        reason = str(report.get('reason') or '')
+        severity = str(report.get('severity') or 'normal')
+        ih = str(report.get('info_hash') or '').upper()
+        tname = str(report.get('torrent_name') or ih)[:120]
+        recipients: set[int] = set()
+        # Super/admin always receive report notifications.
+        admin_rows = self._conn().execute(
+            'SELECT id FROM users WHERE is_disabled=0 AND (username=? OR is_admin=1)',
+            (SUPER_USER,)
+        ).fetchall()
+        recipients.update(int(r['id']) for r in admin_rows)
+        # Editors only receive bad_metadata reports.
+        if reason == 'bad_metadata':
+            recipients.update(self._report_editor_user_ids())
+        owner_uid = int(report.get('owner_user_id') or 0)
+        if owner_uid > 0:
+            recipients.add(owner_uid)
+        reporter_uid = int(report.get('reporter_user_id') or 0)
+        ntype = 'torrent_report_high' if severity == 'high' else 'torrent_report_open'
+        sent = 0
+        for uid in sorted(recipients):
+            if uid <= 0 or uid == reporter_uid:
+                continue
+            if self._add_notification_with_retry(uid, ntype, actor_username, ih, tname, rid):
+                sent += 1
+            else:
+                log.warning('notify_torrent_report_created skipped recipient due to db lock: report_id=%s uid=%s',
+                            rid, uid)
+        self._log(actor_username, 'report_notify_create', ih,
+                  f'report_id={rid} reason={reason} severity={severity} recipients={sent}')
+        return sent
+
+    def notify_torrent_report_update(self, report_id: int, actor_username: str,
+                                     update_label: str = 'updated') -> int:
+        report = self.get_torrent_report(int(report_id))
+        if not report:
+            return 0
+        rid = int(report.get('id') or 0)
+        ih = str(report.get('info_hash') or '').upper()
+        tname = str(report.get('torrent_name') or ih)[:120]
+        actor_uid = 0
+        if (actor_username or '').strip().lower() != 'system':
+            a = self.get_user(actor_username)
+            actor_uid = int(a['id'] or 0) if a else 0
+        reason = str(report.get('reason') or '')
+        recipients: set[int] = set()
+        admin_rows = self._conn().execute(
+            'SELECT id FROM users WHERE is_disabled=0 AND (username=? OR is_admin=1)',
+            (SUPER_USER,)
+        ).fetchall()
+        recipients.update(int(r['id']) for r in admin_rows)
+        if reason == 'bad_metadata':
+            recipients.update(self._report_editor_user_ids())
+        reporter_uid = int(report.get('reporter_user_id') or 0)
+        owner_uid = int(report.get('owner_user_id') or 0)
+        if reporter_uid > 0:
+            recipients.add(reporter_uid)
+        if owner_uid > 0:
+            recipients.add(owner_uid)
+        reporter_type_map = {
+            'open': 'torrent_report_opened',
+            'in_review': 'torrent_report_reviewing',
+            'resolved': 'torrent_report_resolved',
+            'dismissed': 'torrent_report_dismissed',
+            'assign': 'torrent_report_assigned_to_reporter',
+            'unassign': 'torrent_report_unassigned_from_reporter',
+            'note': 'torrent_report_noted',
+        }
+        generic_type_map = {
+            'open': 'torrent_report_open_generic',
+            'in_review': 'torrent_report_reviewing_generic',
+            'resolved': 'torrent_report_resolved_generic',
+            'dismissed': 'torrent_report_dismissed_generic',
+            'assign': 'torrent_report_assigned_generic',
+            'unassign': 'torrent_report_unassigned_generic',
+            'note': 'torrent_report_noted',
+        }
+        action_key = (update_label or '').strip().lower()
+        sent = 0
+        for uid in sorted(recipients):
+            if uid <= 0:
+                continue
+            if actor_uid > 0 and uid == actor_uid:
+                continue
+            ntype = reporter_type_map.get(action_key, 'torrent_report_update') if uid == reporter_uid else generic_type_map.get(action_key, 'torrent_report_update')
+            if self._add_notification_with_retry(uid, ntype, actor_username, ih, tname, rid):
+                sent += 1
+            else:
+                log.warning('notify_torrent_report_update skipped recipient due to db lock: report_id=%s uid=%s',
+                            rid, uid)
+        self._log(actor_username, 'report_notify_update', ih,
+                  f'report_id={rid} action={update_label[:32]} recipients={sent}')
+        return sent
+
+    def notify_torrent_report_note_assignee(self, report_id: int, actor_username: str) -> int:
+        report = self.get_torrent_report(int(report_id))
+        if not report:
+            return 0
+        rid = int(report.get('id') or 0)
+        ih = str(report.get('info_hash') or '').upper()
+        tname = str(report.get('torrent_name') or ih)[:120]
+        assignee_uid = int(report.get('assigned_user_id') or 0)
+        if assignee_uid <= 0:
+            return 0
+        actor_uid = 0
+        if (actor_username or '').strip().lower() != 'system':
+            a = self.get_user(actor_username)
+            actor_uid = int(a['id'] or 0) if a else 0
+        if actor_uid > 0 and assignee_uid == actor_uid:
+            return 0
+        if self._add_notification_with_retry(
+            assignee_uid, 'torrent_report_noted_assignee', actor_username, ih, tname, rid
+        ):
+            self._log(actor_username, 'report_notify_note', ih,
+                      f'report_id={rid} recipient={assignee_uid}')
+            return 1
+        log.warning('notify_torrent_report_note_assignee skipped recipient due to db lock: report_id=%s uid=%s',
+                    rid, assignee_uid)
+        return 0
 
     # ── Bounty System ─────────────────────────────────────────
 
@@ -7025,6 +7718,9 @@ class RegistrationDB:
                 c.execute('DELETE FROM comments WHERE info_hash=?', (ih_upper,))
                 c.execute('DELETE FROM notifications WHERE info_hash=?', (ih_upper,))
                 c.execute('DELETE FROM torrent_votes WHERE info_hash=?', (ih_upper,))
+                c.execute('DELETE FROM torrent_report_actions WHERE report_id IN (SELECT id FROM torrent_reports WHERE info_hash=?)',
+                          (ih_upper,))
+                c.execute('DELETE FROM torrent_reports WHERE info_hash=?', (ih_upper,))
                 c.execute('DELETE FROM torrents WHERE info_hash=?', (ih_upper,))
                 c.execute('COMMIT')
                 self._log(actor, 'delete_torrent', ih_upper, torrent_name)
@@ -7137,6 +7833,8 @@ class RegistrationDB:
         c.execute('DELETE FROM comments')
         c.execute('DELETE FROM notifications')
         c.execute('DELETE FROM torrent_votes')
+        c.execute('DELETE FROM torrent_reports')
+        c.execute('DELETE FROM torrent_report_actions')
         c.execute('DELETE FROM invite_codes')
         c.execute('DELETE FROM points_ledger')
         c.execute('DELETE FROM bounties')
@@ -8268,23 +8966,13 @@ class RegistrationDB:
             torrent_name, int(comment_id)
         )
 
-    def _metadata_moderator_user_ids(self, info_hash: str) -> list[int]:
+    def _metadata_proposal_recipient_user_ids(self, info_hash: str) -> list[int]:
         ih = (info_hash or '').strip().upper()
         if not ih:
             return []
-        ids: set[int] = set()
         t = self.get_torrent(ih)
-        if t and int(t['uploaded_by_id'] or 0) > 0:
-            ids.add(int(t['uploaded_by_id']))
-        rows = self._conn().execute(
-            '''SELECT id FROM users
-               WHERE is_disabled=0
-                 AND (is_admin=1 OR is_editor=1 OR username=?)''',
-            (SUPER_USER,)
-        ).fetchall()
-        for r in rows:
-            ids.add(int(r['id']))
-        return sorted(ids)
+        owner_id = int(t['uploaded_by_id'] or 0) if t else 0
+        return [owner_id] if owner_id > 0 else []
 
     def notify_metadata_proposed(self, proposal_id: int, actor_username: str) -> int:
         p = self.get_metadata_proposal(int(proposal_id))
@@ -8293,7 +8981,7 @@ class RegistrationDB:
         t = self.get_torrent(str(p['info_hash'] or '').upper())
         tname = (t['name'][:120] if t else str(p['info_hash'] or '')[:120])
         sent = 0
-        for uid in self._metadata_moderator_user_ids(str(p['info_hash'] or '')):
+        for uid in self._metadata_proposal_recipient_user_ids(str(p['info_hash'] or '')):
             if uid == int(p['proposed_by_user_id'] or 0):
                 continue
             self.add_notification(
@@ -11219,6 +11907,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_admin_event_detail(path[len('/manage/admin/event/'):])
         elif path.startswith('/manage/admin/security/event/'):
             self._get_admin_security_event_detail(path[len('/manage/admin/security/event/'):])
+        elif path.startswith('/manage/admin/report/'):
+            self._get_admin_report_detail(path[len('/manage/admin/report/'):])
         elif path == '/manage/password':
             self._get_password_page()
         elif path.startswith('/manage/admin/set-password/'):
@@ -11455,8 +12145,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_toggle_comments_lock(False)
         elif path == '/manage/torrent/update-peers':
             self._post_torrent_update_peers()
+        elif path == '/manage/torrent/update-metadata':
+            self._post_torrent_update_metadata()
         elif path == '/manage/torrent/vote':
             self._post_torrent_vote()
+        elif path == '/manage/torrent/report':
+            self._post_torrent_report()
         elif path == '/manage/metadata/propose':
             self._post_metadata_propose()
         elif path == '/manage/metadata/vote':
@@ -11507,6 +12201,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_tracker_move()
         elif path == '/manage/admin/security/action':
             self._post_admin_security_action()
+        elif path == '/manage/admin/report/action':
+            self._post_admin_report_action()
         elif path == '/manage/admin/save-settings':
             self._post_save_settings()
         elif path == '/manage/comment/post':
@@ -11726,6 +12422,38 @@ class ManageHandler(BaseHTTPRequestHandler):
                     q_status=s_status,
                     q_ip=s_ip,
                 )
+        # report queue pagination + search
+        rpage = _get_named_page_param(self.path, 'rpage')
+        reports_pp = 50
+        r_status = qs.get('rstatus', [''])[0].strip()
+        r_severity = qs.get('rseverity', [''])[0].strip()
+        r_reason = qs.get('rreason', [''])[0].strip()
+        r_reporter = qs.get('rreporter', [''])[0].strip()
+        r_info_hash = qs.get('rih', [''])[0].strip()
+        r_owner = qs.get('rowner', [''])[0].strip()
+        reports, reports_total = REGISTRATION_DB.list_torrent_reports(
+            limit=reports_pp,
+            offset=(rpage - 1) * reports_pp,
+            q_status=r_status,
+            q_severity=r_severity,
+            q_reason=r_reason,
+            q_reporter=r_reporter,
+            q_info_hash=r_info_hash,
+            q_owner=r_owner,
+        )
+        reports_total_pages = max(1, (reports_total + reports_pp - 1) // reports_pp)
+        if rpage > reports_total_pages:
+            rpage = reports_total_pages
+            reports, reports_total = REGISTRATION_DB.list_torrent_reports(
+                limit=reports_pp,
+                offset=(rpage - 1) * reports_pp,
+                q_status=r_status,
+                q_severity=r_severity,
+                q_reason=r_reason,
+                q_reporter=r_reporter,
+                q_info_hash=r_info_hash,
+                q_owner=r_owner,
+            )
         trackers     = REGISTRATION_DB.list_magnet_trackers()
         settings     = REGISTRATION_DB.get_all_settings()
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
@@ -11739,6 +12467,9 @@ class ManageHandler(BaseHTTPRequestHandler):
                 tab = 'adduser'
             elif qs.get('strigger', [''])[0] or qs.get('sstatus', [''])[0] or qs.get('sip', [''])[0] or qs.get('sview', [''])[0]:
                 tab = 'security'
+            elif (qs.get('rstatus', [''])[0] or qs.get('rseverity', [''])[0] or qs.get('rreason', [''])[0]
+                  or qs.get('rreporter', [''])[0] or qs.get('rih', [''])[0] or qs.get('rowner', [''])[0]):
+                tab = 'reports'
         self._send_html(_render_admin(user, all_torrents, all_users, events, trackers, settings,
                                       page=page, total_pages=total_pages, total=total,
                                       upage=upage, utotal_pages=utotal_pages, utotal=utotal,
@@ -11759,7 +12490,18 @@ class ManageHandler(BaseHTTPRequestHandler):
                                       strigger=s_trigger,
                                       sstatus=s_status,
                                       sip=s_ip,
-                                      sview=s_view))
+                                      sview=s_view,
+                                      reports=reports,
+                                      rpage=rpage,
+                                      reports_total_pages=reports_total_pages,
+                                      reports_total=reports_total,
+                                      reports_pp=reports_pp,
+                                      rstatus=r_status,
+                                      rseverity=r_severity,
+                                      rreason=r_reason,
+                                      rreporter=r_reporter,
+                                      rih=r_info_hash,
+                                      rowner=r_owner))
 
     def _get_admin_event_detail(self, event_id_raw: str):
         user = self._get_session_user()
@@ -11805,6 +12547,51 @@ class ManageHandler(BaseHTTPRequestHandler):
         msg_type = qs.get('msg_type', ['error'])[0]
         self._send_html(_render_admin_security_event_detail(
             user, event, ban, actions, back_url=back, msg=msg, msg_type=msg_type
+        ))
+
+    def _editor_can_review_report(self, user, report: dict | None) -> bool:
+        if not user or not report:
+            return False
+        if _user_role(user) != 'editor':
+            return False
+        return str(report.get('reason') or '') == 'bad_metadata'
+
+    def _get_admin_report_detail(self, report_id_raw: str):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        role = _user_role(user)
+        if role not in ('super', 'admin', 'editor'):
+            return self._redirect('/manage/dashboard')
+        report_id_str = (report_id_raw or '').strip('/')
+        if not report_id_str.isdigit():
+            if role == 'editor':
+                return self._redirect('/manage/dashboard')
+            return self._redirect('/manage/admin?tab=reports&msg=Invalid+report+id.&msg_type=error')
+        report_id = int(report_id_str)
+        report = REGISTRATION_DB.get_torrent_report(report_id)
+        if not report:
+            if role == 'editor':
+                return self._redirect('/manage/dashboard')
+            return self._redirect('/manage/admin?tab=reports&msg=Report+not+found.&msg_type=error')
+        if role == 'editor' and not self._editor_can_review_report(user, report):
+            q = urllib.parse.quote_plus('Editors may only review bad metadata reports.')
+            return self._redirect(f'/manage/dashboard?msg={q}&msg_type=error')
+        actions = REGISTRATION_DB.list_torrent_report_actions(report_id, limit=300)
+        moderators = REGISTRATION_DB.list_report_editors() if role == 'editor' else REGISTRATION_DB.list_report_moderators()
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        back = urllib.parse.unquote(qs.get('back', [''])[0]).strip()
+        if role == 'editor':
+            back = '/manage/dashboard'
+        elif not back.startswith('/manage/admin'):
+            back = '/manage/admin?tab=reports'
+        msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        active_token = self._current_valid_session_token()
+        active_csrf = _csrf_token(active_token) if active_token else ''
+        self._send_html(_render_admin_report_detail(
+            user, report, actions, moderators, back_url=back, msg=msg, msg_type=msg_type,
+            csrf_token=active_csrf
         ))
 
     def _post_admin_security_action(self):
@@ -11893,6 +12680,61 @@ class ManageHandler(BaseHTTPRequestHandler):
                 return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Unable+to+resolve+security+event.&msg_type=error')
             return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Security+event+marked+resolved.&msg_type=success')
         return self._redirect(f'/manage/admin/security/event/{event_id}?msg=Unknown+security+action.&msg_type=error')
+
+    def _post_admin_report_action(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        role = _user_role(user)
+        if role not in ('super', 'admin', 'editor'):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        try:
+            report_id = int(fields.get('report_id', '0'))
+        except Exception:
+            report_id = 0
+        action = (fields.get('action', '') or '').strip().lower()
+        note = (fields.get('note', '') or '').strip()
+        try:
+            assign_uid = int(fields.get('assign_user_id', '0') or 0)
+        except Exception:
+            assign_uid = 0
+        if report_id <= 0:
+            if role == 'editor':
+                return self._redirect('/manage/dashboard')
+            return self._redirect('/manage/admin?tab=reports&msg=Missing+report+id.&msg_type=error')
+        if role == 'editor':
+            report = REGISTRATION_DB.get_torrent_report(report_id)
+            if not self._editor_can_review_report(user, report):
+                q = urllib.parse.quote_plus('Editors may only review bad metadata reports.')
+                return self._redirect(f'/manage/dashboard?msg={q}&msg_type=error')
+            if action == 'assign':
+                assignee = REGISTRATION_DB.get_user_by_id(assign_uid) if assign_uid > 0 else None
+                if not assignee or int(assignee['is_editor'] if 'is_editor' in assignee.keys() else 0) != 1:
+                    q = urllib.parse.quote_plus('Editors can only assign reports to editors.')
+                    return self._redirect(f'/manage/admin/report/{report_id}?msg={q}&msg_type=error')
+        ok, msg = REGISTRATION_DB.apply_torrent_report_action(
+            report_id, int(user['id']), user['username'], action, note=note, assign_user_id=assign_uid
+        )
+        if ok and action in ('open', 'in_review', 'resolved', 'dismissed', 'assign', 'unassign'):
+            try:
+                REGISTRATION_DB.notify_torrent_report_update(report_id, user['username'], update_label=action)
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower():
+                    log.warning('notify_torrent_report_update failed (non-fatal): report_id=%s err=%s', report_id, e)
+                else:
+                    raise
+        elif ok and action == 'note':
+            try:
+                REGISTRATION_DB.notify_torrent_report_note_assignee(report_id, user['username'])
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower():
+                    log.warning('notify_torrent_report_note_assignee failed (non-fatal): report_id=%s err=%s', report_id, e)
+                else:
+                    raise
+        q = urllib.parse.quote_plus(msg)
+        return self._redirect(f'/manage/admin/report/{report_id}?msg={q}&msg_type={"success" if ok else "error"}')
 
     def _get_password_page(self):
         user = self._get_session_user()
@@ -12865,7 +13707,10 @@ class ManageHandler(BaseHTTPRequestHandler):
         user = self._get_session_user()
         if not user:
             return self._redirect('/manage')
-        self._send_html(_render_notifications_page(user))
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        self._send_html(_render_notifications_page(user, msg=msg, msg_type=msg_type))
 
     def _get_bounty_board(self):
         user = self._get_session_user()
@@ -13136,6 +13981,20 @@ class ManageHandler(BaseHTTPRequestHandler):
                     if bid.isdigit():
                         return self._redirect(f'/manage/bounty/{bid}')
                     return self._redirect('/manage/bounty')
+                if n['type'] in (
+                    'torrent_report_open', 'torrent_report_high', 'torrent_report_update',
+                    'torrent_report_opened', 'torrent_report_reviewing',
+                    'torrent_report_resolved', 'torrent_report_dismissed',
+                    'torrent_report_assigned', 'torrent_report_noted', 'torrent_report_noted_assignee',
+                    'torrent_report_assigned_to_reporter', 'torrent_report_unassigned_from_reporter',
+                    'torrent_report_open_generic', 'torrent_report_reviewing_generic',
+                    'torrent_report_resolved_generic', 'torrent_report_dismissed_generic',
+                    'torrent_report_assigned_generic', 'torrent_report_unassigned_generic'
+                ):
+                    rid = int(n['comment_id'] or 0)
+                    if _can_open_report_detail(user, rid):
+                        return self._redirect(f'/manage/admin/report/{rid}')
+                    return self._redirect(f'/manage/torrent/{ih.lower()}#torrent-report')
                 anchor = f'#comment-{n["comment_id"]}' if int(n['comment_id'] or 0) > 0 else ''
                 return self._redirect(f'/manage/torrent/{ih.lower()}{anchor}')
         self._redirect('/manage/notifications')
@@ -13225,7 +14084,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not cfg.get('active'):
             q = urllib.parse.quote('Peer query is disabled or not fully configured.')
             return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
-        rem = _peer_refresh_remaining_seconds(t)
+        role = _user_role(user)
+        rem = 0 if role in ('super', 'admin') else _peer_refresh_remaining_seconds(t)
         if rem > 0:
             h = rem // 3600
             m = (rem % 3600) // 60
@@ -13244,6 +14104,48 @@ class ManageHandler(BaseHTTPRequestHandler):
             user['username']
         )
         q = urllib.parse.quote(f'Peer stats updated: seeds={details["seeds"]}, peers={details["peers"]}.')
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
+
+    def _post_torrent_update_metadata(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        if not ih or not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not t:
+            return self._redirect('/manage/dashboard')
+        cfg = REGISTRATION_DB.get_metadata_config()
+        if not cfg.get('enabled', True):
+            q = urllib.parse.quote('Metadata features are disabled.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        if not cfg.get('fetch_enabled', True):
+            q = urllib.parse.quote('Metadata fetch jobs are disabled.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        role = _user_role(user)
+        is_privileged = role in ('super', 'admin')
+        ok, msg, _queued = REGISTRATION_DB.request_torrent_metadata_refresh(
+            ih, int(user['id']), user['username'], is_privileged=is_privileged
+        )
+        if not ok:
+            q = urllib.parse.quote(msg)
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        processed_ok = 0
+        processed_err = 0
+        try:
+            for _ in range(3):
+                okc, errc = REGISTRATION_DB.process_metadata_fetch_jobs()
+                processed_ok += int(okc or 0)
+                processed_err += int(errc or 0)
+                if (okc + errc) == 0:
+                    break
+        except Exception:
+            pass
+        detail = f' Processed now: success={processed_ok}, failed={processed_err}.' if (processed_ok or processed_err) else ''
+        q = urllib.parse.quote(msg + detail)
         return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
 
     def _post_torrent_vote(self):
@@ -13279,6 +14181,34 @@ class ManageHandler(BaseHTTPRequestHandler):
                 int(uploader['id']), user['username'], ih, t['name'][:120], final_vote
             )
         return self._redirect(f'/manage/torrent/{ih.lower()}')
+
+    def _post_torrent_report(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        reason = fields.get('reason', '').strip().lower()
+        notes = fields.get('notes', '').strip()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not t:
+            return self._redirect('/manage/dashboard')
+        ok, msg, report_id = REGISTRATION_DB.create_torrent_report(
+            ih, int(user['id']), user['username'], reason, notes=notes
+        )
+        if ok:
+            try:
+                REGISTRATION_DB.notify_torrent_report_created(report_id, user['username'])
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower():
+                    log.warning('notify_torrent_report_created failed (non-fatal): report_id=%s err=%s', report_id, e)
+                else:
+                    raise
+        q = urllib.parse.quote(msg)
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type={"success" if ok else "error"}')
 
     def _can_moderate_metadata_for_torrent(self, user, torrent_row) -> bool:
         if not user or not torrent_row:
@@ -13415,14 +14345,23 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
+        from_notifications = (fields.get('from_notifications', '0') or '').strip() == '1'
         proposal_id = fields.get('proposal_id', '').strip()
+        notif_id = fields.get('notif_id', '').strip()
+        notif_id_int = int(notif_id) if notif_id.isdigit() else 0
         if not proposal_id.isdigit():
+            if from_notifications:
+                return self._redirect('/manage/notifications')
             return self._redirect('/manage/dashboard')
         p = REGISTRATION_DB.get_metadata_proposal(int(proposal_id))
         if not p:
+            if from_notifications:
+                return self._redirect('/manage/notifications')
             return self._redirect('/manage/dashboard')
         t = REGISTRATION_DB.get_torrent(str(p['info_hash'] or '').upper())
         if not self._can_moderate_metadata_for_torrent(user, t):
+            if from_notifications:
+                return self._redirect('/manage/notifications?msg=Not+authorized+for+this+metadata+proposal.&msg_type=error')
             return self._redirect(f'/manage/torrent/{str(p["info_hash"]).lower()}')
         ok, msg = REGISTRATION_DB.resolve_metadata_proposal(
             int(proposal_id), int(user['id']), user['username'],
@@ -13434,7 +14373,16 @@ class ManageHandler(BaseHTTPRequestHandler):
                 REGISTRATION_DB.process_metadata_fetch_jobs()
             except Exception:
                 pass
+        if from_notifications and notif_id_int > 0:
+            try:
+                n = REGISTRATION_DB.get_notification(notif_id_int, int(user['id']))
+                if n and str(n['type'] or '') == 'metadata_proposed' and int(n['comment_id'] or 0) == int(proposal_id):
+                    REGISTRATION_DB.mark_notification_read(notif_id_int, int(user['id']))
+            except Exception:
+                pass
         q = urllib.parse.quote(msg)
+        if from_notifications:
+            return self._redirect(f'/manage/notifications?msg={q}&msg_type={"success" if ok else "error"}')
         return self._redirect(f'/manage/torrent/{str(p["info_hash"]).lower()}?msg={q}&msg_type={"success" if ok else "error"}')
 
     def _post_metadata_reject(self):
@@ -13443,14 +14391,23 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
+        from_notifications = (fields.get('from_notifications', '0') or '').strip() == '1'
         proposal_id = fields.get('proposal_id', '').strip()
+        notif_id = fields.get('notif_id', '').strip()
+        notif_id_int = int(notif_id) if notif_id.isdigit() else 0
         if not proposal_id.isdigit():
+            if from_notifications:
+                return self._redirect('/manage/notifications')
             return self._redirect('/manage/dashboard')
         p = REGISTRATION_DB.get_metadata_proposal(int(proposal_id))
         if not p:
+            if from_notifications:
+                return self._redirect('/manage/notifications')
             return self._redirect('/manage/dashboard')
         t = REGISTRATION_DB.get_torrent(str(p['info_hash'] or '').upper())
         if not self._can_moderate_metadata_for_torrent(user, t):
+            if from_notifications:
+                return self._redirect('/manage/notifications?msg=Not+authorized+for+this+metadata+proposal.&msg_type=error')
             return self._redirect(f'/manage/torrent/{str(p["info_hash"]).lower()}')
         ok, msg = REGISTRATION_DB.resolve_metadata_proposal(
             int(proposal_id), int(user['id']), user['username'],
@@ -13458,7 +14415,16 @@ class ManageHandler(BaseHTTPRequestHandler):
         )
         if ok:
             REGISTRATION_DB.notify_metadata_decision(int(proposal_id), 'rejected', user['username'])
+        if from_notifications and notif_id_int > 0:
+            try:
+                n = REGISTRATION_DB.get_notification(notif_id_int, int(user['id']))
+                if n and str(n['type'] or '') == 'metadata_proposed' and int(n['comment_id'] or 0) == int(proposal_id):
+                    REGISTRATION_DB.mark_notification_read(notif_id_int, int(user['id']))
+            except Exception:
+                pass
         q = urllib.parse.quote(msg)
+        if from_notifications:
+            return self._redirect(f'/manage/notifications?msg={q}&msg_type={"success" if ok else "error"}')
         return self._redirect(f'/manage/torrent/{str(p["info_hash"]).lower()}?msg={q}&msg_type={"success" if ok else "error"}')
 
     def _post_metadata_revoke(self):
@@ -15590,7 +16556,54 @@ class ManageHandler(BaseHTTPRequestHandler):
                 else:
                     url = '/manage/admin?tab=security'
             else:
-                if n['type'] == 'metadata_proposed':
+                if n['type'] in (
+                    'torrent_report_open', 'torrent_report_high', 'torrent_report_update',
+                    'torrent_report_opened', 'torrent_report_reviewing',
+                    'torrent_report_resolved', 'torrent_report_dismissed',
+                    'torrent_report_assigned', 'torrent_report_noted', 'torrent_report_noted_assignee',
+                    'torrent_report_assigned_to_reporter', 'torrent_report_unassigned_from_reporter',
+                    'torrent_report_open_generic', 'torrent_report_reviewing_generic',
+                    'torrent_report_resolved_generic', 'torrent_report_dismissed_generic',
+                    'torrent_report_assigned_generic', 'torrent_report_unassigned_generic'
+                ):
+                    rid = int(n['comment_id'] or 0)
+                    icon = '🚨' if n['type'] == 'torrent_report_high' else ('✅' if n['type'] in ('torrent_report_resolved', 'torrent_report_resolved_generic') else '🚩')
+                    report_labels = {
+                        'torrent_report_open': 'filed a torrent report',
+                        'torrent_report_high': 'filed a HIGH priority report',
+                        'torrent_report_update': 'updated a torrent report',
+                        'torrent_report_opened': 'has opened your torrent report',
+                        'torrent_report_reviewing': 'is reviewing your torrent report',
+                        'torrent_report_resolved': 'has resolved your torrent report',
+                        'torrent_report_dismissed': 'has dismissed your torrent report',
+                        'torrent_report_assigned': 'updated assignment on your torrent report',
+                        'torrent_report_noted': 'added a note to torrent report',
+                        'torrent_report_noted_assignee': 'added a note to your assigned report',
+                        'torrent_report_assigned_to_reporter': 'has been assigned to your torrent report',
+                        'torrent_report_unassigned_from_reporter': 'has been unassigned from your torrent report',
+                        'torrent_report_open_generic': 'opened a torrent report',
+                        'torrent_report_reviewing_generic': 'is reviewing a torrent report',
+                        'torrent_report_resolved_generic': 'resolved a torrent report',
+                        'torrent_report_dismissed_generic': 'dismissed a torrent report',
+                        'torrent_report_assigned_generic': 'assigned a torrent report',
+                        'torrent_report_unassigned_generic': 'unassigned a torrent report',
+                    }
+                    label = report_labels.get(n['type'], 'updated a torrent report')
+                    if n['type'] in ('torrent_report_assigned_to_reporter', 'torrent_report_assigned_generic'):
+                        assignee = ''
+                        if rid > 0 and REGISTRATION_DB:
+                            rinfo = REGISTRATION_DB.get_torrent_report(rid)
+                            assignee = str((rinfo or {}).get('assigned_username') or '').strip()
+                        assignee_disp = assignee or 'a moderator'
+                        if n['type'] == 'torrent_report_assigned_to_reporter':
+                            label = f'has assigned {assignee_disp} to your torrent report'
+                        else:
+                            label = f'assigned {assignee_disp} to torrent report'
+                    if _can_open_report_detail(user, rid):
+                        url = f'/manage/admin/report/{rid}'
+                    else:
+                        url = f'/manage/torrent/{n["info_hash"].lower()}#torrent-report'
+                elif n['type'] == 'metadata_proposed':
                     icon = '🧩'
                     label = 'proposed metadata for your torrent'
                     anchor = f'#metadata-pending-{int(n["comment_id"] or 0)}' if int(n['comment_id'] or 0) > 0 else '#metadata'
@@ -17400,6 +18413,19 @@ def _pw_requirements_html(settings: dict) -> str:
             f'<ul style="margin:0;padding-left:18px;line-height:1.8">{items}</ul></div>')
 
 
+def _can_open_report_detail(user: dict, report_id: int) -> bool:
+    rid = int(report_id or 0)
+    if rid <= 0:
+        return False
+    role = _user_role(user)
+    if role in ('super', 'admin'):
+        return True
+    if role != 'editor' or not REGISTRATION_DB:
+        return False
+    report = REGISTRATION_DB.get_torrent_report(rid)
+    return bool(report and str(report['reason'] or '') == 'bad_metadata')
+
+
 def _render_signup(msg: str = '', pw_settings: dict | None = None,
                    invite_code: str = '', invited_by: str = '') -> str:
     pw_req_html = _pw_requirements_html(pw_settings or {}) if pw_settings else ''
@@ -18201,6 +19227,10 @@ def _event_context_detail_html(detail_raw: str) -> str:
             bid = token.split('=', 1)[1]
             if bid.isdigit():
                 repl = f'bounty_id=<a href="/manage/bounty/{bid}" class="user-link">{_h(bid)}</a>'
+        elif token.startswith('report_id='):
+            rid = token.split('=', 1)[1]
+            if rid.isdigit():
+                repl = f'report_id=<a href="/manage/admin/report/{rid}" class="user-link">{_h(rid)}</a>'
         elif token.startswith('info_hash='):
             ih = token.split('=', 1)[1]
             linked = _event_context_torrent_link(ih)
@@ -18383,6 +19413,132 @@ def _render_admin_security_event_detail(user, event: dict, ban: dict | None, act
     return _manage_page(f'Security Event #{event_id}', body, user=user, msg=msg, msg_type=msg_type)
 
 
+def _render_admin_report_detail(user, report: dict, actions: list, moderators: list,
+                                back_url: str = '/manage/admin?tab=reports',
+                                msg: str = '', msg_type: str = 'error',
+                                csrf_token: str = '') -> str:
+    report_id = int(report.get('id') or 0)
+    safe_back = back_url if (back_url or '').startswith('/manage/admin') else '/manage/admin?tab=reports'
+    status = str(report.get('status') or 'open')
+    severity = str(report.get('severity') or 'normal')
+    severity_color = 'var(--danger)' if severity == 'high' else 'var(--accent)'
+    reason = _h(str(report.get('reason') or ''))
+    notes = _h(str(report.get('notes') or '--'))
+    info_hash = _h(str(report.get('info_hash') or ''))
+    torrent_name = _h(str(report.get('torrent_name') or '(unknown torrent)'))
+    owner_username = _h(str(report.get('owner_username') or '--'))
+    reporter_username = _h(str(report.get('reporter_username') or '--'))
+    owner_cell = (f'<a href="/manage/user/{owner_username}" class="user-link">{owner_username}</a>'
+                  if owner_username and owner_username != '--' else '--')
+    reporter_cell = (f'<a href="/manage/user/{reporter_username}" class="user-link">{reporter_username}</a>'
+                     if reporter_username and reporter_username != '--' else '--')
+    assigned_uid = int(report.get('assigned_user_id') or 0)
+    assigned_username = _h(str(report.get('assigned_username') or '--'))
+    csrf = csrf_token or ''
+    status_rows = ''
+    for target in ('open', 'in_review', 'resolved', 'dismissed'):
+        status_rows += (
+            '<form method="POST" action="/manage/admin/report/action" style="display:inline">'
+            f'<input type="hidden" name="report_id" value="{report_id}">'
+            f'<input type="hidden" name="action" value="{target}">'
+            f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+            f'<button class="btn btn-sm {"btn-primary" if status == target else ""}">{_h(target)}</button>'
+            '</form>'
+        )
+    assign_options = '<option value="0">-- Unassigned --</option>'
+    for m in moderators:
+        uid = int(m.get('id') or 0)
+        uname = _h(str(m.get('username') or ''))
+        assign_options += f'<option value="{uid}"{" selected" if assigned_uid == uid else ""}>{uname}</option>'
+    action_rows = ''
+    for a in actions:
+        when = _h(str(a.get('created_at') or '')[:19].replace('T', ' '))
+        actor = _h(str(a.get('actor_username') or a.get('actor_username_current') or '--'))
+        action = _h(str(a.get('action') or ''))
+        from_status = _h(str(a.get('from_status') or ''))
+        to_status = _h(str(a.get('to_status') or ''))
+        note = _h(str(a.get('note') or ''))
+        transition = f'{from_status} → {to_status}' if (from_status or to_status) else '--'
+        action_rows += (
+            '<tr>'
+            f'<td class="hash" style="white-space:nowrap">{when}</td>'
+            f'<td>{actor}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem">{action}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem">{transition}</td>'
+            f'<td style="word-break:break-word">{note}</td>'
+            '</tr>'
+        )
+    if not action_rows:
+        action_rows = '<tr><td colspan="5" class="empty">No actions recorded</td></tr>'
+    body = f'''
+  <div class="page-title">Torrent Report Detail</div>
+  <div class="page-sub">
+    Moderation workflow view &nbsp;·&nbsp;
+    <a href="{_h(safe_back)}" style="color:var(--muted);text-decoration:none;font-size:0.85rem">&#10094; Back to Reports</a>
+  </div>
+  <div class="card" style="margin-bottom:14px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+      <div class="card-title" style="margin:0;border:0;padding:0">Report #{report_id}</div>
+      <div class="actions">
+        <button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(f'/manage/admin/report/{report_id}')})">&#128279; Copy URL</button>
+        <a class="btn btn-sm" href="{_h(safe_back)}">&#10094; Back</a>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div style="display:grid;grid-template-columns:minmax(170px,230px) 1fr;gap:10px 14px;align-items:start">
+      <div class="hash">Report ID</div><div class="hash">{report_id}</div>
+      <div class="hash">Created</div><div>{_h(str(report.get('created_at') or '')[:19].replace('T',' '))}</div>
+      <div class="hash">Severity</div><div style="color:{severity_color};font-family:var(--mono);font-size:0.76rem;text-transform:uppercase">{_h(severity)}</div>
+      <div class="hash">Reason</div><div style="font-family:var(--mono);font-size:0.76rem">{reason}</div>
+      <div class="hash">Status</div><div style="font-family:var(--mono);font-size:0.76rem;text-transform:uppercase">{_h(status)}</div>
+      <div class="hash">Reporter</div><div>{reporter_cell}</div>
+      <div class="hash">Owner</div><div>{owner_cell}</div>
+      <div class="hash">Assigned</div><div>{assigned_username}</div>
+      <div class="hash">Torrent</div><div><a href="/manage/torrent/{info_hash.lower()}" class="user-link">{torrent_name}</a><div class="hash" style="margin-top:4px">{info_hash}</div></div>
+      <div class="hash">Notes</div><div style="white-space:pre-wrap">{notes}</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Status</div>
+    <div class="actions">{status_rows}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Assignment</div>
+    <form method="POST" action="/manage/admin/report/action" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+      <input type="hidden" name="report_id" value="{report_id}">
+      <input type="hidden" name="action" value="assign">
+      <input type="hidden" name="_csrf" value="{_h(csrf)}">
+      <div class="form-group" style="margin:0;min-width:220px">
+        <label>Moderator</label>
+        <select name="assign_user_id">{assign_options}</select>
+      </div>
+      <button class="btn btn-sm btn-primary" type="submit">Set Assignment</button>
+    </form>
+  </div>
+  <div class="card">
+    <div class="card-title">Add Note</div>
+    <form method="POST" action="/manage/admin/report/action" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+      <input type="hidden" name="report_id" value="{report_id}">
+      <input type="hidden" name="action" value="note">
+      <input type="hidden" name="_csrf" value="{_h(csrf)}">
+      <div class="form-group" style="margin:0;min-width:320px;flex:1">
+        <label>Moderator note</label>
+        <input type="text" name="note" maxlength="500" placeholder="Investigation update">
+      </div>
+      <button class="btn btn-sm" type="submit">Add Note</button>
+    </form>
+  </div>
+  <div class="card">
+    <div class="card-title">Action Timeline</div>
+    <div class="table-wrap"><table>
+      <tr><th scope="col">Time</th><th scope="col">Actor</th><th scope="col">Action</th><th scope="col">Transition</th><th scope="col">Note</th></tr>
+      {action_rows}
+    </table></div>
+  </div>'''
+    return _manage_page(f'Report #{report_id}', body, user=user, msg=msg, msg_type=msg_type)
+
+
 def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   trackers: list, settings: dict,
                   msg: str = '', msg_type: str = 'error',
@@ -18395,10 +19551,15 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   security_events: list | None = None, security_bans: list | None = None, spage: int = 1,
                   security_total_pages: int = 1, security_total: int = 0,
                   security_pp: int = 50, strigger: str = '', sstatus: str = '',
-                  sip: str = '', sview: str = 'events') -> str:
+                  sip: str = '', sview: str = 'events',
+                  reports: list | None = None, rpage: int = 1, reports_total_pages: int = 1,
+                  reports_total: int = 0, reports_pp: int = 50, rstatus: str = '',
+                  rseverity: str = '', rreason: str = '', rreporter: str = '',
+                  rih: str = '', rowner: str = '') -> str:
     is_super = user['username'] == SUPER_USER
     security_events = security_events or []
     security_bans = security_bans or []
+    reports = reports or []
     sview = sview if sview in ('events', 'bans') else 'events'
 
     # ── Tracker rows ─────────────────────────────────────────────
@@ -19755,6 +20916,22 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     sec_start = ((spage - 1) * security_pp) + 1 if security_total else 0
     sec_end = min(security_total, spage * security_pp) if security_total else 0
     sec_range_label = f'{sec_start}-{sec_end}' if security_total else '0'
+    report_page_params = [('tab', 'reports')]
+    if rstatus:
+        report_page_params.append(('rstatus', rstatus))
+    if rseverity:
+        report_page_params.append(('rseverity', rseverity))
+    if rreason:
+        report_page_params.append(('rreason', rreason))
+    if rreporter:
+        report_page_params.append(('rreporter', rreporter))
+    if rih:
+        report_page_params.append(('rih', rih))
+    if rowner:
+        report_page_params.append(('rowner', rowner))
+    report_page_base = '/manage/admin?' + urllib.parse.urlencode(report_page_params)
+    report_back_url = report_page_base + (f'&rpage={int(rpage)}' if int(rpage) > 1 else '')
+    report_back_enc = urllib.parse.quote(report_back_url, safe='')
     sec_rows = ''
     for se in security_events:
         sev = _h(se.get('severity', ''))
@@ -19834,6 +21011,45 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         '<th scope="col">Actions</th>'
     )
     sec_table_rows = sec_rows if sview == 'events' else sec_ban_rows
+    reports_range_start = ((rpage - 1) * reports_pp + 1) if reports_total > 0 else 0
+    reports_range_end = min(rpage * reports_pp, reports_total) if reports_total > 0 else 0
+    reports_range_label = (f'{reports_range_start}-{reports_range_end}'
+                           if reports_total > 0 else '0-0')
+    report_rows = ''
+    for rr in reports:
+        rid = int(rr.get('id') or 0)
+        created = _h(str(rr.get('created_at') or '')[:19].replace('T', ' '))
+        severity = str(rr.get('severity') or 'normal').lower()
+        sev_color = 'var(--danger)' if severity == 'high' else 'var(--accent)'
+        sev_label = 'HIGH' if severity == 'high' else 'NORMAL'
+        reason = _h(str(rr.get('reason') or ''))
+        status = _h(str(rr.get('status') or 'open'))
+        ih = _h(str(rr.get('info_hash') or ''))
+        reporter = _h(str(rr.get('reporter_username') or ''))
+        owner = _h(str(rr.get('owner_username') or '--'))
+        assignee = _h(str(rr.get('assigned_username') or '--'))
+        reporter_cell = (f'<a href="/manage/user/{reporter}" class="user-link">{reporter}</a>'
+                         if reporter else '--')
+        owner_cell = (f'<a href="/manage/user/{owner}" class="user-link">{owner}</a>'
+                      if owner and owner != '--' else '--')
+        tname = _h(str(rr.get('torrent_name') or '')[:120])
+        detail_link = f'/manage/admin/report/{rid}?back={report_back_enc}'
+        torrent_link = f'/manage/torrent/{str(rr.get("info_hash") or "").lower()}'
+        report_rows += (
+            '<tr>'
+            f'<td class="hash" style="white-space:nowrap">{created}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.72rem;text-transform:uppercase;color:{sev_color}">{sev_label}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem">{reason}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem;text-transform:uppercase">{status}</td>'
+            f'<td><a href="{torrent_link}" class="user-link">{tname}</a><div class="hash" style="margin-top:4px">{ih}</div></td>'
+            f'<td>{reporter_cell}</td>'
+            f'<td>{owner_cell}</td>'
+            f'<td>{assignee}</td>'
+            f'<td><a href="{detail_link}" class="btn btn-sm">View &#8594;</a></td>'
+            '</tr>'
+        )
+    if not report_rows:
+        report_rows = '<tr><td colspan="9" class="empty">No reports found</td></tr>'
 
     _tab_settings  = ('<button class="tab" onclick="showTab(\'settings\',this)">Settings</button>'
                       if is_super else '')
@@ -19848,7 +21064,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _tab_danger    = ('<button class="tab tab-danger" onclick="showTab(\'danger\',this)"'
                       '>Danger</button>'
                       if is_super else '')
-    _tab_names = ['torrents','users','adduser','trackers','settings','database','economy','topups','invites','danger','events','security']
+    _tab_names = ['torrents','users','adduser','trackers','settings','database','economy','topups','invites','danger','events','security','reports']
     if tab and tab in _tab_names:
         _safe_tab = tab.replace("'", '')
         _autotab_js = (
@@ -19869,6 +21085,13 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                        'for(var i=0;i<els.length;i++){'
                        'var oc=els[i].getAttribute("onclick")||"";'
                        'if(oc.indexOf("showTab(\'events\'")!==-1){els[i].click();break;}'
+                       '}})</script>')
+    elif rpage > 1:
+        _autotab_js = ('<script>window.addEventListener("DOMContentLoaded",function(){'
+                       'var els=document.querySelectorAll(".tab");'
+                       'for(var i=0;i<els.length;i++){'
+                       'var oc=els[i].getAttribute("onclick")||"";'
+                       'if(oc.indexOf("showTab(\'reports\'")!==-1){els[i].click();break;}'
                        '}})</script>')
     else:
         _autotab_js = ''
@@ -19958,6 +21181,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     {_tab_danger}
     <button class="tab" onclick="showTab('events',this)">Event Log</button>
     <button class="tab" onclick="showTab('security',this)">Security</button>
+    <button class="tab" onclick="showTab('reports',this)">Reports</button>
   </div>
 
   <div class="panel visible" id="panel-torrents">
@@ -20136,6 +21360,83 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <tbody>{sec_table_rows}</tbody>
       </table></div>
       {_pagination_html(spage, security_total_pages, sec_page_base, page_param='spage')}
+    </div>
+  </div>
+
+  <div class="panel" id="panel-reports">
+    <div class="card">
+      <div class="card-title">Torrent Reports
+        <span style="color:var(--muted);font-size:0.78rem;font-weight:400;margin-left:8px">
+          {reports_total} matching · showing {reports_range_label} · page {rpage}/{reports_total_pages}
+        </span>
+      </div>
+      <form method="GET" action="/manage/admin" style="margin-bottom:16px">
+        <input type="hidden" name="tab" value="reports">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <div class="form-group" style="margin:0;min-width:120px">
+            <label style="font-size:0.75rem">Status</label>
+            <select name="rstatus" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+              <option value=""{' selected' if not rstatus else ''}>all</option>
+              <option value="open"{' selected' if rstatus == 'open' else ''}>open</option>
+              <option value="in_review"{' selected' if rstatus == 'in_review' else ''}>in_review</option>
+              <option value="resolved"{' selected' if rstatus == 'resolved' else ''}>resolved</option>
+              <option value="dismissed"{' selected' if rstatus == 'dismissed' else ''}>dismissed</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0;min-width:120px">
+            <label style="font-size:0.75rem">Severity</label>
+            <select name="rseverity" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+              <option value=""{' selected' if not rseverity else ''}>all</option>
+              <option value="high"{' selected' if rseverity == 'high' else ''}>high</option>
+              <option value="normal"{' selected' if rseverity == 'normal' else ''}>normal</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0;min-width:120px">
+            <label style="font-size:0.75rem">Reason</label>
+            <select name="rreason" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+              <option value=""{' selected' if not rreason else ''}>all</option>
+              <option value="bad_metadata"{' selected' if rreason == 'bad_metadata' else ''}>bad_metadata</option>
+              <option value="copyright"{' selected' if rreason == 'copyright' else ''}>copyright</option>
+              <option value="spam"{' selected' if rreason == 'spam' else ''}>spam</option>
+              <option value="abuse"{' selected' if rreason == 'abuse' else ''}>abuse</option>
+              <option value="csam"{' selected' if rreason == 'csam' else ''}>csam</option>
+              <option value="other"{' selected' if rreason == 'other' else ''}>other</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0;min-width:140px">
+            <label style="font-size:0.75rem">Reporter</label>
+            <input type="text" name="rreporter" value="{_h(rreporter)}" placeholder="e.g. cathy"
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <div class="form-group" style="margin:0;min-width:160px">
+            <label style="font-size:0.75rem">Info hash</label>
+            <input type="text" name="rih" value="{_h(rih)}" placeholder="A1B2..."
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <div class="form-group" style="margin:0;min-width:130px">
+            <label style="font-size:0.75rem">Owner</label>
+            <input type="text" name="rowner" value="{_h(rowner)}" placeholder="uploader"
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <button type="submit" class="btn btn-primary" style="white-space:nowrap">🔍 Search</button>
+          <a href="/manage/admin?tab=reports" class="btn" style="white-space:nowrap">✕ Clear</a>
+        </div>
+      </form>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th scope="col" style="white-space:nowrap;width:140px">Time</th>
+          <th scope="col" style="width:90px">Severity</th>
+          <th scope="col" style="width:120px">Reason</th>
+          <th scope="col" style="width:110px">Status</th>
+          <th scope="col">Torrent</th>
+          <th scope="col" style="width:110px">Reporter</th>
+          <th scope="col" style="width:110px">Owner</th>
+          <th scope="col" style="width:110px">Assigned</th>
+          <th scope="col" style="width:90px">Actions</th>
+        </tr></thead>
+        <tbody>{report_rows}</tbody>
+      </table></div>
+      {_pagination_html(rpage, reports_total_pages, report_page_base, page_param='rpage')}
     </div>
   </div>'''
     return _manage_page('Admin Panel', body, user=user, msg=msg, msg_type=msg_type)
@@ -20837,7 +22138,7 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
     return _manage_page('📬 Conversation', body, user=viewer)
 
 
-def _render_notifications_page(viewer) -> str:
+def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -> str:
     if not REGISTRATION_DB:
         return _manage_page('Notifications', '<p>Unavailable</p>', user=viewer)
     notifs = REGISTRATION_DB.get_all_notifications(viewer['id'])
@@ -20975,7 +22276,73 @@ def _render_notifications_page(viewer) -> str:
                 f'</div>'
             )
         else:
-            if n['type'] == 'metadata_proposed':
+            if n['type'] in (
+                'torrent_report_open', 'torrent_report_high', 'torrent_report_update',
+                'torrent_report_opened', 'torrent_report_reviewing',
+                'torrent_report_resolved', 'torrent_report_dismissed',
+                'torrent_report_assigned', 'torrent_report_noted', 'torrent_report_noted_assignee',
+                'torrent_report_assigned_to_reporter', 'torrent_report_unassigned_from_reporter',
+                'torrent_report_open_generic', 'torrent_report_reviewing_generic',
+                'torrent_report_resolved_generic', 'torrent_report_dismissed_generic',
+                'torrent_report_assigned_generic', 'torrent_report_unassigned_generic'
+            ):
+                rid = int(n['comment_id'] or 0)
+                icon = '🚨' if n['type'] == 'torrent_report_high' else ('✅' if n['type'] in ('torrent_report_resolved', 'torrent_report_resolved_generic') else '🚩')
+                report_labels = {
+                    'torrent_report_open': 'filed a torrent report on',
+                    'torrent_report_high': 'filed a HIGH priority report on',
+                    'torrent_report_update': 'updated a torrent report on',
+                    'torrent_report_opened': 'has opened your torrent report on',
+                    'torrent_report_reviewing': 'is reviewing your torrent report on',
+                    'torrent_report_resolved': 'has resolved your torrent report on',
+                    'torrent_report_dismissed': 'has dismissed your torrent report on',
+                    'torrent_report_assigned': 'updated assignment on your torrent report for',
+                    'torrent_report_noted': 'added a note to torrent report on',
+                    'torrent_report_noted_assignee': 'added a note to your assigned report on',
+                    'torrent_report_assigned_to_reporter': 'has been assigned to your torrent report on',
+                    'torrent_report_unassigned_from_reporter': 'has been unassigned from your torrent report on',
+                    'torrent_report_open_generic': 'opened a torrent report on',
+                    'torrent_report_reviewing_generic': 'is reviewing a torrent report on',
+                    'torrent_report_resolved_generic': 'resolved a torrent report on',
+                    'torrent_report_dismissed_generic': 'dismissed a torrent report on',
+                    'torrent_report_assigned_generic': 'assigned a torrent report on',
+                    'torrent_report_unassigned_generic': 'unassigned a torrent report on',
+                }
+                label = report_labels.get(n['type'], 'updated a torrent report on')
+                label_html = _h(label)
+                if n['type'] in ('torrent_report_assigned_to_reporter', 'torrent_report_assigned_generic'):
+                    assignee = ''
+                    if rid > 0 and REGISTRATION_DB:
+                        rinfo = REGISTRATION_DB.get_torrent_report(rid)
+                        assignee = str((rinfo or {}).get('assigned_username') or '').strip()
+                    if assignee:
+                        assignee_h = _h(assignee)
+                        assignee_url = f'/manage/user/{urllib.parse.quote(assignee)}'
+                        assignee_disp_html = f'<a href="{assignee_url}" class="user-link">{assignee_h}</a>'
+                    else:
+                        assignee_disp_html = 'a moderator'
+                    if n['type'] == 'torrent_report_assigned_to_reporter':
+                        label_html = f'has assigned {assignee_disp_html} to your torrent report on'
+                    else:
+                        label_html = f'assigned {assignee_disp_html} to torrent report on'
+                if _can_open_report_detail(viewer, rid):
+                    url = f'/manage/admin/report/{rid}'
+                else:
+                    url = f'/manage/torrent/{n["info_hash"].lower()}#torrent-report'
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">{icon}</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' {label_html} '
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                    f'</div>'
+                )
+            elif n['type'] == 'metadata_proposed':
                 pid = int(n['comment_id'] or 0)
                 url = f'/manage/torrent/{n["info_hash"].lower()}#metadata-pending-{pid}' if pid > 0 else f'/manage/torrent/{n["info_hash"].lower()}#metadata'
                 read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
@@ -20983,23 +22350,46 @@ def _render_notifications_page(viewer) -> str:
                 if pid > 0:
                     p = REGISTRATION_DB.get_metadata_proposal(pid)
                     can_mod = False
+                    source_link = ''
                     if p:
                         t = REGISTRATION_DB.get_torrent(str(p['info_hash'] or '').upper())
                         vrole = _user_role(viewer)
                         can_mod = (vrole in ('super', 'admin') or
                                    (vrole == 'editor' and REGISTRATION_DB.get_metadata_config().get('allow_editor_override', True)) or
                                    (t and int(t['uploaded_by_id'] or 0) == int(viewer['id'])))
+                        provider = str(p['provider'] or '').strip().lower()
+                        ext_id = str(p['proposed_id'] or '').strip()
+                        proposed_url = str(p['proposed_url'] or '').strip()
+                        meta_url = proposed_url
+                        if not meta_url and ext_id:
+                            if provider == 'imdb':
+                                meta_url = f'https://www.imdb.com/title/{ext_id}/'
+                            elif provider == 'tvmaze':
+                                meta_url = f'https://www.tvmaze.com/shows/{ext_id}'
+                            elif provider == 'steam':
+                                meta_url = f'https://store.steampowered.com/app/{ext_id}/'
+                        if meta_url:
+                            src_label = {'imdb': 'IMDb', 'tvmaze': 'TVMaze', 'steam': 'Steam'}.get(provider, 'Source')
+                            source_link = (
+                                f'<a class="btn btn-sm" href="{_h(meta_url)}" target="_blank" rel="noopener noreferrer" '
+                                f'title="Open proposed metadata source in new tab">Open {src_label} ↗</a>'
+                            )
                     if can_mod:
                         actions = (
                             '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
                             f'<form method="POST" action="/manage/metadata/approve" style="display:inline">'
                             f'<input type="hidden" name="proposal_id" value="{pid}">'
+                            '<input type="hidden" name="from_notifications" value="1">'
+                            f'<input type="hidden" name="notif_id" value="{n_id}">'
                             f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
                             '<button class="btn btn-sm btn-green">Approve</button></form>'
                             f'<form method="POST" action="/manage/metadata/reject" style="display:inline">'
                             f'<input type="hidden" name="proposal_id" value="{pid}">'
+                            '<input type="hidden" name="from_notifications" value="1">'
+                            f'<input type="hidden" name="notif_id" value="{n_id}">'
                             f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
                             '<button class="btn btn-sm btn-danger">Reject</button></form>'
+                            f'{source_link}'
                             f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
                             '</div>'
                         )
@@ -21145,7 +22535,7 @@ def _render_notifications_page(viewer) -> str:
         f'</div>'
         f'{rows}'
     )
-    return _manage_page('Notifications', body, user=viewer)
+    return _manage_page('Notifications', body, user=viewer, msg=msg, msg_type=msg_type)
 
 
 def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: str = '',
@@ -21225,7 +22615,8 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     peer_cfg = REGISTRATION_DB.get_peer_query_config() if REGISTRATION_DB else {'active': False}
     peer_update_btn = ''
     if peer_cfg.get('active'):
-        rem = _peer_refresh_remaining_seconds(t)
+        peer_privileged = vrole in ('super', 'admin')
+        rem = 0 if peer_privileged else _peer_refresh_remaining_seconds(t)
         if rem > 0:
             h = rem // 3600
             m = (rem % 3600) // 60
@@ -21243,6 +22634,40 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 f'<button type="submit" class="btn btn-green">Refresh Seeds/Peers</button>'
                 f'</form>'
             )
+    metadata_update_btn = ''
+    if REGISTRATION_DB:
+        meta_cfg_action = REGISTRATION_DB.get_metadata_config()
+        if meta_cfg_action.get('enabled', True) and meta_cfg_action.get('fetch_enabled', True):
+            active_meta_for_refresh = REGISTRATION_DB.list_active_metadata_links(ih)
+            if active_meta_for_refresh:
+                is_meta_privileged = vrole in ('super', 'admin')
+                rem = REGISTRATION_DB.get_metadata_refresh_remaining_seconds(
+                    ih, is_privileged=is_meta_privileged
+                )
+                if rem > 0:
+                    h = rem // 3600
+                    m = (rem % 3600) // 60
+                    metadata_update_btn = (
+                        f'<button type="button" class="btn btn-sm btn-accent-rev" disabled '
+                        f'style="opacity:0.95;cursor:not-allowed" '
+                        f'title="Available in {h}h {m}m">'
+                        f'Refresh Metadata ({h}h {m}m)</button>'
+                    )
+                else:
+                    metadata_update_btn = (
+                        f'<form method="POST" action="/manage/torrent/update-metadata" style="display:inline">'
+                        f'<input type="hidden" name="info_hash" value="{ih}">'
+                        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                        f'<button type="submit" class="btn btn-sm btn-accent-rev">Refresh Metadata</button>'
+                        f'</form>'
+                    )
+            else:
+                metadata_update_btn = (
+                    '<button type="button" class="btn btn-sm btn-accent-rev" disabled '
+                    'style="opacity:0.75;cursor:not-allowed" '
+                    'title="No active metadata linked">'
+                    'Refresh Metadata</button>'
+                )
 
     # Delete button
     del_btn = ''
@@ -21337,6 +22762,29 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         '</form>'
         '</div>'
         '</div>'
+    )
+    report_controls = (
+        '<details id="torrent-report" style="width:100%;padding-bottom:10px;margin-bottom:2px;border-bottom:1px solid var(--border)">'
+        '<summary style="cursor:pointer;list-style:none;font-family:var(--mono);font-size:0.76rem;'
+        'letter-spacing:0.08em;text-transform:uppercase;color:var(--accent2);padding:4px 0">🚩 Report Torrent</summary>'
+        '<form method="POST" action="/manage/torrent/report" style="margin-top:10px;display:flex;flex-direction:column;gap:8px;width:100%">'
+        f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
+        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+        '<label style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">Reason'
+        '<select name="reason" required style="width:100%;padding:8px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">'
+        '<option value="bad_metadata">Bad metadata</option>'
+        '<option value="copyright">Copyright</option>'
+        '<option value="spam">Spam</option>'
+        '<option value="abuse">Abuse</option>'
+        '<option value="csam">CSAM</option>'
+        '<option value="other">Other</option>'
+        '</select></label>'
+        '<label style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">Notes (optional, required for Other)'
+        '<textarea name="notes" maxlength="1000" rows="3" style="width:100%;padding:8px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem;resize:vertical"></textarea>'
+        '</label>'
+        '<button type="submit" class="btn btn-sm btn-danger" style="align-self:flex-start">Submit Report</button>'
+        '</form>'
+        '</details>'
     )
     metadata_card = ''
     if REGISTRATION_DB:
@@ -21493,7 +22941,13 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                     f'<button class="btn btn-sm btn-danger">Revoke</button>'
                     f'</form>'
                 )
-            poster_html = ''
+            poster_html = (
+                '<div style="width:120px;min-height:170px;border-radius:8px;'
+                'border:1px solid var(--border);display:flex;align-items:center;'
+                'justify-content:center;text-align:center;padding:8px;'
+                'color:var(--muted);font-size:0.74rem;line-height:1.35;'
+                'font-family:var(--mono);background:var(--card)">Poster not available</div>'
+            )
             if poster_url:
                 poster_html = (
                     f'<img src="{_h(poster_url)}" alt="Poster" loading="lazy" referrerpolicy="no-referrer" '
@@ -21666,7 +23120,10 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
 
         metadata_card = (
             '<div class="card" id="metadata">'
-            '<div class="card-title">Metadata</div>'
+            '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">'
+            '<div class="card-title" style="margin:0">Metadata</div>'
+            '<a href="#torrent-report" class="btn btn-sm btn-danger">Report Torrent</a>'
+            '</div>'
             + ('<div style="color:var(--danger);font-size:0.84rem">Metadata features are disabled by configuration.</div>' if not meta_enabled else '')
             + (f'<div style="margin-bottom:14px">{propose_controls}</div>' if propose_controls else '')
             + '<div style="display:flex;flex-direction:column;gap:14px">'
@@ -21729,9 +23186,11 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     <div class="card">
       <div class="card-title">Actions</div>
       <div style="display:flex;flex-direction:column;gap:12px;align-items:flex-start">
+        {report_controls}
         {vote_controls}
         <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet Link</button>
         {peer_update_btn}
+        {metadata_update_btn}
         {del_btn}
         {lock_btn}
         {del_comments_btn}
