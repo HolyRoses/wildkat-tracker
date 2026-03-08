@@ -6799,11 +6799,15 @@ class RegistrationDB:
                 c.execute('DELETE FROM torrents WHERE info_hash=?', (ih_upper,))
                 c.commit()
                 self._log(actor, 'delete_torrent', ih_upper, torrent_name)
-                return
+                return True, ''
             except sqlite3.OperationalError as e:
                 if 'locked' in str(e) and attempt < 4:
                     time.sleep(0.25 * (attempt + 1))
                     continue
+                if 'locked' in str(e):
+                    log.warning('delete_torrent lock after retries (non-fatal): ih=%s actor=%s err=%s',
+                                ih_upper, actor, e)
+                    return False, 'Database is busy, please retry deleting this torrent.'
                 raise
 
     def backup_to_bytes(self) -> bytes:
@@ -13284,7 +13288,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             t = REGISTRATION_DB.get_torrent(ih)
             if not t or t['uploaded_by_id'] != user['id']:
                 return self._redirect('/manage/dashboard')
-        REGISTRATION_DB.delete_torrent(ih, user['username'])
+        ok, err = REGISTRATION_DB.delete_torrent(ih, user['username'])
+        if not ok:
+            q = urllib.parse.quote(err or 'Unable to delete torrent right now.')
+            if redirect and redirect.startswith('/manage') and not redirect.startswith('/manage/torrent'):
+                return self._redirect(f'{redirect}?msg={q}&msg_type=error')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
         log.info('REGISTRATION torrent deleted  ih=%s  by=%s', ih, user['username'])
         if redirect and redirect.startswith('/manage') and not redirect.startswith('/manage/torrent'):
             self._redirect(redirect)
