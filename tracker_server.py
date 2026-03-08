@@ -2717,7 +2717,6 @@ class RegistrationDB:
             'metadata_vote_enabled':    '1',
             'metadata_vote_window_hours': '24',
             'metadata_vote_min_unique_voters': '3',
-            'metadata_vote_min_net_score': '3',
             'metadata_auto_finalize_enabled': '1',
             'metadata_reward_proposer': '1.0',
             'metadata_reward_voter':    '0.25',
@@ -5246,7 +5245,6 @@ class RegistrationDB:
             'vote_enabled': settings.get('metadata_vote_enabled', '1') == '1',
             'vote_window_hours': _to_int('metadata_vote_window_hours', 24, 1, 168),
             'vote_min_unique_voters': _to_int('metadata_vote_min_unique_voters', 3, 1, 100),
-            'vote_min_net_score': _to_int('metadata_vote_min_net_score', 3, 1, 100),
             'auto_finalize_enabled': settings.get('metadata_auto_finalize_enabled', '1') == '1',
             'reward_proposer': _to_float('metadata_reward_proposer', 1.0, 0.0, 100.0),
             'reward_voter': _to_float('metadata_reward_voter', 0.25, 0.0, 100.0),
@@ -14490,7 +14488,6 @@ class ManageHandler(BaseHTTPRequestHandler):
             for key, default, lo, hi in [
                 ('metadata_vote_window_hours', '24', 1, 168),
                 ('metadata_vote_min_unique_voters', '3', 1, 100),
-                ('metadata_vote_min_net_score', '3', 1, 100),
                 ('metadata_fetch_timeout_sec', '5', 2, 20),
                 ('metadata_fetch_max_retries', '3', 1, 10),
                 ('metadata_fetch_per_cycle', '2', 1, 10),
@@ -18470,55 +18467,61 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
       <div class="card">
         <div class="card-title">Metadata Moderation</div>
         <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
-          Configure metadata proposal voting, auto-accept behavior, and reward tuning.
+          Configure metadata voting, auto-finalization, and reward tuning.
+          Finalization policy: no-vote proposals auto-approve; voted proposals auto-approve on net +1 or higher, otherwise auto-reject.
         </p>
         <form method="POST" action="/manage/admin/save-settings">
           <input type="hidden" name="form_id" value="metadata_moderation_settings">
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
             <input type="checkbox" name="metadata_enabled" value="1" {'checked' if settings.get('metadata_enabled','1')=='1' else ''}> Enable metadata feature
+            <span class="hash" title="Master switch for metadata proposals, active metadata cards, and moderation workflow.">[?]</span>
           </label>
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
             <input type="checkbox" name="metadata_vote_enabled" value="1" {'checked' if settings.get('metadata_vote_enabled','1')=='1' else ''}> Enable community voting
+            <span class="hash" title="Allows community members to upvote/downvote pending metadata proposals.">[?]</span>
           </label>
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
             <input type="checkbox" name="metadata_auto_finalize_enabled" value="1" {'checked' if settings.get('metadata_auto_finalize_enabled','1')=='1' else ''}> Enable auto-finalize / auto-accept
+            <span class="hash" title="At vote-window expiry: no votes = auto-approve; voted proposals with net +1 or higher = auto-approve; net 0 or lower = auto-reject.">[?]</span>
           </label>
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
             <input type="checkbox" name="metadata_allow_owner_auto_approve" value="1" {'checked' if settings.get('metadata_allow_owner_auto_approve','1')=='1' else ''}> Allow owner immediate approve
+            <span class="hash" title="When enabled, torrent owner proposals are approved immediately and skip community voting.">[?]</span>
           </label>
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
             <input type="checkbox" name="metadata_allow_editor_override" value="1" {'checked' if settings.get('metadata_allow_editor_override','1')=='1' else ''}> Allow editor moderation override
+            <span class="hash" title="When enabled, editors can immediately approve/reject/revoke metadata without waiting for votes.">[?]</span>
           </label>
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
             <input type="checkbox" name="metadata_allow_post_revoke" value="1" {'checked' if settings.get('metadata_allow_post_revoke','1')=='1' else ''}> Allow post-approve revoke
+            <span class="hash" title="Allows owner/editor/admin to revoke already-active metadata and replace it.">[?]</span>
           </label>
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:16px">
             <input type="checkbox" name="metadata_revoke_requires_reason" value="1" {'checked' if settings.get('metadata_revoke_requires_reason','1')=='1' else ''}> Require revoke reason
+            <span class="hash" title="Requires a reason when revoking active metadata so audits and events include context.">[?]</span>
           </label>
 
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px">
-            <div class="form-group"><label>Vote window (hours)</label>
+            <div class="form-group"><label>Vote window (hours) <span class="hash" title="How long a pending proposal stays open before auto-finalization runs.">[?]</span></label>
               <input type="number" name="metadata_vote_window_hours" value="{_h(settings.get('metadata_vote_window_hours','24'))}" min="1" max="168"></div>
-            <div class="form-group"><label>Min unique voters</label>
+            <div class="form-group"><label>Min unique voters <span class="hash" title="Minimum distinct voters required before immediate vote-time auto-decisions are allowed.">[?]</span></label>
               <input type="number" name="metadata_vote_min_unique_voters" value="{_h(settings.get('metadata_vote_min_unique_voters','3'))}" min="1" max="100"></div>
-            <div class="form-group"><label>Min net score</label>
-              <input type="number" name="metadata_vote_min_net_score" value="{_h(settings.get('metadata_vote_min_net_score','3'))}" min="1" max="100"></div>
-            <div class="form-group"><label>Fetch timeout (sec)</label>
+            <div class="form-group"><label>Fetch timeout (sec) <span class="hash" title="HTTP timeout for OMDb/TVMaze metadata fetch requests.">[?]</span></label>
               <input type="number" name="metadata_fetch_timeout_sec" value="{_h(settings.get('metadata_fetch_timeout_sec','5'))}" min="2" max="20"></div>
-            <div class="form-group"><label>Fetch max retries</label>
+            <div class="form-group"><label>Fetch max retries <span class="hash" title="Maximum retry attempts when external metadata fetch fails.">[?]</span></label>
               <input type="number" name="metadata_fetch_max_retries" value="{_h(settings.get('metadata_fetch_max_retries','3'))}" min="1" max="10"></div>
-            <div class="form-group"><label>Fetch per cycle</label>
+            <div class="form-group"><label>Fetch per cycle <span class="hash" title="How many queued metadata fetch jobs to process each maintenance cycle.">[?]</span></label>
               <input type="number" name="metadata_fetch_per_cycle" value="{_h(settings.get('metadata_fetch_per_cycle','2'))}" min="1" max="10"></div>
           </div>
 
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px">
-            <div class="form-group"><label>Reward proposer</label>
+            <div class="form-group"><label>Reward proposer <span class="hash" title="Micro reward credited when a proposal is approved. Converts to whole points via points_micro rollover.">[?]</span></label>
               <input type="number" step="0.01" name="metadata_reward_proposer" value="{_h(settings.get('metadata_reward_proposer','1.0'))}" min="0" max="100"></div>
-            <div class="form-group"><label>Reward voter</label>
+            <div class="form-group"><label>Reward voter <span class="hash" title="Micro reward per winning-side upvote when system/community approval happens.">[?]</span></label>
               <input type="number" step="0.01" name="metadata_reward_voter" value="{_h(settings.get('metadata_reward_voter','0.25'))}" min="0" max="100"></div>
-            <div class="form-group"><label>Reward daily cap</label>
+            <div class="form-group"><label>Reward daily cap <span class="hash" title="Maximum total metadata reward points a user can receive per day.">[?]</span></label>
               <input type="number" step="0.01" name="metadata_reward_daily_cap_points" value="{_h(settings.get('metadata_reward_daily_cap_points','5.0'))}" min="0" max="10000"></div>
-            <div class="form-group"><label>Max rewarded votes/day</label>
+            <div class="form-group"><label>Max rewarded votes/day <span class="hash" title="Maximum number of voter reward grants per user per day. Voting still works after cap; payout does not.">[?]</span></label>
               <input type="number" name="metadata_reward_max_votes_per_day" value="{_h(settings.get('metadata_reward_max_votes_per_day','20'))}" min="0" max="10000"></div>
           </div>
           <button type="submit" class="btn btn-primary">Save</button>
