@@ -5340,24 +5340,35 @@ class RegistrationDB:
         if active:
             return False, 'An active proposal already exists for this provider.'
         c = self._conn()
-        try:
-            c.execute(
-                '''INSERT INTO torrent_metadata_proposals (
-                       info_hash, provider, proposed_id, proposed_url, season, episode,
-                       proposed_by_user_id, proposed_by_username, status,
-                       decision_reason, decided_by_user_id, decided_by_username, decided_at,
-                       voting_opened_at, voting_closes_at, auto_finalize_at,
-                       rewards_issued_at, created_at, updated_at
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (ih, p, ext_id, (proposed_url or '')[:500], season, episode,
-                 int(proposer_user_id), proposer_username[:64], 'pending',
-                 '', None, None, None,
-                 ts_now, closes_at.isoformat(), closes_at.isoformat(),
-                 None, ts_now, ts_now)
-            )
-            c.commit()
-        except sqlite3.IntegrityError:
-            return False, 'This metadata target has already been proposed for this torrent.'
+        for attempt in range(8):
+            try:
+                c.execute(
+                    '''INSERT INTO torrent_metadata_proposals (
+                           info_hash, provider, proposed_id, proposed_url, season, episode,
+                           proposed_by_user_id, proposed_by_username, status,
+                           decision_reason, decided_by_user_id, decided_by_username, decided_at,
+                           voting_opened_at, voting_closes_at, auto_finalize_at,
+                           rewards_issued_at, created_at, updated_at
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (ih, p, ext_id, (proposed_url or '')[:500], season, episode,
+                     int(proposer_user_id), proposer_username[:64], 'pending',
+                     '', None, None, None,
+                     ts_now, closes_at.isoformat(), closes_at.isoformat(),
+                     None, ts_now, ts_now)
+                )
+                c.commit()
+                break
+            except sqlite3.IntegrityError:
+                return False, 'This metadata target has already been proposed for this torrent.'
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.08 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    log.warning('create_metadata_proposal lock after retries (non-fatal): ih=%s provider=%s err=%s',
+                                ih, p, e)
+                    return False, 'Database is busy, please retry metadata submission.'
+                raise
         proposal_id = int(c.execute('SELECT last_insert_rowid()').fetchone()[0])
         self._log(proposer_username, 'metadata_propose', ih,
                   f'proposal_id={proposal_id} provider={p} id={ext_id}')
@@ -11334,7 +11345,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         role    = _user_role(user)
         per_page = int(REGISTRATION_DB.get_setting('torrents_per_page', '50'))
         page     = _get_page_param(self.path)
-        uid      = None if role in ('super', 'admin', 'standard') else user['id']
+        uid      = None if role in ('super', 'admin', 'editor', 'standard') else user['id']
         total    = REGISTRATION_DB.count_torrents(user_id=uid)
         torrents = REGISTRATION_DB.list_torrents(user_id=uid, page=page, per_page=per_page)
         total_pages = max(1, (total + per_page - 1) // per_page)
@@ -13737,7 +13748,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         page   = max(1, int(params.get('page', ['1'])[0]))
         per_page = int(REGISTRATION_DB.get_setting('torrents_per_page', '50'))
         role   = _user_role(user)
-        uid    = None if role in ('super', 'admin', 'standard') else user['id']
+        uid    = None if role in ('super', 'admin', 'editor', 'standard') else user['id']
         if query:
             total    = REGISTRATION_DB.count_search_torrents(query, user_id=uid)
             torrents = REGISTRATION_DB.search_torrents(query, user_id=uid, page=page, per_page=per_page)
