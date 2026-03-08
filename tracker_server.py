@@ -1450,6 +1450,37 @@ def _normalize_external_image_url(raw: str) -> str:
     return url
 
 
+def _sanitize_metadata_base_url(raw: str, default_url: str, allowed_hosts: set[str],
+                                *, strict: bool = False) -> str:
+    """Validate and normalize metadata provider base URL.
+
+    Rules:
+    - HTTPS only
+    - host must be in allowed_hosts
+    - no embedded credentials
+    - query/fragment removed
+    If strict=True, invalid input returns empty string.
+    """
+    default = (default_url or '').strip() or 'https://example.invalid/'
+    candidate = (raw or '').strip() or default
+    try:
+        parsed = urllib.parse.urlparse(candidate)
+        scheme = (parsed.scheme or '').lower()
+        host = (parsed.hostname or '').lower()
+        if scheme != 'https' or not host or host not in allowed_hosts:
+            return '' if strict else default
+        if parsed.username or parsed.password:
+            return '' if strict else default
+        netloc = host
+        if parsed.port:
+            netloc = f'{host}:{int(parsed.port)}'
+        path = parsed.path or ''
+        normalized = urllib.parse.urlunparse(('https', netloc, path, '', '', '')).strip()
+        return normalized or ('' if strict else default)
+    except Exception:
+        return '' if strict else default
+
+
 def _b64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
@@ -5289,6 +5320,8 @@ class RegistrationDB:
                 return max(lo, min(hi, float(settings.get(key, str(default)) or default)))
             except Exception:
                 return default
+        omdb_base_default = 'https://www.omdbapi.com/'
+        tvmaze_base_default = 'https://api.tvmaze.com'
         return {
             'enabled': settings.get('metadata_enabled', '1') == '1',
             'vote_enabled': settings.get('metadata_vote_enabled', '1') == '1',
@@ -5307,8 +5340,16 @@ class RegistrationDB:
             'fetch_timeout_sec': _to_int('metadata_fetch_timeout_sec', 5, 2, 20),
             'fetch_max_retries': _to_int('metadata_fetch_max_retries', 3, 1, 10),
             'fetch_per_cycle': _to_int('metadata_fetch_per_cycle', 2, 1, 10),
-            'omdb_base_url': (settings.get('metadata_omdb_base_url', 'https://www.omdbapi.com/') or 'https://www.omdbapi.com/').strip(),
-            'tvmaze_base_url': (settings.get('metadata_tvmaze_base_url', 'https://api.tvmaze.com') or 'https://api.tvmaze.com').strip(),
+            'omdb_base_url': _sanitize_metadata_base_url(
+                settings.get('metadata_omdb_base_url', omdb_base_default) or omdb_base_default,
+                omdb_base_default,
+                {'omdbapi.com', 'www.omdbapi.com'},
+            ),
+            'tvmaze_base_url': _sanitize_metadata_base_url(
+                settings.get('metadata_tvmaze_base_url', tvmaze_base_default) or tvmaze_base_default,
+                tvmaze_base_default,
+                {'api.tvmaze.com'},
+            ),
             'omdb_api_key': (settings.get('metadata_omdb_api_key', '') or '').strip(),
         }
 
@@ -5423,13 +5464,20 @@ class RegistrationDB:
         now = datetime.datetime.now()
         closes_at = now + datetime.timedelta(hours=cfg['vote_window_hours'])
         ts_now = self._ts()
-        # Guard: one active proposal per provider per torrent.
-        active = self.get_active_metadata_proposal(ih, p)
-        if active:
-            return False, 'An active proposal already exists for this provider.'
         c = self._conn()
         for attempt in range(8):
             try:
+                c.execute('BEGIN IMMEDIATE')
+                # Guard: one active proposal per provider per torrent.
+                active = c.execute(
+                    '''SELECT id FROM torrent_metadata_proposals
+                       WHERE info_hash=? AND provider=? AND status='pending'
+                       ORDER BY id DESC LIMIT 1''',
+                    (ih, p)
+                ).fetchone()
+                if active:
+                    c.execute('ROLLBACK')
+                    return False, 'An active proposal already exists for this provider.'
                 c.execute(
                     '''INSERT INTO torrent_metadata_proposals (
                            info_hash, provider, proposed_id, proposed_url, season, episode,
@@ -5444,11 +5492,19 @@ class RegistrationDB:
                      ts_now, closes_at.isoformat(), closes_at.isoformat(),
                      None, ts_now, ts_now)
                 )
-                c.commit()
+                c.execute('COMMIT')
                 break
             except sqlite3.IntegrityError:
+                try:
+                    c.execute('ROLLBACK')
+                except Exception:
+                    pass
                 return False, 'This metadata target has already been proposed for this torrent.'
             except sqlite3.OperationalError as e:
+                try:
+                    c.execute('ROLLBACK')
+                except Exception:
+                    pass
                 if 'locked' in str(e).lower() and attempt < 7:
                     time.sleep(0.08 * (attempt + 1))
                     continue
@@ -14652,12 +14708,22 @@ class ManageHandler(BaseHTTPRequestHandler):
         elif form_id == 'metadata_settings':
             fetch_enabled = '1' if fields.get('metadata_fetch_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('metadata_fetch_enabled', fetch_enabled, user['username'])
-            omdb_base = (fields.get('metadata_omdb_base_url', 'https://www.omdbapi.com/') or '').strip()
-            tvmaze_base = (fields.get('metadata_tvmaze_base_url', 'https://api.tvmaze.com') or '').strip()
+            omdb_base = _sanitize_metadata_base_url(
+                fields.get('metadata_omdb_base_url', 'https://www.omdbapi.com/') or '',
+                'https://www.omdbapi.com/',
+                {'omdbapi.com', 'www.omdbapi.com'},
+                strict=True,
+            )
+            tvmaze_base = _sanitize_metadata_base_url(
+                fields.get('metadata_tvmaze_base_url', 'https://api.tvmaze.com') or '',
+                'https://api.tvmaze.com',
+                {'api.tvmaze.com'},
+                strict=True,
+            )
             if not omdb_base:
-                omdb_base = 'https://www.omdbapi.com/'
+                return self._redirect('/manage/admin?tab=settings&msg=Invalid+OMDb+base+URL.+Use+HTTPS+and+an+approved+host.&msg_type=error')
             if not tvmaze_base:
-                tvmaze_base = 'https://api.tvmaze.com'
+                return self._redirect('/manage/admin?tab=settings&msg=Invalid+TVMaze+base+URL.+Use+HTTPS+and+api.tvmaze.com.&msg_type=error')
             REGISTRATION_DB.set_setting('metadata_omdb_base_url', omdb_base[:500], user['username'])
             REGISTRATION_DB.set_setting('metadata_tvmaze_base_url', tvmaze_base[:500], user['username'])
             clear_key = fields.get('metadata_omdb_api_key_clear') == '1'
@@ -21389,7 +21455,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 provider_meta_line = (
                     f'{provider_label} id: '
                     f'<a href="{_h(show_url)}" target="_blank" rel="noopener" class="user-link">{_h(ext_id)}</a>'
-                    f' <button type="button" onclick="copyHash(this,{repr(ext_id)})" '
+                    f' <button type="button" onclick="copyHash(this,{_h(json.dumps(ext_id))})" '
                     f'title="Copy ID" '
                     f'class="btn-id-copy">Copy</button>'
                 )
@@ -21398,7 +21464,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 provider_meta_line = (
                     f'{provider_label} id: '
                     f'<a href="{_h(imdb_url)}" target="_blank" rel="noopener" class="user-link">{_h(ext_id)}</a>'
-                    f' <button type="button" onclick="copyHash(this,{repr(ext_id)})" '
+                    f' <button type="button" onclick="copyHash(this,{_h(json.dumps(ext_id))})" '
                     f'title="Copy ID" '
                     f'class="btn-id-copy">Copy</button>'
                 )
@@ -21407,7 +21473,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 provider_meta_line = (
                     f'{provider_label} id: '
                     f'<a href="{_h(steam_url)}" target="_blank" rel="noopener" class="user-link">{_h(ext_id)}</a>'
-                    f' <button type="button" onclick="copyHash(this,{repr(ext_id)})" '
+                    f' <button type="button" onclick="copyHash(this,{_h(json.dumps(ext_id))})" '
                     f'title="Copy ID" '
                     f'class="btn-id-copy">Copy</button>'
                 )
