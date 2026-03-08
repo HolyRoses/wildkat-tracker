@@ -22840,6 +22840,25 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             rating = ''
             if cache and cache['rating_value'] is not None:
                 rating = f'<span class="hash">Rating: {float(cache["rating_value"]):.1f}</span>'
+            raw_payload = {}
+            if cache:
+                try:
+                    raw_payload = json.loads(cache['raw_json'] or '{}')
+                except Exception:
+                    raw_payload = {}
+            rotten_tomato = ''
+            if provider == 'imdb' and isinstance(raw_payload, dict):
+                ratings = raw_payload.get('Ratings')
+                if isinstance(ratings, list):
+                    for r in ratings:
+                        if not isinstance(r, dict):
+                            continue
+                        source = str(r.get('Source') or '').strip().lower()
+                        if source == 'rotten tomatoes':
+                            value = str(r.get('Value') or '').strip()
+                            if value:
+                                rotten_tomato = f'<span class="hash">🍅 { _h(value) }</span>'
+                            break
             year = ''
             if cache and cache['year']:
                 year = f'<span class="hash">Year: {int(cache["year"])}</span>'
@@ -22860,12 +22879,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             episode_name = ''
             season_num = None
             episode_num = None
-            if provider == 'tvmaze' and cache:
-                try:
-                    raw_payload = json.loads(cache['raw_json'] or '{}')
-                except Exception:
-                    raw_payload = {}
-                if isinstance(raw_payload, dict):
+            if provider == 'tvmaze' and isinstance(raw_payload, dict):
                     show_name = str((raw_payload.get('show') or {}).get('name') or '').strip()
                     episode_name = str((raw_payload.get('episode') or {}).get('name') or '').strip()
                     try:
@@ -22985,7 +22999,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 f'{episode_name_html}'
                 f'<div class="hash" style="margin-top:4px">{provider_meta_line}</div>'
                 f'{subtitle_html}'
-                f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">{year}{runtime}{rating}{network}</div>'
+                f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">{year}{runtime}{rating}{rotten_tomato}{network}</div>'
                 f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">{genre_html}</div>'
                 f'{revoke_html}'
                 '</div>'
