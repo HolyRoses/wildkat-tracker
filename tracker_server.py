@@ -5303,6 +5303,31 @@ class RegistrationDB:
         p = _normalize_metadata_provider(provider)
         if not ih or not p:
             return False, 'Invalid metadata provider.'
+        # Anti-spam guardrails for community proposal volume.
+        uid = int(proposer_user_id or 0)
+        if uid > 0:
+            now = datetime.datetime.now()
+            cutoff_24h = (now - datetime.timedelta(hours=24)).isoformat()
+            cutoff_10m = (now - datetime.timedelta(minutes=10)).isoformat()
+            c = self._conn()
+            day_count = int(c.execute(
+                '''SELECT COUNT(*) FROM torrent_metadata_proposals
+                   WHERE proposed_by_user_id=? AND created_at>=?''',
+                (uid, cutoff_24h)
+            ).fetchone()[0] or 0)
+            burst_count = int(c.execute(
+                '''SELECT COUNT(*) FROM torrent_metadata_proposals
+                   WHERE proposed_by_user_id=? AND created_at>=?''',
+                (uid, cutoff_10m)
+            ).fetchone()[0] or 0)
+            if day_count >= 10:
+                self._log(proposer_username, 'metadata_propose_rate_limited', str(uid),
+                          f'window=24h count={day_count}')
+                return False, 'Proposal rate limit reached (10 per 24h). Please try again later.'
+            if burst_count >= 3:
+                self._log(proposer_username, 'metadata_propose_rate_limited', str(uid),
+                          f'window=10m count={burst_count}')
+                return False, 'Proposal burst limit reached (3 per 10 minutes). Please wait and try again.'
         trow = self.get_torrent(ih)
         if not trow:
             return False, 'Torrent not found.'
@@ -6040,24 +6065,30 @@ class RegistrationDB:
             (now_iso,)
         ).fetchall()
         approved = 0
-        accepted = 0
+        rejected = 0
         for r in rows:
             pid = int(r['id'])
             summary = self.get_metadata_proposal_vote_summary(pid)
-            if (summary['unique_voters'] >= int(cfg['vote_min_unique_voters']) and
-                    summary['net'] >= int(cfg['vote_min_net_score'])):
-                ok, _ = self.resolve_metadata_proposal(pid, 0, 'system', 'approve', 'auto-finalized by community threshold')
+            unique_voters = int(summary.get('unique_voters', 0))
+            net = int(summary.get('net', 0))
+            if unique_voters == 0:
+                ok, _ = self.resolve_metadata_proposal(pid, 0, 'system', 'approve', 'auto-accepted with no community votes')
+                if ok:
+                    self.notify_metadata_decision(pid, 'approved', 'system')
+                    approved += 1
+            elif net >= 1:
+                ok, _ = self.resolve_metadata_proposal(pid, 0, 'system', 'approve', 'auto-approved by community vote')
                 if ok:
                     self.notify_metadata_decision(pid, 'approved', 'system')
                     approved += 1
             else:
-                ok, _ = self.resolve_metadata_proposal(pid, 0, 'system', 'approve', 'auto-accepted after vote window elapsed')
+                ok, _ = self.resolve_metadata_proposal(pid, 0, 'system', 'reject', 'auto-rejected by community vote')
                 if ok:
-                    self.notify_metadata_decision(pid, 'approved', 'system')
-                    accepted += 1
-        if approved or accepted:
-            self._log('system', 'metadata_auto_finalize', '', f'approved_by_threshold={approved} auto_accepted={accepted}')
-        return approved, accepted
+                    self.notify_metadata_decision(pid, 'rejected', 'system')
+                    rejected += 1
+        if approved or rejected:
+            self._log('system', 'metadata_auto_finalize', '', f'approved={approved} rejected={rejected}')
+        return approved, rejected
 
     # ── Bounty System ─────────────────────────────────────────
 
@@ -13107,11 +13138,13 @@ class ManageHandler(BaseHTTPRequestHandler):
                 p = REGISTRATION_DB.get_metadata_proposal(int(proposal_id))
                 if p and str(p['status'] or '') == 'pending':
                     summary = REGISTRATION_DB.get_metadata_proposal_vote_summary(int(proposal_id))
-                    if (int(summary.get('unique_voters', 0)) >= int(cfg.get('vote_min_unique_voters', 3)) and
-                            int(summary.get('net', 0)) >= int(cfg.get('vote_min_net_score', 3))):
+                    unique_voters = int(summary.get('unique_voters', 0))
+                    net = int(summary.get('net', 0))
+                    quorum = int(cfg.get('vote_min_unique_voters', 3))
+                    if unique_voters >= quorum and net >= 1:
                         ok_res, _ = REGISTRATION_DB.resolve_metadata_proposal(
                             int(proposal_id), 0, 'system', 'approve',
-                            'community threshold reached'
+                            'community vote reached positive threshold'
                         )
                         if ok_res:
                             REGISTRATION_DB.notify_metadata_decision(int(proposal_id), 'approved', 'system')
@@ -13119,7 +13152,15 @@ class ManageHandler(BaseHTTPRequestHandler):
                                 REGISTRATION_DB.process_metadata_fetch_jobs()
                             except Exception:
                                 pass
-                            msg = 'Threshold reached. Proposal approved and queued for fetch.'
+                            msg = 'Community vote approved. Proposal approved and queued for fetch.'
+                    elif unique_voters >= quorum and net <= 0:
+                        ok_res, _ = REGISTRATION_DB.resolve_metadata_proposal(
+                            int(proposal_id), 0, 'system', 'reject',
+                            'community vote reached rejection threshold'
+                        )
+                        if ok_res:
+                            REGISTRATION_DB.notify_metadata_decision(int(proposal_id), 'rejected', 'system')
+                            msg = 'Community vote rejected this proposal.'
             except Exception:
                 pass
         q = urllib.parse.quote(msg)
@@ -23296,10 +23337,10 @@ def main():
                 except Exception as _e:
                     log.warning('expire_bounties failed (non-fatal): %s', _e)
                 try:
-                    _meta_approved, _meta_expired = REGISTRATION_DB.auto_finalize_metadata_proposals()
-                    if _meta_approved or _meta_expired:
-                        log.info('metadata reconcile: approved=%d expired=%d',
-                                 _meta_approved, _meta_expired)
+                    _meta_approved, _meta_rejected = REGISTRATION_DB.auto_finalize_metadata_proposals()
+                    if _meta_approved or _meta_rejected:
+                        log.info('metadata reconcile: approved=%d rejected=%d',
+                                 _meta_approved, _meta_rejected)
                 except Exception as _e:
                     log.warning('auto_finalize_metadata_proposals failed (non-fatal): %s', _e)
                 try:
