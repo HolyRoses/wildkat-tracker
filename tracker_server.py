@@ -142,6 +142,40 @@ logging.basicConfig(
 )
 log = logging.getLogger('tracker')
 
+
+class _WKSQLiteConnection(sqlite3.Connection):
+    """SQLite connection that self-recovers after lock contention."""
+
+    @staticmethod
+    def _rollback_if_locked(conn: sqlite3.Connection, err: Exception) -> None:
+        if 'locked' not in str(err).lower():
+            return
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    def execute(self, sql, parameters=(), /):
+        try:
+            return super().execute(sql, parameters)
+        except sqlite3.OperationalError as e:
+            self._rollback_if_locked(self, e)
+            raise
+
+    def executemany(self, sql, seq_of_parameters, /):
+        try:
+            return super().executemany(sql, seq_of_parameters)
+        except sqlite3.OperationalError as e:
+            self._rollback_if_locked(self, e)
+            raise
+
+    def executescript(self, sql_script, /):
+        try:
+            return super().executescript(sql_script)
+        except sqlite3.OperationalError as e:
+            self._rollback_if_locked(self, e)
+            raise
+
 try:
     from fido2.server import Fido2Server
     from fido2.webauthn import (
@@ -1728,8 +1762,12 @@ class RegistrationDB:
                     old.close()
                 except Exception:
                     pass
-            conn = sqlite3.connect(self._path, check_same_thread=False,
-                                   timeout=10)
+            conn = sqlite3.connect(
+                self._path,
+                check_same_thread=False,
+                timeout=10,
+                factory=_WKSQLiteConnection,
+            )
             conn.row_factory = sqlite3.Row
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA foreign_keys=ON')
@@ -6789,26 +6827,50 @@ class RegistrationDB:
             'SELECT name FROM torrents WHERE info_hash=?', (ih_upper,)
         ).fetchone()
         torrent_name = row['name'] if row else ih_upper
-        for attempt in range(5):
+        for attempt in range(4):
+            c = None
             try:
-                c = self._conn()
+                # Use a fresh dedicated writer connection so deletion is not
+                # affected by any thread-local transaction state.
+                c = sqlite3.connect(
+                    self._path,
+                    timeout=30,
+                    check_same_thread=False,
+                    factory=_WKSQLiteConnection,
+                )
+                c.row_factory = sqlite3.Row
+                c.execute('PRAGMA journal_mode=WAL')
+                c.execute('PRAGMA foreign_keys=ON')
+                c.execute('PRAGMA busy_timeout=30000')
+                c.execute('BEGIN IMMEDIATE')
                 # Expunge all comments and notifications tied to this torrent
                 c.execute('DELETE FROM comments WHERE info_hash=?', (ih_upper,))
                 c.execute('DELETE FROM notifications WHERE info_hash=?', (ih_upper,))
                 c.execute('DELETE FROM torrent_votes WHERE info_hash=?', (ih_upper,))
                 c.execute('DELETE FROM torrents WHERE info_hash=?', (ih_upper,))
-                c.commit()
+                c.execute('COMMIT')
                 self._log(actor, 'delete_torrent', ih_upper, torrent_name)
                 return True, ''
             except sqlite3.OperationalError as e:
-                if 'locked' in str(e) and attempt < 4:
-                    time.sleep(0.25 * (attempt + 1))
+                try:
+                    if c is not None:
+                        c.execute('ROLLBACK')
+                except Exception:
+                    pass
+                if 'locked' in str(e).lower() and attempt < 3:
+                    time.sleep(0.35 * (attempt + 1))
                     continue
-                if 'locked' in str(e):
+                if 'locked' in str(e).lower():
                     log.warning('delete_torrent lock after retries (non-fatal): ih=%s actor=%s err=%s',
                                 ih_upper, actor, e)
                     return False, 'Database is busy, please retry deleting this torrent.'
                 raise
+            finally:
+                if c is not None:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
 
     def backup_to_bytes(self) -> bytes:
         """Return a gzip-compressed snapshot of the live DB as raw bytes."""
