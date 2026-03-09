@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import difflib
 import hashlib
 import hmac
 import html as _html_mod
@@ -1481,6 +1482,104 @@ def _normalize_torrent_display_name(name: str, cleanup_tags: list[str],
     return normalized or original
 
 
+_TITLE_STOP_TOKENS = {
+    '2160p', '1080p', '720p', '480p', 'x264', 'x265', 'h264', 'h265', 'hevc', 'avc',
+    'webrip', 'web', 'webdl', 'web-dl', 'bluray', 'bdrip', 'brrip', 'hdr', 'hdr10',
+    'dv', 'dolbyvision', 'proper', 'repack', 'internal', 'extended', 'remux', 'uhd',
+    'dd', 'ddp', 'ddp5', 'ddp51', 'ddp7', 'aac', 'ac3', 'dts', 'atmos', 'truehd',
+    'amzn', 'amazon', 'nf', 'netflix', 'dsnp', 'hmax', 'atvp', 'pcok', 'roku', 'itunes',
+}
+
+
+def _normalize_match_text(raw: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '', str(raw or '').lower())
+
+
+def _match_ratio(a: str, b: str) -> int:
+    na = _normalize_match_text(a)
+    nb = _normalize_match_text(b)
+    if not na or not nb:
+        return 0
+    return int(round(difflib.SequenceMatcher(None, na, nb).ratio() * 100.0))
+
+
+def _parse_release_for_auto_match(raw_name: str, cleanup_tags: list[str] | None = None,
+                                  strip_www_prefix: bool = True) -> dict[str, Any]:
+    src = str(raw_name or '').strip()
+    cleaned = _normalize_torrent_display_name(
+        src,
+        cleanup_tags or [],
+        strip_www_prefix=strip_www_prefix,
+    )
+    norm = re.sub(r'[\s_]+', '.', cleaned)
+    norm = re.sub(r'\.+', '.', norm).strip('.')
+    season = None
+    episode = None
+    m = re.search(r'(?i)\bS(\d{1,2})E(\d{1,2})\b', norm)
+    if not m:
+        m = re.search(r'(?i)\b(\d{1,2})x(\d{1,2})\b', norm)
+    if m:
+        try:
+            season = int(m.group(1))
+            episode = int(m.group(2))
+        except Exception:
+            season = None
+            episode = None
+    if season is None:
+        ms = re.search(r'(?i)\bS(?:EASON)?[ ._-]?(\d{1,2})\b', norm)
+        if ms:
+            try:
+                season = int(ms.group(1))
+            except Exception:
+                season = None
+    if season is None:
+        ms2 = re.search(r'(?i)\bseason[ ._-]*(\d{1,2})\b', norm)
+        if ms2:
+            try:
+                season = int(ms2.group(1))
+            except Exception:
+                season = None
+    year = None
+    my = re.search(r'\b(19\d{2}|20\d{2})\b', norm)
+    if my:
+        try:
+            year = int(my.group(1))
+        except Exception:
+            year = None
+    tokens = [t for t in re.split(r'[.\-]+', norm) if t]
+    title_parts: list[str] = []
+    for tok in tokens:
+        low = tok.lower()
+        if re.fullmatch(r'(?i)s\d{1,2}e\d{1,2}', tok):
+            break
+        if re.fullmatch(r'(?i)\d{1,2}x\d{1,2}', tok):
+            break
+        if re.fullmatch(r'(?i)s\d{1,2}', tok):
+            break
+        if low == 'season':
+            break
+        if re.fullmatch(r'(19\d{2}|20\d{2})', tok):
+            break
+        if low in _TITLE_STOP_TOKENS:
+            break
+        if low.isdigit() and len(low) >= 3:
+            break
+        title_parts.append(tok)
+    title_query = ' '.join(title_parts).strip()
+    if not title_query:
+        # Fallback: keep early alpha tokens only.
+        alnum = [t for t in tokens if re.search(r'[a-zA-Z]', t)]
+        title_query = ' '.join(alnum[:6]).strip()
+    return {
+        'kind': 'tv' if (season is not None) else 'movie',
+        'title_query': title_query[:140],
+        'year': year,
+        'season': season,
+        'episode': episode,
+        'normalized': norm,
+    }
+
+
 def _strip_html_text(raw: str) -> str:
     text = str(raw or '')
     if not text:
@@ -2864,6 +2963,7 @@ class RegistrationDB:
             'upload_max_files':       '1000',
             'upload_max_file_mb':     '10',
             'torrent_name_cleanup_enabled': '1',
+            'torrent_name_cleanup_on_upload': '1',
             'torrent_name_cleanup_strip_www_prefix': '1',
             'torrent_name_cleanup_tags': '',
             'robots_txt':              'User-agent: *\nDisallow: /announce\nDisallow: /scrape\nDisallow: /manage\n',
@@ -2919,6 +3019,13 @@ class RegistrationDB:
             'metadata_fetch_timeout_sec':'5',
             'metadata_fetch_max_retries':'3',
             'metadata_fetch_per_cycle':  '2',
+            'metadata_auto_match_enabled': '0',
+            'metadata_auto_match_on_upload': '0',
+            'metadata_auto_match_upload_cap': '5',
+            'metadata_auto_match_movies': '1',
+            'metadata_auto_match_tv': '1',
+            'metadata_auto_match_high_threshold': '90',
+            'metadata_auto_match_medium_threshold': '72',
             'metadata_omdb_base_url':    'https://www.omdbapi.com/',
             'metadata_tvmaze_base_url':  'https://api.tvmaze.com',
             'metadata_omdb_api_key':     '',
@@ -5492,6 +5599,13 @@ class RegistrationDB:
             'fetch_timeout_sec': _to_int('metadata_fetch_timeout_sec', 5, 2, 20),
             'fetch_max_retries': _to_int('metadata_fetch_max_retries', 3, 1, 10),
             'fetch_per_cycle': _to_int('metadata_fetch_per_cycle', 2, 1, 10),
+            'auto_match_enabled': settings.get('metadata_auto_match_enabled', '0') == '1',
+            'auto_match_on_upload': settings.get('metadata_auto_match_on_upload', '0') == '1',
+            'auto_match_upload_cap': _to_int('metadata_auto_match_upload_cap', 5, 1, 100),
+            'auto_match_movies': settings.get('metadata_auto_match_movies', '1') == '1',
+            'auto_match_tv': settings.get('metadata_auto_match_tv', '1') == '1',
+            'auto_match_high_threshold': _to_int('metadata_auto_match_high_threshold', 90, 80, 100),
+            'auto_match_medium_threshold': _to_int('metadata_auto_match_medium_threshold', 72, 50, 95),
             'omdb_base_url': _sanitize_metadata_base_url(
                 settings.get('metadata_omdb_base_url', omdb_base_default) or omdb_base_default,
                 omdb_base_default,
@@ -6095,6 +6209,272 @@ class RegistrationDB:
             'fetched_ok': True,
         }
         return True, payload, ''
+
+    def _search_omdb_title(self, title_query: str, media_type: str,
+                           year: int | None, cfg: dict) -> tuple[bool, dict, str]:
+        api_key = (cfg.get('omdb_api_key') or '').strip()
+        if not api_key:
+            return False, {}, 'OMDb API key is not configured.'
+        tq = (title_query or '').strip()
+        if not tq:
+            return False, {}, 'Missing title query.'
+        base = (cfg.get('omdb_base_url') or 'https://www.omdbapi.com/').rstrip('/')
+        timeout = int(cfg.get('fetch_timeout_sec', 5))
+        title_variants: list[str] = [tq]
+        stripped = re.sub(r'(?i)^(the|a|an)\s+', '', tq).strip()
+        if stripped and stripped.lower() != tq.lower():
+            title_variants.append(stripped)
+        # OMDb title matches can be sensitive to "&" vs "and".
+        and_amp_variants: list[str] = []
+        for title in list(title_variants):
+            v1 = re.sub(r'(?i)\band\b', '&', title).strip()
+            v2 = title.replace('&', ' and ').strip()
+            v2 = re.sub(r'\s+', ' ', v2)
+            and_amp_variants.extend([v1, v2])
+        for candidate in and_amp_variants:
+            if candidate and all(candidate.lower() != existing.lower() for existing in title_variants):
+                title_variants.append(candidate)
+        # Release names often strip apostrophes (were -> we're). Add conservative variants.
+        contraction_map = {
+            'were': "we're",
+            'dont': "don't",
+            'cant': "can't",
+            'wont': "won't",
+            'isnt': "isn't",
+            'arent': "aren't",
+            'doesnt': "doesn't",
+            'didnt': "didn't",
+            'im': "i'm",
+            'ive': "i've",
+        }
+        contraction_variants: list[str] = []
+        for title in list(title_variants):
+            words = title.split()
+            changed = False
+            out: list[str] = []
+            for w in words:
+                key = re.sub(r"[^a-z0-9]", "", w.lower())
+                repl = contraction_map.get(key)
+                if repl:
+                    out.append(repl)
+                    changed = True
+                else:
+                    out.append(w)
+            if changed:
+                contraction_variants.append(' '.join(out))
+        for candidate in contraction_variants:
+            if candidate and all(candidate.lower() != existing.lower() for existing in title_variants):
+                title_variants.append(candidate)
+        # Generic base-title fallback: long release names often include franchise subtitles
+        # that OMDb does not index in `t=` lookup. Try compact leading-token probes.
+        words = [w for w in re.split(r'\s+', tq) if w]
+        for n in (4, 3):
+            if len(words) >= n + 1:
+                probe = ' '.join(words[:n]).strip()
+                if probe and all(probe.lower() != existing.lower() for existing in title_variants):
+                    title_variants.append(probe)
+        last_err = 'OMDb returned no match.'
+
+        def _query(title: str, with_year: bool) -> tuple[bool, dict, str]:
+            params = {'apikey': api_key, 't': title, 'plot': 'short'}
+            if media_type in ('movie', 'series'):
+                params['type'] = media_type
+            if with_year and year is not None:
+                params['y'] = int(year)
+            q = urllib.parse.urlencode(params)
+            ok, raw, err = self._metadata_http_get_json(f'{base}/?{q}', timeout)
+            if ok and str(raw.get('Response', '')).lower() == 'true':
+                return True, raw, ''
+            return False, {}, (err or str(raw.get('Error') or 'OMDb returned no match.'))
+
+        if year is not None:
+            for title in title_variants:
+                ok, raw, err = _query(title, with_year=True)
+                if ok:
+                    return True, raw, ''
+                if err:
+                    last_err = err
+            for title in title_variants:
+                ok, raw, err = _query(title, with_year=False)
+                if ok:
+                    return True, raw, ''
+                if err:
+                    last_err = err
+            return False, {}, last_err
+
+        for title in title_variants:
+            ok, raw, err = _query(title, with_year=False)
+            if ok:
+                return True, raw, ''
+            if err:
+                last_err = err
+        return False, {}, last_err
+
+    def _stage_pending_metadata_preview(self, proposal_id: int) -> None:
+        prow = self.get_metadata_proposal(int(proposal_id))
+        if not prow:
+            return
+        self._activate_metadata_link_from_proposal(prow, int(prow['proposed_by_user_id'] or 0),
+                                                   str(prow['proposed_by_username'] or ''))
+        self._enqueue_metadata_fetch_job(prow)
+        self.process_metadata_fetch_jobs()
+
+    def auto_match_torrent_metadata(self, info_hash: str, actor_user_id: int,
+                                    actor_username: str, source: str = 'manual') -> tuple[bool, str, str, int]:
+        """Attempt automatic metadata match.
+
+        Returns `(ok, message, level, score)` where level is one of:
+        `high`, `medium`, `low`, `skip`, `error`.
+        """
+        ih = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return False, 'Invalid torrent hash.', 'error', 0
+        trow = self.get_torrent(ih)
+        if not trow:
+            return False, 'Torrent not found.', 'error', 0
+        cfg = self.get_metadata_config()
+        if not cfg.get('enabled', True) or not cfg.get('auto_match_enabled', False):
+            return False, 'Auto-match is disabled by settings.', 'skip', 0
+        cleanup_tags = _parse_torrent_name_cleanup_tags(
+            self.get_setting('torrent_name_cleanup_tags', '')
+        )
+        strip_www_prefix = self.get_setting('torrent_name_cleanup_strip_www_prefix', '1') == '1'
+        parsed = _parse_release_for_auto_match(
+            str(trow['name'] or ''),
+            cleanup_tags=cleanup_tags,
+            strip_www_prefix=strip_www_prefix,
+        )
+        title_query = str(parsed.get('title_query') or '').strip()
+        if not title_query:
+            return False, 'Unable to infer title from release name.', 'skip', 0
+        high_th = int(cfg.get('auto_match_high_threshold', 90))
+        med_th = int(cfg.get('auto_match_medium_threshold', 72))
+        if med_th >= high_th:
+            med_th = max(50, high_th - 5)
+
+        provider = ''
+        ext_id = ''
+        proposed_url = ''
+        season = None
+        episode = None
+        score = 0
+        explain = ''
+
+        if parsed.get('kind') == 'tv' and cfg.get('auto_match_tv', True):
+            if self.has_active_metadata_link(ih, 'tvmaze'):
+                return False, 'TV metadata is already active for this torrent.', 'skip', 0
+            season = parsed.get('season')
+            episode = parsed.get('episode')
+            sid, show_name, show_url = self._search_tvmaze_show(title_query, cfg)
+            if sid:
+                ok_tv, tv_payload, tv_err = self._fetch_tvmaze_metadata(
+                    sid, season, episode, cfg
+                )
+                if ok_tv:
+                    raw = tv_payload.get('raw') if isinstance(tv_payload, dict) else {}
+                    show_title = ''
+                    if isinstance(raw, dict):
+                        show_title = str(((raw.get('show') or {}).get('name')) or '')
+                    title_score = _match_ratio(title_query, show_title or show_name)
+                    year_score = 0
+                    pyear = parsed.get('year')
+                    cyear = tv_payload.get('year')
+                    if isinstance(pyear, int) and isinstance(cyear, int):
+                        if pyear == cyear:
+                            year_score = 10
+                        elif abs(pyear - cyear) <= 1:
+                            year_score = 6
+                    se_score = 12 if (season is not None and episode is not None) else 0
+                    score = min(100, title_score + year_score + se_score)
+                    provider = 'tvmaze'
+                    ext_id = sid
+                    proposed_url = show_url
+                    explain = f'tv title={title_score} year={year_score} se={se_score}'
+                else:
+                    explain = tv_err or 'tvmaze fetch failed'
+
+        if not provider and cfg.get('auto_match_movies', True):
+            if self.has_active_metadata_link(ih, 'imdb'):
+                return False, 'IMDb metadata is already active for this torrent.', 'skip', 0
+            omdb_type = 'movie' if parsed.get('kind') != 'tv' else 'series'
+            ok_omdb, omdb_raw, omdb_err = self._search_omdb_title(
+                title_query, omdb_type, parsed.get('year'), cfg
+            )
+            if ok_omdb:
+                imdb_id = _validate_imdb_id(str(omdb_raw.get('imdbID') or ''))
+                if imdb_id:
+                    cand_title = str(omdb_raw.get('Title') or '')
+                    cand_year = None
+                    try:
+                        cand_year = int(str(omdb_raw.get('Year') or '')[:4])
+                    except Exception:
+                        cand_year = None
+                    pyear = parsed.get('year')
+                    if isinstance(pyear, int) and isinstance(cand_year, int) and abs(pyear - cand_year) > 1:
+                        explain = f'imdb year mismatch query={pyear} candidate={cand_year}'
+                    else:
+                        cand_type = str(omdb_raw.get('Type') or '').lower()
+                        title_score = _match_ratio(title_query, cand_title)
+                        year_score = 0
+                        if isinstance(pyear, int) and isinstance(cand_year, int):
+                            if pyear == cand_year:
+                                year_score = 10
+                            elif abs(pyear - cand_year) <= 1:
+                                year_score = 6
+                        type_score = 6 if ((parsed.get('kind') == 'movie' and cand_type == 'movie') or
+                                           (parsed.get('kind') == 'tv' and cand_type in ('series', 'episode'))) else 0
+                        score = min(100, title_score + year_score + type_score)
+                        provider = 'imdb'
+                        ext_id = imdb_id
+                        proposed_url = f'https://www.imdb.com/title/{imdb_id}/'
+                        explain = f'imdb title={title_score} year={year_score} type={type_score}'
+                else:
+                    explain = 'omdb response missing imdb id'
+            else:
+                explain = omdb_err or 'omdb search failed'
+
+        if not provider or not ext_id:
+            return False, f'No metadata match found ({explain}).', 'low', 0
+
+        level = 'high' if score >= high_th else ('medium' if score >= med_th else 'low')
+        if level == 'low':
+            self._log(actor_username, 'metadata_auto_match_low', ih,
+                      f'provider={provider} id={ext_id} score={score} source={source} {explain}')
+            return False, f'Auto-match score too low ({score}); no proposal created.', 'low', int(score)
+
+        ok_prop, result = self.create_metadata_proposal(
+            ih, provider, ext_id, int(actor_user_id), actor_username,
+            proposed_url=proposed_url, season=season, episode=episode
+        )
+        if not ok_prop:
+            return False, str(result), 'error', int(score)
+        proposal_id = int(result)
+
+        if level == 'high':
+            ok_res, msg_res = self.resolve_metadata_proposal(
+                proposal_id, int(actor_user_id), actor_username,
+                'approve', f'auto-match high confidence ({score}) [{source}]'
+            )
+            if ok_res:
+                self.notify_metadata_decision(proposal_id, 'approved', actor_username)
+                try:
+                    self.process_metadata_fetch_jobs()
+                except Exception:
+                    pass
+                self._log(actor_username, 'metadata_auto_match_approved', ih,
+                          f'provider={provider} id={ext_id} score={score} source={source} {explain}')
+                return True, f'Auto-matched and approved ({provider.upper()} score {score}).', level, int(score)
+            return False, msg_res, 'error', int(score)
+        if level == 'medium':
+            try:
+                self._stage_pending_metadata_preview(proposal_id)
+            except Exception:
+                pass
+            self.notify_metadata_proposed(proposal_id, actor_username)
+            self._log(actor_username, 'metadata_auto_match_pending', ih,
+                      f'provider={provider} id={ext_id} score={score} source={source} {explain}')
+            return True, f'Auto-match queued for community review ({provider.upper()} score {score}).', level, int(score)
+        return False, 'Auto-match could not classify confidence.', 'error', int(score)
 
     def _maybe_issue_metadata_rewards(self, proposal) -> None:
         if not proposal:
@@ -12228,6 +12608,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_torrent_update_peers()
         elif path == '/manage/torrent/update-metadata':
             self._post_torrent_update_metadata()
+        elif path == '/manage/torrent/auto-match-metadata':
+            self._post_torrent_auto_match_metadata()
         elif path == '/manage/torrent/normalize-name':
             self._post_torrent_normalize_name()
         elif path == '/manage/torrent/vote':
@@ -13709,6 +14091,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         skipped_db_locked = 0
         normalized_names = 0
         cleanup_enabled = REGISTRATION_DB.get_setting('torrent_name_cleanup_enabled', '1') == '1'
+        cleanup_on_upload = REGISTRATION_DB.get_setting('torrent_name_cleanup_on_upload', '1') == '1'
         cleanup_tags = _parse_torrent_name_cleanup_tags(
             REGISTRATION_DB.get_setting('torrent_name_cleanup_tags', '')
         )
@@ -13727,7 +14110,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             except Exception:
                 skipped_invalid += 1
                 continue
-            if cleanup_enabled:
+            if cleanup_enabled and cleanup_on_upload:
                 normalized_name = _normalize_torrent_display_name(
                     name, cleanup_tags, strip_www_prefix=cleanup_strip_www
                 )
@@ -13756,7 +14139,11 @@ class ManageHandler(BaseHTTPRequestHandler):
                 skipped_duplicate += 1
         auto_peer_queued = 0
         auto_peer_not_queued = 0
+        auto_match_approved = 0
+        auto_match_pending = 0
+        auto_match_skipped = 0
         peer_cfg = REGISTRATION_DB.get_peer_query_config()
+        meta_cfg = REGISTRATION_DB.get_metadata_config() if REGISTRATION_DB else {}
         if added_with_hash and peer_cfg.get('active') and peer_cfg.get('auto_on_upload'):
             configured_cap = max(1, int(peer_cfg.get('auto_upload_cap', 5)))
             # Guardrail for very large uploads: keep auto peer queue pressure bounded.
@@ -13768,6 +14155,29 @@ class ManageHandler(BaseHTTPRequestHandler):
                 else:
                     auto_peer_not_queued += 1
                     log.debug('UPLOAD auto peer queue failed ih=%s', ih)
+        if (added_with_hash and meta_cfg.get('enabled', True)
+                and meta_cfg.get('auto_match_enabled', False)
+                and meta_cfg.get('auto_match_on_upload', False)):
+            mcap = max(1, min(100, int(meta_cfg.get('auto_match_upload_cap', 5))))
+            for ih, _tname in added_with_hash[:mcap]:
+                try:
+                    m_ok, _m_msg, m_level, _m_score = REGISTRATION_DB.auto_match_torrent_metadata(
+                        ih, int(user['id']), user['username'], source='upload'
+                    )
+                    if m_ok and m_level == 'high':
+                        auto_match_approved += 1
+                    elif m_ok and m_level == 'medium':
+                        auto_match_pending += 1
+                    else:
+                        auto_match_skipped += 1
+                except sqlite3.OperationalError as e:
+                    if 'locked' in str(e).lower():
+                        auto_match_skipped += 1
+                        log.warning('UPLOAD auto match skipped due DB lock ih=%s user=%s', ih, user['username'])
+                    else:
+                        raise
+            if len(added_with_hash) > mcap:
+                auto_match_skipped += (len(added_with_hash) - mcap)
         follower_notifs = 0
         for ih, tname in added_with_hash:
             follower_notifs += REGISTRATION_DB.notify_followers_torrent_upload(
@@ -13795,6 +14205,12 @@ class ManageHandler(BaseHTTPRequestHandler):
             parts.append(f'{over_cap} peer snapshots deferred (cap {cap})')
         if auto_peer_not_queued:
             parts.append(f'{auto_peer_not_queued} peer snapshots queue failed')
+        if auto_match_approved:
+            parts.append(f'{auto_match_approved} metadata auto-approved')
+        if auto_match_pending:
+            parts.append(f'{auto_match_pending} metadata queued for review')
+        if auto_match_skipped and meta_cfg.get('auto_match_on_upload', False):
+            parts.append(f'{auto_match_skipped} metadata auto-match skipped')
         msg = ' | '.join(parts) if parts else 'No files processed.'
         msg_type = 'success' if added else 'error'
         log.debug('UPLOAD result msg=%r msg_type=%r added=%d skipped=%d errors=%d',
@@ -14275,6 +14691,23 @@ class ManageHandler(BaseHTTPRequestHandler):
         detail = f' Processed now: success={processed_ok}, failed={processed_err}.' if (processed_ok or processed_err) else ''
         q = urllib.parse.quote(msg + detail)
         return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
+
+    def _post_torrent_auto_match_metadata(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        if not ih or not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        ok, msg, _level, _score = REGISTRATION_DB.auto_match_torrent_metadata(
+            ih, int(user['id']), user['username'], source='manual'
+        )
+        q = urllib.parse.quote(msg)
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type={"success" if ok else "error"}')
 
     def _post_torrent_vote(self):
         user = self._get_session_user()
@@ -15681,14 +16114,40 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/admin?tab=trackers&msg=Peer+query+settings+saved&msg_type=success')
         elif form_id == 'torrent_name_cleanup_settings':
             enabled = '1' if fields.get('torrent_name_cleanup_enabled') == '1' else '0'
+            on_upload = '1' if fields.get('torrent_name_cleanup_on_upload') == '1' else '0'
             strip_www = '1' if fields.get('torrent_name_cleanup_strip_www_prefix') == '1' else '0'
             cleanup_tags = _parse_torrent_name_cleanup_tags(
                 fields.get('torrent_name_cleanup_tags', '')
             )
             REGISTRATION_DB.set_setting('torrent_name_cleanup_enabled', enabled, user['username'])
+            REGISTRATION_DB.set_setting('torrent_name_cleanup_on_upload', on_upload, user['username'])
             REGISTRATION_DB.set_setting('torrent_name_cleanup_strip_www_prefix', strip_www, user['username'])
             REGISTRATION_DB.set_setting('torrent_name_cleanup_tags', '\n'.join(cleanup_tags)[:8000], user['username'])
             return self._redirect('/manage/admin?tab=trackers&msg=Torrent+name+normalization+settings+saved&msg_type=success')
+        elif form_id == 'metadata_auto_match_settings':
+            REGISTRATION_DB.set_setting('metadata_auto_match_enabled',
+                                        '1' if fields.get('metadata_auto_match_enabled') == '1' else '0',
+                                        user['username'])
+            REGISTRATION_DB.set_setting('metadata_auto_match_on_upload',
+                                        '1' if fields.get('metadata_auto_match_on_upload') == '1' else '0',
+                                        user['username'])
+            REGISTRATION_DB.set_setting('metadata_auto_match_movies',
+                                        '1' if fields.get('metadata_auto_match_movies') == '1' else '0',
+                                        user['username'])
+            REGISTRATION_DB.set_setting('metadata_auto_match_tv',
+                                        '1' if fields.get('metadata_auto_match_tv') == '1' else '0',
+                                        user['username'])
+            for key, default, lo, hi in [
+                ('metadata_auto_match_upload_cap', '5', 1, 100),
+                ('metadata_auto_match_high_threshold', '90', 80, 100),
+                ('metadata_auto_match_medium_threshold', '72', 50, 95),
+            ]:
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except Exception:
+                    v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
+            return self._redirect('/manage/admin?tab=trackers&msg=Metadata+auto-match+settings+saved&msg_type=success')
         elif form_id == 'auto_promote':
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('auto_promote_enabled', val, user['username'])
@@ -21265,8 +21724,16 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _peer_auto_upload = settings.get('peer_query_auto_on_upload', '0') == '1'
     _peer_auto_cap = _h(settings.get('peer_query_auto_upload_cap', '5'))
     _cleanup_enabled = settings.get('torrent_name_cleanup_enabled', '1') == '1'
+    _cleanup_on_upload = settings.get('torrent_name_cleanup_on_upload', '1') == '1'
     _cleanup_strip_www = settings.get('torrent_name_cleanup_strip_www_prefix', '1') == '1'
     _cleanup_tags = _h(settings.get('torrent_name_cleanup_tags', ''))
+    _am_enabled = settings.get('metadata_auto_match_enabled', '0') == '1'
+    _am_on_upload = settings.get('metadata_auto_match_on_upload', '0') == '1'
+    _am_movies = settings.get('metadata_auto_match_movies', '1') == '1'
+    _am_tv = settings.get('metadata_auto_match_tv', '1') == '1'
+    _am_upload_cap = _h(settings.get('metadata_auto_match_upload_cap', '5'))
+    _am_high = _h(settings.get('metadata_auto_match_high_threshold', '90'))
+    _am_medium = _h(settings.get('metadata_auto_match_medium_threshold', '72'))
     _peer_disabled_attr = '' if is_super else 'disabled'
     _peer_save_cta = ('<button type="submit" class="btn btn-primary">Save Peer Query Settings</button>'
                       if is_super else
@@ -21337,7 +21804,11 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <input type="hidden" name="form_id" value="torrent_name_cleanup_settings">
         <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
           <input type="checkbox" name="torrent_name_cleanup_enabled" value="1" {'checked' if _cleanup_enabled else ''} {_peer_disabled_attr}>
-          Enable automatic normalization on upload
+          Enable normalization engine
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+          <input type="checkbox" name="torrent_name_cleanup_on_upload" value="1" {'checked' if _cleanup_on_upload else ''} {_peer_disabled_attr}>
+          Run on upload
         </label>
         <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
           <input type="checkbox" name="torrent_name_cleanup_strip_www_prefix" value="1" {'checked' if _cleanup_strip_www else ''} {_peer_disabled_attr}>
@@ -21354,6 +21825,53 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           Tags are matched case-insensitively. Empty lines are ignored.
         </div>
         {('<button type="submit" class="btn btn-primary">Save Normalization Settings</button>' if is_super else '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')}
+      </form>
+    </div>'''
+    metadata_auto_match_card = f'''
+    <div class="card">
+      <div class="card-title">Metadata Auto-Match</div>
+      <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+        Attempt IMDb/TVMaze matches from cleaned release names. High confidence auto-approves;
+        medium confidence creates a community-review proposal.
+      </p>
+      <form method="POST" action="/manage/admin/save-settings">
+        <input type="hidden" name="form_id" value="metadata_auto_match_settings">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+          <input type="checkbox" name="metadata_auto_match_enabled" value="1" {'checked' if _am_enabled else ''} {_peer_disabled_attr}>
+          Enable auto-match engine
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+          <input type="checkbox" name="metadata_auto_match_on_upload" value="1" {'checked' if _am_on_upload else ''} {_peer_disabled_attr}>
+          Run on upload
+        </label>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="metadata_auto_match_movies" value="1" {'checked' if _am_movies else ''} {_peer_disabled_attr}>
+            Movies (IMDb/OMDb)
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+            <input type="checkbox" name="metadata_auto_match_tv" value="1" {'checked' if _am_tv else ''} {_peer_disabled_attr}>
+            TV (TVMaze)
+          </label>
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <div class="form-group" style="min-width:150px">
+            <label>Upload cap</label>
+            <input type="number" name="metadata_auto_match_upload_cap" value="{_am_upload_cap}" min="1" max="100" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:180px">
+            <label>High threshold (auto-approve)</label>
+            <input type="number" name="metadata_auto_match_high_threshold" value="{_am_high}" min="80" max="100" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:180px">
+            <label>Medium threshold (queue)</label>
+            <input type="number" name="metadata_auto_match_medium_threshold" value="{_am_medium}" min="50" max="95" {_peer_disabled_attr}>
+          </div>
+        </div>
+        <div style="font-size:0.8rem;color:var(--muted);margin:6px 0 14px 0">
+          Scores below medium are rejected automatically and not kept as pending proposals.
+        </div>
+        {('<button type="submit" class="btn btn-primary">Save Auto-Match Settings</button>' if is_super else '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')}
       </form>
     </div>'''
 
@@ -21461,6 +21979,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
       </form>
     </div>
     {peer_query_card}
+    {metadata_auto_match_card}
     {torrent_name_cleanup_card}
   </div>
 
@@ -22829,7 +23348,17 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 f'</form>'
             )
     metadata_update_btn = ''
+    metadata_auto_match_btn = ''
+    normalize_name_btn = ''
     if REGISTRATION_DB:
+        if REGISTRATION_DB.get_setting('torrent_name_cleanup_enabled', '1') == '1':
+            normalize_name_btn = (
+                f'<form method="POST" action="/manage/torrent/normalize-name" style="display:inline">'
+                f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                f'<button type="submit" class="btn btn-sm btn-blue-rev">&#x1F9F9; Normalize Name</button>'
+                f'</form>'
+            )
         meta_cfg_action = REGISTRATION_DB.get_metadata_config()
         if meta_cfg_action.get('enabled', True) and meta_cfg_action.get('fetch_enabled', True):
             active_meta_for_refresh = REGISTRATION_DB.list_active_metadata_links(ih)
@@ -22862,6 +23391,15 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                     'title="No active metadata linked">'
                     'Refresh Metadata</button>'
                 )
+        if (vrole != 'basic' and meta_cfg_action.get('enabled', True)
+                and meta_cfg_action.get('auto_match_enabled', False)):
+            metadata_auto_match_btn = (
+                f'<form method="POST" action="/manage/torrent/auto-match-metadata" style="display:inline">'
+                f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                f'<button type="submit" class="btn btn-sm btn-blue-rev">&#x1F50E; Auto Match Metadata</button>'
+                f'</form>'
+            )
 
     # Delete button
     del_btn = ''
@@ -23328,10 +23866,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
 
         metadata_card = (
             '<div class="card" id="metadata">'
-            '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">'
-            '<div class="card-title" style="margin:0">Metadata</div>'
-            '<a href="#torrent-report" class="btn btn-sm btn-danger">Report Torrent</a>'
-            '</div>'
+            '<div class="card-title">Metadata</div>'
             + ('<div style="color:var(--danger);font-size:0.84rem">Metadata features are disabled by configuration.</div>' if not meta_enabled else '')
             + (f'<div style="margin-bottom:14px">{propose_controls}</div>' if propose_controls else '')
             + '<div style="display:flex;flex-direction:column;gap:14px">'
@@ -23400,11 +23935,8 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet</button>
         {peer_update_btn}
         {metadata_update_btn}
-        <form method="POST" action="/manage/torrent/normalize-name" style="display:inline">
-          <input type="hidden" name="info_hash" value="{ih}">
-          <input type="hidden" name="_csrf" value="{_h(csrf)}">
-          <button type="submit" class="btn btn-sm btn-blue-rev">&#x1F9F9; Normalize Name</button>
-        </form>
+        {normalize_name_btn}
+        {metadata_auto_match_btn}
         {del_btn}
         {lock_btn}
         {del_comments_btn}
