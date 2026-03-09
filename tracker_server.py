@@ -1458,7 +1458,8 @@ def _parse_torrent_name_cleanup_tags(raw: str) -> list[str]:
 
 
 def _normalize_torrent_display_name(name: str, cleanup_tags: list[str],
-                                    strip_www_prefix: bool = True) -> str:
+                                    strip_www_prefix: bool = True,
+                                    strip_extensions: bool = True) -> str:
     original = str(name or '').strip()
     if not original:
         return ''
@@ -1478,6 +1479,15 @@ def _normalize_torrent_display_name(name: str, cleanup_tags: list[str],
     normalized = re.sub(r'\s{2,}', ' ', normalized).strip()
     normalized = re.sub(r'^\s*[-:|]\s*', '', normalized)
     normalized = re.sub(r'\s*[-:|]\s*$', '', normalized)
+    if strip_extensions:
+        normalized = re.sub(
+            r'(?i)(?:\.(mkv|mp4|avi|mov|wmv|flv|m4v|ts|m2ts|webm|mpg|mpeg|iso|mka|mks|srt|sub|ass))+$',
+            '',
+            normalized,
+        )
+        normalized = re.sub(r'\s{2,}', ' ', normalized).strip()
+        normalized = re.sub(r'^\s*[-:|.]\s*', '', normalized)
+        normalized = re.sub(r'\s*[-:|.]\s*$', '', normalized)
     normalized = normalized.strip()
     return normalized or original
 
@@ -1504,12 +1514,14 @@ def _match_ratio(a: str, b: str) -> int:
 
 
 def _parse_release_for_auto_match(raw_name: str, cleanup_tags: list[str] | None = None,
-                                  strip_www_prefix: bool = True) -> dict[str, Any]:
+                                  strip_www_prefix: bool = True,
+                                  strip_extensions: bool = True) -> dict[str, Any]:
     src = str(raw_name or '').strip()
     cleaned = _normalize_torrent_display_name(
         src,
         cleanup_tags or [],
         strip_www_prefix=strip_www_prefix,
+        strip_extensions=strip_extensions,
     )
     norm = re.sub(r'[\s_]+', '.', cleaned)
     norm = re.sub(r'\.+', '.', norm).strip('.')
@@ -1589,6 +1601,30 @@ def _strip_html_text(raw: str) -> str:
     text = _html_mod.unescape(text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+
+def _normalize_release_name_for_srrdb(raw_name: str) -> str:
+    name = str(raw_name or '').strip()
+    if not name:
+        return ''
+    name = re.sub(r'[\s_]+', '.', name)
+    name = re.sub(r'\.+', '.', name).strip('.')
+    name = re.sub(r'(?i)\.(mkv|mp4|avi|mov|wmv|flv)$', '', name)
+    return name[:240]
+
+
+def _parse_torrent_files_json(files_json_raw: str) -> list[dict[str, Any]]:
+    try:
+        files = json.loads(files_json_raw or '[]')
+        if isinstance(files, list):
+            out: list[dict[str, Any]] = []
+            for f in files:
+                if isinstance(f, dict):
+                    out.append(f)
+            return out
+    except Exception:
+        pass
+    return []
 
 
 def _normalize_external_image_url(raw: str) -> str:
@@ -2376,6 +2412,35 @@ class RegistrationDB:
             );
         ''')
         c.commit()
+        # ── Torrent SRRDB cache (migration-safe) ────────────
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS torrent_srrdb_cache (
+                info_hash                   TEXT PRIMARY KEY,
+                release_name                TEXT    NOT NULL DEFAULT '',
+                matched                     INTEGER NOT NULL DEFAULT 0,
+                srrdb_release               TEXT    NOT NULL DEFAULT '',
+                details_url                 TEXT    NOT NULL DEFAULT '',
+                nfo_name                    TEXT    NOT NULL DEFAULT '',
+                nfo_url                     TEXT    NOT NULL DEFAULT '',
+                imdb_id                     TEXT    NOT NULL DEFAULT '',
+                imdb_title                  TEXT    NOT NULL DEFAULT '',
+                archived_name               TEXT    NOT NULL DEFAULT '',
+                archived_size               INTEGER NOT NULL DEFAULT 0,
+                archived_crc                TEXT    NOT NULL DEFAULT '',
+                nfo_size                    INTEGER NOT NULL DEFAULT 0,
+                nfo_crc                     TEXT    NOT NULL DEFAULT '',
+                local_archived_found        INTEGER NOT NULL DEFAULT 0,
+                local_archived_size_match   INTEGER NOT NULL DEFAULT 0,
+                local_nfo_found             INTEGER NOT NULL DEFAULT 0,
+                local_nfo_size_match        INTEGER NOT NULL DEFAULT 0,
+                fetched_at                  TEXT    NOT NULL,
+                fetch_error                 TEXT    NOT NULL DEFAULT '',
+                raw_json                    TEXT    NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_tsrrdb_fetched
+              ON torrent_srrdb_cache(fetched_at DESC);
+        ''')
+        c.commit()
         # ── Top-up system (migration-safe) ───────────────────
         c.executescript('''
             CREATE TABLE IF NOT EXISTS topup_orders (
@@ -2965,6 +3030,7 @@ class RegistrationDB:
             'torrent_name_cleanup_enabled': '1',
             'torrent_name_cleanup_on_upload': '1',
             'torrent_name_cleanup_strip_www_prefix': '1',
+            'torrent_name_cleanup_strip_extensions': '1',
             'torrent_name_cleanup_tags': '',
             'robots_txt':              'User-agent: *\nDisallow: /announce\nDisallow: /scrape\nDisallow: /manage\n',
             'pw_min_length':     '12',
@@ -3026,6 +3092,12 @@ class RegistrationDB:
             'metadata_auto_match_tv': '1',
             'metadata_auto_match_high_threshold': '90',
             'metadata_auto_match_medium_threshold': '72',
+            'srrdb_enabled':              '0',
+            'srrdb_on_upload':            '0',
+            'srrdb_upload_cap':           '5',
+            'srrdb_timeout_sec':          '5',
+            'srrdb_cache_ttl_hours':      '72',
+            'srrdb_api_base_url':         'https://api.srrdb.com/v1',
             'metadata_omdb_base_url':    'https://www.omdbapi.com/',
             'metadata_tvmaze_base_url':  'https://api.tvmaze.com',
             'metadata_omdb_api_key':     '',
@@ -5200,7 +5272,8 @@ class RegistrationDB:
                 raise
 
     def normalize_torrent_name(self, ih: str, actor: str, cleanup_tags: list[str],
-                               strip_www_prefix: bool = True) -> tuple[bool, str]:
+                               strip_www_prefix: bool = True,
+                               strip_extensions: bool = True) -> tuple[bool, str]:
         ih_upper = (ih or '').strip().upper()
         if not re.fullmatch(r'[A-F0-9]{40}', ih_upper):
             return False, 'Invalid info hash.'
@@ -5214,7 +5287,9 @@ class RegistrationDB:
                     return False, 'Torrent not found.'
                 old_name = str(row['name'] or '')
                 new_name = _normalize_torrent_display_name(
-                    old_name, cleanup_tags, strip_www_prefix=strip_www_prefix
+                    old_name, cleanup_tags,
+                    strip_www_prefix=strip_www_prefix,
+                    strip_extensions=strip_extensions,
                 )
                 if not new_name:
                     return False, 'Normalized name would be empty; update aborted.'
@@ -5618,6 +5693,364 @@ class RegistrationDB:
             ),
             'omdb_api_key': (settings.get('metadata_omdb_api_key', '') or '').strip(),
         }
+
+    def get_srrdb_config(self) -> dict:
+        settings = self.get_all_settings()
+        def _to_int(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                return max(lo, min(hi, int(settings.get(key, str(default)) or default)))
+            except Exception:
+                return default
+        srrdb_base_default = 'https://api.srrdb.com/v1'
+        return {
+            'enabled': settings.get('srrdb_enabled', '0') == '1',
+            'on_upload': settings.get('srrdb_on_upload', '0') == '1',
+            'upload_cap': _to_int('srrdb_upload_cap', 5, 1, 50),
+            'timeout_sec': _to_int('srrdb_timeout_sec', 5, 2, 20),
+            'cache_ttl_hours': _to_int('srrdb_cache_ttl_hours', 72, 1, 720),
+            'api_base_url': _sanitize_metadata_base_url(
+                settings.get('srrdb_api_base_url', srrdb_base_default) or srrdb_base_default,
+                srrdb_base_default,
+                {'api.srrdb.com'},
+            ),
+        }
+
+    def get_torrent_srrdb_cache(self, info_hash: str):
+        ih = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return None
+        return self._conn().execute(
+            'SELECT * FROM torrent_srrdb_cache WHERE info_hash=?',
+            (ih,)
+        ).fetchone()
+
+    def _compare_srrdb_local_files(self, files_json_raw: str, archived_name: str, archived_size: int,
+                                   nfo_name: str, nfo_size: int) -> dict[str, int]:
+        files = _parse_torrent_files_json(files_json_raw)
+        archived_found = 0
+        archived_size_match = 0
+        nfo_found = 0
+        nfo_size_match = 0
+        archived_local_size = 0
+        nfo_local_size = 0
+        archived_name_exact = 0
+        nfo_name_exact = 0
+        archived_match_name = ''
+        nfo_match_name = ''
+
+        cleanup_tags = _parse_torrent_name_cleanup_tags(
+            self.get_setting('torrent_name_cleanup_tags', '')
+        )
+        strip_www_prefix = self.get_setting('torrent_name_cleanup_strip_www_prefix', '1') == '1'
+
+        def _canon_filename(name: str) -> str:
+            base = os.path.basename(str(name or '')).strip()
+            if not base:
+                return ''
+            return _normalize_torrent_display_name(
+                base,
+                cleanup_tags,
+                strip_www_prefix=strip_www_prefix,
+                strip_extensions=False,
+            ).strip().lower()
+
+        file_rows: list[dict[str, Any]] = []
+        for f in files:
+            path = str(f.get('path') or '')
+            base = os.path.basename(path).strip()
+            if not base:
+                continue
+            try:
+                local_size = int(f.get('size') or 0)
+            except Exception:
+                local_size = 0
+            file_rows.append({
+                'base': base,
+                'base_l': base.lower(),
+                'canon': _canon_filename(base),
+                'size': local_size,
+            })
+
+        def _find_local_match(remote_name: str) -> tuple[int, int, int, str]:
+            remote_base = os.path.basename(str(remote_name or '')).strip()
+            if not remote_base:
+                return 0, 0, 0, ''
+            remote_l = remote_base.lower()
+            remote_canon = _canon_filename(remote_base)
+
+            # 1) Exact basename match
+            for row in file_rows:
+                if row['base_l'] == remote_l:
+                    return 1, 1, int(row['size'] or 0), str(row['base'])
+
+            # 2) Normalized fallback match
+            if remote_canon:
+                for row in file_rows:
+                    if row['canon'] and row['canon'] == remote_canon:
+                        return 1, 0, int(row['size'] or 0), str(row['base'])
+            return 0, 0, 0, ''
+
+        a_found, a_exact, a_local_size, a_local_name = _find_local_match(archived_name)
+        archived_found = int(a_found)
+        archived_name_exact = int(a_exact)
+        archived_local_size = int(a_local_size or 0)
+        archived_match_name = a_local_name
+        if archived_found and int(archived_size or 0) > 0 and a_local_size == int(archived_size):
+            archived_size_match = 1
+
+        n_found, n_exact, n_local_size, n_local_name = _find_local_match(nfo_name)
+        nfo_found = int(n_found)
+        nfo_name_exact = int(n_exact)
+        nfo_local_size = int(n_local_size or 0)
+        nfo_match_name = n_local_name
+        if nfo_found and int(nfo_size or 0) > 0 and n_local_size == int(nfo_size):
+            nfo_size_match = 1
+
+        return {
+            'local_archived_found': archived_found,
+            'local_archived_size_match': archived_size_match,
+            'local_nfo_found': nfo_found,
+            'local_nfo_size_match': nfo_size_match,
+            'local_archived_name_exact': archived_name_exact,
+            'local_nfo_name_exact': nfo_name_exact,
+            'local_archived_match_name': archived_match_name,
+            'local_nfo_match_name': nfo_match_name,
+            'local_archived_size': archived_local_size,
+            'local_nfo_size': nfo_local_size,
+        }
+
+    def refresh_torrent_srrdb_cache(self, info_hash: str, actor_username: str = 'system',
+                                    force: bool = False) -> tuple[bool, str]:
+        ih = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return False, 'Invalid info hash.'
+        cfg = self.get_srrdb_config()
+        if not cfg.get('enabled', False):
+            return False, 'SRRDB is disabled.'
+        trow = self.get_torrent(ih)
+        if not trow:
+            return False, 'Torrent not found.'
+        now_ts = self._ts()
+        if not force:
+            cached = self.get_torrent_srrdb_cache(ih)
+            if cached:
+                try:
+                    age = datetime.datetime.now() - _parse_iso(str(cached['fetched_at'] or ''))
+                    if age.total_seconds() < (int(cfg.get('cache_ttl_hours', 72)) * 3600):
+                        return True, 'Cached SRRDB data is still fresh.'
+                except Exception:
+                    pass
+
+        cleanup_tags = _parse_torrent_name_cleanup_tags(
+            self.get_setting('torrent_name_cleanup_tags', '')
+        )
+        strip_www_prefix = self.get_setting('torrent_name_cleanup_strip_www_prefix', '1') == '1'
+        strip_extensions = self.get_setting('torrent_name_cleanup_strip_extensions', '1') == '1'
+        cleaned_name = _normalize_torrent_display_name(
+            str(trow['name'] or ''), cleanup_tags,
+            strip_www_prefix=strip_www_prefix,
+            strip_extensions=strip_extensions,
+        )
+        release_name = _normalize_release_name_for_srrdb(cleaned_name)
+        if not release_name:
+            return False, 'Unable to build SRRDB release query.'
+        base = (cfg.get('api_base_url') or 'https://api.srrdb.com/v1').rstrip('/')
+        timeout_sec = int(cfg.get('timeout_sec', 5))
+        search_key = urllib.parse.quote(f'r:{release_name}', safe=':')
+        ok_search, search_raw, err_search = self._metadata_http_get_json(
+            f'{base}/search/{search_key}', timeout_sec
+        )
+        match_release = ''
+        if ok_search:
+            results = search_raw.get('results') if isinstance(search_raw, dict) else None
+            if isinstance(results, list) and results:
+                match_release = str((results[0] or {}).get('release') or '').strip()
+        if not match_release:
+            for attempt in range(6):
+                try:
+                    c = self._conn()
+                    c.execute(
+                        '''INSERT INTO torrent_srrdb_cache (
+                               info_hash, release_name, matched, srrdb_release, details_url,
+                               nfo_name, nfo_url, imdb_id, imdb_title, archived_name, archived_size,
+                               archived_crc, nfo_size, nfo_crc, local_archived_found, local_archived_size_match,
+                               local_nfo_found, local_nfo_size_match, fetched_at, fetch_error, raw_json
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(info_hash) DO UPDATE SET
+                               release_name=excluded.release_name,
+                               matched=excluded.matched,
+                               srrdb_release=excluded.srrdb_release,
+                               details_url=excluded.details_url,
+                               nfo_name=excluded.nfo_name,
+                               nfo_url=excluded.nfo_url,
+                               imdb_id=excluded.imdb_id,
+                               imdb_title=excluded.imdb_title,
+                               archived_name=excluded.archived_name,
+                               archived_size=excluded.archived_size,
+                               archived_crc=excluded.archived_crc,
+                               nfo_size=excluded.nfo_size,
+                               nfo_crc=excluded.nfo_crc,
+                               local_archived_found=excluded.local_archived_found,
+                               local_archived_size_match=excluded.local_archived_size_match,
+                               local_nfo_found=excluded.local_nfo_found,
+                               local_nfo_size_match=excluded.local_nfo_size_match,
+                               fetched_at=excluded.fetched_at,
+                               fetch_error=excluded.fetch_error,
+                               raw_json=excluded.raw_json''',
+                        (
+                            ih, release_name, 0, '', '', '', '', '', '', '', 0, '', 0, '',
+                            0, 0, 0, 0, now_ts,
+                            str(err_search or 'No SRRDB match found.')[:500],
+                            json.dumps({'search': search_raw if ok_search else {}, 'error': err_search or ''}, ensure_ascii=False),
+                        )
+                    )
+                    c.commit()
+                    self._log(actor_username, 'srrdb_cache_refresh', ih, f'matched=0 release={release_name}')
+                    return False, 'No SRRDB match found.'
+                except sqlite3.OperationalError as e:
+                    if 'locked' in str(e).lower() and attempt < 5:
+                        time.sleep(0.08 * (attempt + 1))
+                        continue
+                    if 'locked' in str(e).lower():
+                        log.warning('refresh_torrent_srrdb_cache lock after retries (non-fatal): ih=%s actor=%s err=%s',
+                                    ih, actor_username, e)
+                        return False, 'Database is busy, please retry SRRDB refresh.'
+                    raise
+
+        ok_details, details_raw, err_details = self._metadata_http_get_json(
+            f'{base}/details/{urllib.parse.quote(match_release, safe="")}', timeout_sec
+        )
+        ok_nfo, nfo_raw, err_nfo = self._metadata_http_get_json(
+            f'{base}/nfo/{urllib.parse.quote(match_release, safe="")}', timeout_sec
+        )
+        ok_imdb, imdb_raw, _err_imdb = self._metadata_http_get_json(
+            f'{base}/imdb/{urllib.parse.quote(match_release, safe="")}', timeout_sec
+        )
+
+        archived_name = ''
+        archived_size = 0
+        archived_crc = ''
+        nfo_name = ''
+        nfo_url = ''
+        nfo_size = 0
+        nfo_crc = ''
+        imdb_id = ''
+        imdb_title = ''
+        if ok_details and isinstance(details_raw, dict):
+            archived = details_raw.get('archived-files')
+            if isinstance(archived, list) and archived:
+                first = archived[0] if isinstance(archived[0], dict) else {}
+                archived_name = str(first.get('name') or '')
+                try:
+                    archived_size = int(first.get('size') or 0)
+                except Exception:
+                    archived_size = 0
+                archived_crc = str(first.get('crc') or '')
+            files = details_raw.get('files')
+            if isinstance(files, list):
+                for f in files:
+                    if not isinstance(f, dict):
+                        continue
+                    fname = str(f.get('name') or '')
+                    if fname.lower().endswith('.nfo'):
+                        nfo_name = fname
+                        try:
+                            nfo_size = int(f.get('size') or 0)
+                        except Exception:
+                            nfo_size = 0
+                        nfo_crc = str(f.get('crc') or '')
+                        break
+        if ok_nfo and isinstance(nfo_raw, dict):
+            nfo_list = nfo_raw.get('nfo')
+            nfo_links = nfo_raw.get('nfolink')
+            if isinstance(nfo_list, list) and nfo_list and not nfo_name:
+                nfo_name = str(nfo_list[0] or '')
+            if isinstance(nfo_links, list) and nfo_links:
+                nfo_url = str(nfo_links[0] or '')
+        if ok_imdb and isinstance(imdb_raw, dict):
+            rels = imdb_raw.get('releases')
+            if isinstance(rels, list) and rels:
+                first_rel = rels[0] if isinstance(rels[0], dict) else {}
+                iid = str(first_rel.get('imdb') or '').strip()
+                if iid.isdigit():
+                    imdb_id = f'tt{iid}'
+                elif iid.lower().startswith('tt'):
+                    imdb_id = iid.lower()
+                imdb_title = str(first_rel.get('title') or '')
+
+        local_cmp = self._compare_srrdb_local_files(
+            str(trow['files_json'] or ''), archived_name, archived_size, nfo_name, nfo_size
+        )
+        details_url = f'https://www.srrdb.com/release/details/{urllib.parse.quote(match_release, safe="")}'
+        fetch_error = ''
+        if not ok_details:
+            fetch_error = err_details or 'Failed to fetch SRRDB details.'
+        elif not ok_nfo:
+            fetch_error = err_nfo or 'Failed to fetch SRRDB NFO data.'
+
+        for attempt in range(6):
+            try:
+                c = self._conn()
+                c.execute(
+                    '''INSERT INTO torrent_srrdb_cache (
+                           info_hash, release_name, matched, srrdb_release, details_url,
+                           nfo_name, nfo_url, imdb_id, imdb_title, archived_name, archived_size,
+                           archived_crc, nfo_size, nfo_crc, local_archived_found, local_archived_size_match,
+                           local_nfo_found, local_nfo_size_match, fetched_at, fetch_error, raw_json
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(info_hash) DO UPDATE SET
+                           release_name=excluded.release_name,
+                           matched=excluded.matched,
+                           srrdb_release=excluded.srrdb_release,
+                           details_url=excluded.details_url,
+                           nfo_name=excluded.nfo_name,
+                           nfo_url=excluded.nfo_url,
+                           imdb_id=excluded.imdb_id,
+                           imdb_title=excluded.imdb_title,
+                           archived_name=excluded.archived_name,
+                           archived_size=excluded.archived_size,
+                           archived_crc=excluded.archived_crc,
+                           nfo_size=excluded.nfo_size,
+                           nfo_crc=excluded.nfo_crc,
+                           local_archived_found=excluded.local_archived_found,
+                           local_archived_size_match=excluded.local_archived_size_match,
+                           local_nfo_found=excluded.local_nfo_found,
+                           local_nfo_size_match=excluded.local_nfo_size_match,
+                           fetched_at=excluded.fetched_at,
+                           fetch_error=excluded.fetch_error,
+                           raw_json=excluded.raw_json''',
+                    (
+                        ih, release_name, 1, match_release, details_url,
+                        nfo_name[:400], nfo_url[:1000], imdb_id[:32], imdb_title[:200],
+                        archived_name[:400], int(archived_size or 0), archived_crc[:32],
+                        int(nfo_size or 0), nfo_crc[:32],
+                        int(local_cmp.get('local_archived_found', 0)),
+                        int(local_cmp.get('local_archived_size_match', 0)),
+                        int(local_cmp.get('local_nfo_found', 0)),
+                        int(local_cmp.get('local_nfo_size_match', 0)),
+                        now_ts, fetch_error[:500],
+                        json.dumps({
+                            'search': search_raw if ok_search else {},
+                            'details': {'ok': ok_details, 'error': err_details or ''},
+                            'nfo': {'ok': ok_nfo, 'error': err_nfo or ''},
+                            'imdb': {'ok': ok_imdb},
+                        }, ensure_ascii=False),
+                    )
+                )
+                c.commit()
+                self._log(actor_username, 'srrdb_cache_refresh', ih,
+                          f'matched=1 release={match_release} error={fetch_error[:120]}')
+                return True, ('SRRDB matched.' if not fetch_error else 'SRRDB matched with partial data.')
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower() and attempt < 5:
+                    time.sleep(0.08 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    log.warning('refresh_torrent_srrdb_cache lock after retries (non-fatal): ih=%s actor=%s err=%s',
+                                ih, actor_username, e)
+                    return False, 'Database is busy, please retry SRRDB refresh.'
+                raise
+        return False, 'Database is busy, please retry SRRDB refresh.'
 
     def list_metadata_proposals_for_torrent(self, info_hash: str, limit: int = 20) -> list:
         ih = (info_hash or '').strip().upper()
@@ -6265,6 +6698,29 @@ class RegistrationDB:
         for candidate in contraction_variants:
             if candidate and all(candidate.lower() != existing.lower() for existing in title_variants):
                 title_variants.append(candidate)
+        # Possessive fallback: release names often drop apostrophes ("Sisters" vs "Sister's").
+        # Generate conservative single-word possessive probes to avoid over-mutating titles.
+        possessive_variants: list[str] = []
+        for title in list(title_variants):
+            words = title.split()
+            for idx, w in enumerate(words):
+                if "'" in w:
+                    continue
+                mpos = re.fullmatch(r'([A-Za-z]{3,})s', w)
+                if not mpos:
+                    continue
+                singular = mpos.group(1)
+                if len(singular) < 3:
+                    continue
+                w2 = f"{singular}'s"
+                out = list(words)
+                out[idx] = w2
+                probe = ' '.join(out).strip()
+                if probe:
+                    possessive_variants.append(probe)
+        for candidate in possessive_variants:
+            if candidate and all(candidate.lower() != existing.lower() for existing in title_variants):
+                title_variants.append(candidate)
         # Generic base-title fallback: long release names often include franchise subtitles
         # that OMDb does not index in `t=` lookup. Try compact leading-token probes.
         words = [w for w in re.split(r'\s+', tq) if w]
@@ -6339,10 +6795,12 @@ class RegistrationDB:
             self.get_setting('torrent_name_cleanup_tags', '')
         )
         strip_www_prefix = self.get_setting('torrent_name_cleanup_strip_www_prefix', '1') == '1'
+        strip_extensions = self.get_setting('torrent_name_cleanup_strip_extensions', '1') == '1'
         parsed = _parse_release_for_auto_match(
             str(trow['name'] or ''),
             cleanup_tags=cleanup_tags,
             strip_www_prefix=strip_www_prefix,
+            strip_extensions=strip_extensions,
         )
         title_query = str(parsed.get('title_query') or '').strip()
         if not title_query:
@@ -12610,6 +13068,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_torrent_update_metadata()
         elif path == '/manage/torrent/auto-match-metadata':
             self._post_torrent_auto_match_metadata()
+        elif path == '/manage/torrent/srrdb-match':
+            self._post_torrent_srrdb_match()
         elif path == '/manage/torrent/normalize-name':
             self._post_torrent_normalize_name()
         elif path == '/manage/torrent/vote':
@@ -14098,6 +14558,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         cleanup_strip_www = REGISTRATION_DB.get_setting(
             'torrent_name_cleanup_strip_www_prefix', '1'
         ) == '1'
+        cleanup_strip_extensions = REGISTRATION_DB.get_setting(
+            'torrent_name_cleanup_strip_extensions', '1'
+        ) == '1'
         for idx, (fname, file_data) in enumerate(file_list):
             if idx >= max_files:
                 skipped_over_max_files += 1
@@ -14112,7 +14575,9 @@ class ManageHandler(BaseHTTPRequestHandler):
                 continue
             if cleanup_enabled and cleanup_on_upload:
                 normalized_name = _normalize_torrent_display_name(
-                    name, cleanup_tags, strip_www_prefix=cleanup_strip_www
+                    name, cleanup_tags,
+                    strip_www_prefix=cleanup_strip_www,
+                    strip_extensions=cleanup_strip_extensions,
                 )
             else:
                 normalized_name = (name or '').strip()
@@ -14142,8 +14607,11 @@ class ManageHandler(BaseHTTPRequestHandler):
         auto_match_approved = 0
         auto_match_pending = 0
         auto_match_skipped = 0
+        srrdb_matched = 0
+        srrdb_skipped = 0
         peer_cfg = REGISTRATION_DB.get_peer_query_config()
         meta_cfg = REGISTRATION_DB.get_metadata_config() if REGISTRATION_DB else {}
+        srrdb_cfg = REGISTRATION_DB.get_srrdb_config() if REGISTRATION_DB else {'enabled': False}
         if added_with_hash and peer_cfg.get('active') and peer_cfg.get('auto_on_upload'):
             configured_cap = max(1, int(peer_cfg.get('auto_upload_cap', 5)))
             # Guardrail for very large uploads: keep auto peer queue pressure bounded.
@@ -14178,6 +14646,30 @@ class ManageHandler(BaseHTTPRequestHandler):
                         raise
             if len(added_with_hash) > mcap:
                 auto_match_skipped += (len(added_with_hash) - mcap)
+        if (added_with_hash and srrdb_cfg.get('enabled', False)
+                and srrdb_cfg.get('on_upload', False)):
+            scap = max(1, min(50, int(srrdb_cfg.get('upload_cap', 5))))
+            for ih, _tname in added_with_hash[:scap]:
+                try:
+                    s_ok, _s_msg = REGISTRATION_DB.refresh_torrent_srrdb_cache(
+                        ih, actor_username=user['username'], force=True
+                    )
+                    if s_ok and REGISTRATION_DB.get_torrent_srrdb_cache(ih):
+                        row = REGISTRATION_DB.get_torrent_srrdb_cache(ih)
+                        if row and int(row['matched'] or 0) == 1:
+                            srrdb_matched += 1
+                        else:
+                            srrdb_skipped += 1
+                    else:
+                        srrdb_skipped += 1
+                except sqlite3.OperationalError as e:
+                    if 'locked' in str(e).lower():
+                        srrdb_skipped += 1
+                        log.warning('UPLOAD srrdb refresh skipped due DB lock ih=%s user=%s', ih, user['username'])
+                    else:
+                        raise
+            if len(added_with_hash) > scap:
+                srrdb_skipped += (len(added_with_hash) - scap)
         follower_notifs = 0
         for ih, tname in added_with_hash:
             follower_notifs += REGISTRATION_DB.notify_followers_torrent_upload(
@@ -14211,6 +14703,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             parts.append(f'{auto_match_pending} metadata queued for review')
         if auto_match_skipped and meta_cfg.get('auto_match_on_upload', False):
             parts.append(f'{auto_match_skipped} metadata auto-match skipped')
+        if srrdb_matched:
+            parts.append(f'{srrdb_matched} SRRDB matches cached')
+        if srrdb_skipped and srrdb_cfg.get('on_upload', False):
+            parts.append(f'{srrdb_skipped} SRRDB checks skipped')
         msg = ' | '.join(parts) if parts else 'No files processed.'
         msg_type = 'success' if added else 'error'
         log.debug('UPLOAD result msg=%r msg_type=%r added=%d skipped=%d errors=%d',
@@ -14241,8 +14737,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         cleanup_strip_www = REGISTRATION_DB.get_setting(
             'torrent_name_cleanup_strip_www_prefix', '1'
         ) == '1'
+        cleanup_strip_extensions = REGISTRATION_DB.get_setting(
+            'torrent_name_cleanup_strip_extensions', '1'
+        ) == '1'
         ok, msg = REGISTRATION_DB.normalize_torrent_name(
-            ih, user['username'], cleanup_tags, strip_www_prefix=cleanup_strip_www
+            ih, user['username'], cleanup_tags,
+            strip_www_prefix=cleanup_strip_www,
+            strip_extensions=cleanup_strip_extensions,
         )
         q = urllib.parse.quote(msg)
         return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type={"success" if ok else "error"}')
@@ -14705,6 +15206,27 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/dashboard')
         ok, msg, _level, _score = REGISTRATION_DB.auto_match_torrent_metadata(
             ih, int(user['id']), user['username'], source='manual'
+        )
+        q = urllib.parse.quote(msg)
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_torrent_srrdb_match(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        if _user_role(user) == 'basic':
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        if not ih or not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        cfg = REGISTRATION_DB.get_srrdb_config()
+        if not cfg.get('enabled', False):
+            q = urllib.parse.quote('SRRDB engine is disabled.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        ok, msg = REGISTRATION_DB.refresh_torrent_srrdb_cache(
+            ih, actor_username=user['username'], force=True
         )
         q = urllib.parse.quote(msg)
         return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type={"success" if ok else "error"}')
@@ -16116,12 +16638,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             enabled = '1' if fields.get('torrent_name_cleanup_enabled') == '1' else '0'
             on_upload = '1' if fields.get('torrent_name_cleanup_on_upload') == '1' else '0'
             strip_www = '1' if fields.get('torrent_name_cleanup_strip_www_prefix') == '1' else '0'
+            strip_extensions = '1' if fields.get('torrent_name_cleanup_strip_extensions') == '1' else '0'
             cleanup_tags = _parse_torrent_name_cleanup_tags(
                 fields.get('torrent_name_cleanup_tags', '')
             )
             REGISTRATION_DB.set_setting('torrent_name_cleanup_enabled', enabled, user['username'])
             REGISTRATION_DB.set_setting('torrent_name_cleanup_on_upload', on_upload, user['username'])
             REGISTRATION_DB.set_setting('torrent_name_cleanup_strip_www_prefix', strip_www, user['username'])
+            REGISTRATION_DB.set_setting('torrent_name_cleanup_strip_extensions', strip_extensions, user['username'])
             REGISTRATION_DB.set_setting('torrent_name_cleanup_tags', '\n'.join(cleanup_tags)[:8000], user['username'])
             return self._redirect('/manage/admin?tab=trackers&msg=Torrent+name+normalization+settings+saved&msg_type=success')
         elif form_id == 'metadata_auto_match_settings':
@@ -16147,6 +16671,35 @@ class ManageHandler(BaseHTTPRequestHandler):
                 except Exception:
                     v = default
                 REGISTRATION_DB.set_setting(key, v, user['username'])
+        elif form_id == 'srrdb_settings':
+            REGISTRATION_DB.set_setting('srrdb_enabled',
+                                        '1' if fields.get('srrdb_enabled') == '1' else '0',
+                                        user['username'])
+            REGISTRATION_DB.set_setting('srrdb_on_upload',
+                                        '1' if fields.get('srrdb_on_upload') == '1' else '0',
+                                        user['username'])
+            for key, default, lo, hi in [
+                ('srrdb_upload_cap', '5', 1, 50),
+                ('srrdb_timeout_sec', '5', 2, 20),
+                ('srrdb_cache_ttl_hours', '72', 1, 720),
+            ]:
+                try:
+                    v = str(max(lo, min(hi, int(fields.get(key, default)))))
+                except Exception:
+                    v = default
+                REGISTRATION_DB.set_setting(key, v, user['username'])
+            api_base = (fields.get('srrdb_api_base_url', '') or '').strip()
+            if api_base:
+                try:
+                    parsed = urllib.parse.urlparse(api_base)
+                    host = (parsed.hostname or '').lower()
+                    if parsed.scheme == 'https' and host == 'api.srrdb.com':
+                        REGISTRATION_DB.set_setting('srrdb_api_base_url', api_base[:300], user['username'])
+                    else:
+                        return self._redirect('/manage/admin?tab=trackers&msg=SRRDB+API+base+must+be+https%3A%2F%2Fapi.srrdb.com%2Fv1&msg_type=error')
+                except Exception:
+                    return self._redirect('/manage/admin?tab=trackers&msg=Invalid+SRRDB+API+base+URL.&msg_type=error')
+            return self._redirect('/manage/admin?tab=trackers&msg=SRRDB+settings+saved&msg_type=success')
             return self._redirect('/manage/admin?tab=trackers&msg=Metadata+auto-match+settings+saved&msg_type=success')
         elif form_id == 'auto_promote':
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
@@ -18045,6 +18598,8 @@ _MANAGE_CSS = '''
   .btn-id-copy:hover { color:var(--accent); border-color:var(--accent); background:rgba(245,166,35,0.08); }
   .btn-green { border-color: var(--green); color: var(--green); }
   .btn-green:hover { background: var(--green); color: #000; }
+  .btn-orange-rev { border-color: var(--accent); color: var(--accent); }
+  .btn-orange-rev:hover { background: var(--accent); color: #000; border-color: var(--accent); }
   .btn-accent-rev { border-color: var(--accent); color: var(--accent); }
   .btn-accent-rev:hover { background: var(--accent); color: #000; border-color: var(--green); }
   .btn-blue-rev { border-color: var(--blue); color: var(--blue); }
@@ -21726,6 +22281,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _cleanup_enabled = settings.get('torrent_name_cleanup_enabled', '1') == '1'
     _cleanup_on_upload = settings.get('torrent_name_cleanup_on_upload', '1') == '1'
     _cleanup_strip_www = settings.get('torrent_name_cleanup_strip_www_prefix', '1') == '1'
+    _cleanup_strip_ext = settings.get('torrent_name_cleanup_strip_extensions', '1') == '1'
     _cleanup_tags = _h(settings.get('torrent_name_cleanup_tags', ''))
     _am_enabled = settings.get('metadata_auto_match_enabled', '0') == '1'
     _am_on_upload = settings.get('metadata_auto_match_on_upload', '0') == '1'
@@ -21734,6 +22290,12 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _am_upload_cap = _h(settings.get('metadata_auto_match_upload_cap', '5'))
     _am_high = _h(settings.get('metadata_auto_match_high_threshold', '90'))
     _am_medium = _h(settings.get('metadata_auto_match_medium_threshold', '72'))
+    _srr_enabled = settings.get('srrdb_enabled', '0') == '1'
+    _srr_on_upload = settings.get('srrdb_on_upload', '0') == '1'
+    _srr_upload_cap = _h(settings.get('srrdb_upload_cap', '5'))
+    _srr_timeout = _h(settings.get('srrdb_timeout_sec', '5'))
+    _srr_ttl = _h(settings.get('srrdb_cache_ttl_hours', '72'))
+    _srr_api_base = _h(settings.get('srrdb_api_base_url', 'https://api.srrdb.com/v1'))
     _peer_disabled_attr = '' if is_super else 'disabled'
     _peer_save_cta = ('<button type="submit" class="btn btn-primary">Save Peer Query Settings</button>'
                       if is_super else
@@ -21814,6 +22376,10 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           <input type="checkbox" name="torrent_name_cleanup_strip_www_prefix" value="1" {'checked' if _cleanup_strip_www else ''} {_peer_disabled_attr}>
           Strip leading site prefix (example: <span class="hash">www.site.tld - </span>)
         </label>
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+          <input type="checkbox" name="torrent_name_cleanup_strip_extensions" value="1" {'checked' if _cleanup_strip_ext else ''} {_peer_disabled_attr}>
+          Remove trailing file extensions (example: <span class="hash">.mkv</span>, <span class="hash">.mp4</span>, <span class="hash">.avi</span>)
+        </label>
         <div class="form-group">
           <label>Junk tags (one per line or comma-separated)</label>
           <textarea name="torrent_name_cleanup_tags" rows="6"
@@ -21872,6 +22438,46 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           Scores below medium are rejected automatically and not kept as pending proposals.
         </div>
         {('<button type="submit" class="btn btn-primary">Save Auto-Match Settings</button>' if is_super else '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')}
+      </form>
+    </div>'''
+    srrdb_card = f'''
+    <div class="card">
+      <div class="card-title">SRRDB Matching</div>
+      <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+        Query SRRDB by normalized release name and cache details/nfo/imdb links for matching releases.
+      </p>
+      <form method="POST" action="/manage/admin/save-settings">
+        <input type="hidden" name="form_id" value="srrdb_settings">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+          <input type="checkbox" name="srrdb_enabled" value="1" {'checked' if _srr_enabled else ''} {_peer_disabled_attr}>
+          Enable SRRDB engine
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+          <input type="checkbox" name="srrdb_on_upload" value="1" {'checked' if _srr_on_upload else ''} {_peer_disabled_attr}>
+          Run on upload
+        </label>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <div class="form-group" style="min-width:150px">
+            <label>Upload cap</label>
+            <input type="number" name="srrdb_upload_cap" value="{_srr_upload_cap}" min="1" max="50" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:150px">
+            <label>Timeout (sec)</label>
+            <input type="number" name="srrdb_timeout_sec" value="{_srr_timeout}" min="2" max="20" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:170px">
+            <label>Cache TTL (hours)</label>
+            <input type="number" name="srrdb_cache_ttl_hours" value="{_srr_ttl}" min="1" max="720" {_peer_disabled_attr}>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>SRRDB API Base URL</label>
+          <input type="text" name="srrdb_api_base_url" value="{_srr_api_base}" placeholder="https://api.srrdb.com/v1" {_peer_disabled_attr}>
+        </div>
+        <div style="font-size:0.8rem;color:var(--muted);margin:6px 0 14px 0">
+          SRRDB card appears on torrent pages only when the engine is enabled and a match is found.
+        </div>
+        {('<button type="submit" class="btn btn-primary">Save SRRDB Settings</button>' if is_super else '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')}
       </form>
     </div>'''
 
@@ -21981,6 +22587,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     {peer_query_card}
     {metadata_auto_match_card}
     {torrent_name_cleanup_card}
+    {srrdb_card}
   </div>
 
   {'<div class="panel" id="panel-settings">' + settings_html + '</div>' if is_super else ''}
@@ -23349,6 +23956,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             )
     metadata_update_btn = ''
     metadata_auto_match_btn = ''
+    srrdb_match_btn = ''
     normalize_name_btn = ''
     if REGISTRATION_DB:
         if REGISTRATION_DB.get_setting('torrent_name_cleanup_enabled', '1') == '1':
@@ -23398,6 +24006,15 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 f'<input type="hidden" name="info_hash" value="{ih}">'
                 f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
                 f'<button type="submit" class="btn btn-sm btn-blue-rev">&#x1F50E; Auto Match Metadata</button>'
+                f'</form>'
+            )
+        srrdb_cfg_action = REGISTRATION_DB.get_srrdb_config()
+        if (vrole != 'basic' and srrdb_cfg_action.get('enabled', False)):
+            srrdb_match_btn = (
+                f'<form method="POST" action="/manage/torrent/srrdb-match" style="display:inline">'
+                f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                f'<button type="submit" class="btn btn-sm btn-blue-rev">&#x1F50E; srrDB Match</button>'
                 f'</form>'
             )
 
@@ -23519,6 +24136,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         '</details>'
     )
     metadata_card = ''
+    srrdb_card = ''
     if REGISTRATION_DB:
         meta_cfg = REGISTRATION_DB.get_metadata_config()
         meta_enabled = bool(meta_cfg.get('enabled', True))
@@ -23877,6 +24495,119 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             '</div>'
             '</div>'
         )
+        srrdb_cfg = REGISTRATION_DB.get_srrdb_config()
+        if srrdb_cfg.get('enabled', False):
+            srow = REGISTRATION_DB.get_torrent_srrdb_cache(ih)
+            if srow and int(srow['matched'] or 0) == 1:
+                s_release = _h(str(srow['srrdb_release'] or ''))
+                s_details = _h(str(srow['details_url'] or ''))
+                s_nfo_name = _h(str(srow['nfo_name'] or ''))
+                s_nfo_url = _h(str(srow['nfo_url'] or ''))
+                s_imdb = str(srow['imdb_id'] or '').strip().lower()
+                s_imdb_title = _h(str(srow['imdb_title'] or ''))
+                s_arch_name = _h(str(srow['archived_name'] or ''))
+                s_arch_size = int(srow['archived_size'] or 0)
+                s_arch_crc = _h(str(srow['archived_crc'] or ''))
+                s_nfo_size = int(srow['nfo_size'] or 0)
+                s_nfo_crc = _h(str(srow['nfo_crc'] or ''))
+                s_arch_found = int(srow['local_archived_found'] or 0) == 1
+                s_arch_match = int(srow['local_archived_size_match'] or 0) == 1
+                s_nfo_found = int(srow['local_nfo_found'] or 0) == 1
+                s_nfo_match = int(srow['local_nfo_size_match'] or 0) == 1
+                s_cmp_live = REGISTRATION_DB._compare_srrdb_local_files(
+                    str(t['files_json'] or ''), str(srow['archived_name'] or ''), s_arch_size,
+                    str(srow['nfo_name'] or ''), s_nfo_size
+                )
+                s_arch_exact = int(s_cmp_live.get('local_archived_name_exact', 0) or 0) == 1
+                s_nfo_exact = int(s_cmp_live.get('local_nfo_name_exact', 0) or 0) == 1
+                s_arch_local_name = str(s_cmp_live.get('local_archived_match_name', '') or '')
+                s_nfo_local_name = str(s_cmp_live.get('local_nfo_match_name', '') or '')
+                s_arch_local_size = int(s_cmp_live.get('local_archived_size', 0) or 0)
+                s_nfo_local_size = int(s_cmp_live.get('local_nfo_size', 0) or 0)
+                s_err = _h(str(srow['fetch_error'] or ''))
+                active_imdb = ''
+                active_links_for_imdb = REGISTRATION_DB.list_active_metadata_links(ih)
+                for al in active_links_for_imdb:
+                    if str(al['provider'] or '') == 'imdb':
+                        active_imdb = str(al['external_id'] or '').strip().lower()
+                        break
+                imdb_align = '--'
+                if s_imdb:
+                    imdb_align = 'Match' if (active_imdb and active_imdb == s_imdb) else ('Mismatch' if active_imdb else 'No active IMDb metadata')
+                imdb_align_badge = (
+                    '<span style="color:#3ecf8e !important;font-weight:600">🟢 Match</span>' if imdb_align == 'Match'
+                    else ('<span style="color:#ff6b6b !important;font-weight:600">🔴 Mismatch</span>' if imdb_align == 'Mismatch'
+                          else f'<span class="hash">{_h(imdb_align)}</span>')
+                )
+                mkv_size_badge = (
+                    '<span style="color:#3ecf8e !important;font-weight:600">🟢 Match</span>' if s_arch_match
+                    else ('<span style="color:#ff6b6b !important;font-weight:600">🔴 Mismatch</span>' if s_arch_found else '<span class="hash">--</span>')
+                )
+                nfo_size_badge = (
+                    '<span style="color:#3ecf8e !important;font-weight:600">🟢 Match</span>' if s_nfo_match
+                    else ('<span style="color:#ff6b6b !important;font-weight:600">🔴 Mismatch</span>' if s_nfo_found else '<span class="hash">--</span>')
+                )
+                if s_arch_found and (not s_arch_match):
+                    arch_size_tip = _h(
+                        f'Size mismatch: local {format(s_arch_local_size, ",")} B '
+                        f'vs srrDB {format(s_arch_size, ",")} B'
+                    )
+                    mkv_size_badge = (
+                        f'<span style="color:#ff6b6b !important;font-weight:600" title="{arch_size_tip}">'
+                        '🔴 Mismatch</span>'
+                    )
+                if s_nfo_found and (not s_nfo_match):
+                    nfo_size_tip = _h(
+                        f'Size mismatch: local {format(s_nfo_local_size, ",")} B '
+                        f'vs srrDB {format(s_nfo_size, ",")} B'
+                    )
+                    nfo_size_badge = (
+                        f'<span style="color:#ff6b6b !important;font-weight:600" title="{nfo_size_tip}">'
+                        '🔴 Mismatch</span>'
+                    )
+                if s_arch_match and s_arch_found and not s_arch_exact:
+                    arch_tip = _h(f'Filename differs: local "{s_arch_local_name or "--"}" vs srrDB "{str(srow["archived_name"] or "")}"')
+                    mkv_size_badge = (
+                        f'<span style="color:#f5a623 !important;font-weight:600" title="{arch_tip}">'
+                        '🟡 Match</span>'
+                    )
+                if s_nfo_match and s_nfo_found and not s_nfo_exact:
+                    nfo_tip = _h(f'Filename differs: local "{s_nfo_local_name or "--"}" vs srrDB "{str(srow["nfo_name"] or "")}"')
+                    nfo_size_badge = (
+                        f'<span style="color:#f5a623 !important;font-weight:600" title="{nfo_tip}">'
+                        '🟡 Match</span>'
+                    )
+                srrdb_nfo_btn = (f'<a href="{s_nfo_url}" target="_blank" rel="noopener" class="btn btn-sm btn-orange-rev">NFO</a>'
+                                 if s_nfo_url else '')
+                srrdb_imdb_html = (
+                    f'<div><span class="hash">srrDB IMDb:</span> '
+                    f'<a href="https://www.imdb.com/title/{_h(s_imdb)}/" target="_blank" rel="noopener" class="user-link">{_h(s_imdb)}</a> '
+                    f'&nbsp;·&nbsp; {s_imdb_title}</div>'
+                    if s_imdb else ''
+                )
+                srrdb_note_html = (f'<div style="color:var(--muted);font-size:0.8rem">Note: {s_err}</div>'
+                                   if s_err else '')
+                srrdb_card = (
+                    '<div class="card" id="srrdb">'
+                    '<div class="card-title">Scene Verification (srrDB)</div>'
+                    '<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:10px">'
+                    f'<span class="hash">Release: <span style="color:var(--text);font-family:var(--mono)">{s_release}</span></span>'
+                    f'<a href="{s_details}" target="_blank" rel="noopener" class="btn btn-sm btn-orange-rev">srrDB</a>'
+                    f'{srrdb_nfo_btn}'
+                    + '</div>'
+                    '<div style="display:flex;flex-direction:column;gap:8px;font-size:0.86rem">'
+                    f'<div><span class="hash">Archived:</span> {s_arch_name or "--"} '
+                    f'(<span class="hash">{_fmt_size(s_arch_size) if s_arch_size else "--"}, CRC {s_arch_crc or "--"}</span>)</div>'
+                    f'<div><span class="hash">NFO:</span> {s_nfo_name or "--"} '
+                    f'(<span class="hash">{_fmt_size(s_nfo_size) if s_nfo_size else "--"}, CRC {s_nfo_crc or "--"}</span>)</div>'
+                    f'<div class="hash">Local MKV: {"found" if s_arch_found else "not found"} · size {mkv_size_badge}'
+                    f' &nbsp;|&nbsp; Local NFO: {"found" if s_nfo_found else "not found"} · size {nfo_size_badge}</div>'
+                    f'{srrdb_imdb_html}'
+                    f'<div class="hash">IMDb alignment: {imdb_align_badge}</div>'
+                    f'{srrdb_note_html}'
+                    '</div>'
+                    '</div>'
+                )
 
     body = f'''
   <div class="page-title">{t["name"]}</div>
@@ -23937,6 +24668,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         {metadata_update_btn}
         {normalize_name_btn}
         {metadata_auto_match_btn}
+        {srrdb_match_btn}
         {del_btn}
         {lock_btn}
         {del_comments_btn}
@@ -23946,6 +24678,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
 
   {swarm_card}
   {metadata_card}
+  {srrdb_card}
 
   <div class="card">
     {files_html}
