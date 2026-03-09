@@ -24014,7 +24014,8 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 f'<form method="POST" action="/manage/torrent/srrdb-match" style="display:inline">'
                 f'<input type="hidden" name="info_hash" value="{ih}">'
                 f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
-                f'<button type="submit" class="btn btn-sm btn-blue-rev">&#x1F50E; srrDB Match</button>'
+                f'<button type="submit" class="btn btn-sm btn-blue-rev" '
+                f'title="srrDB matching is intended for scene releases.">&#x1F50E; srrDB Match</button>'
                 f'</form>'
             )
 
