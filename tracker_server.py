@@ -1441,6 +1441,46 @@ def _infer_tv_show_query(release_name: str) -> str:
     return q[:120]
 
 
+def _parse_torrent_name_cleanup_tags(raw: str) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r'[\n,]+', str(raw or '')):
+        tag = part.strip()
+        if not tag:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tags.append(tag[:120])
+    return tags
+
+
+def _normalize_torrent_display_name(name: str, cleanup_tags: list[str],
+                                    strip_www_prefix: bool = True) -> str:
+    original = str(name or '').strip()
+    if not original:
+        return ''
+    normalized = original
+    if strip_www_prefix:
+        normalized = re.sub(
+            r'(?i)^\s*(?:www\.)[a-z0-9.-]+\.[a-z]{2,}\s*[-–—]\s*',
+            '',
+            normalized,
+        )
+    for tag in cleanup_tags:
+        if not tag:
+            continue
+        normalized = re.sub(re.escape(tag), '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\[\s*\]', ' ', normalized)
+    normalized = re.sub(r'\(\s*\)', ' ', normalized)
+    normalized = re.sub(r'\s{2,}', ' ', normalized).strip()
+    normalized = re.sub(r'^\s*[-:|]\s*', '', normalized)
+    normalized = re.sub(r'\s*[-:|]\s*$', '', normalized)
+    normalized = normalized.strip()
+    return normalized or original
+
+
 def _strip_html_text(raw: str) -> str:
     text = str(raw or '')
     if not text:
@@ -2823,6 +2863,9 @@ class RegistrationDB:
             'upload_max_content_mb':  '100',
             'upload_max_files':       '1000',
             'upload_max_file_mb':     '10',
+            'torrent_name_cleanup_enabled': '1',
+            'torrent_name_cleanup_strip_www_prefix': '1',
+            'torrent_name_cleanup_tags': '',
             'robots_txt':              'User-agent: *\nDisallow: /announce\nDisallow: /scrape\nDisallow: /manage\n',
             'pw_min_length':     '12',
             'pw_require_upper':  '1',
@@ -5047,6 +5090,45 @@ class RegistrationDB:
                 if 'locked' in str(e).lower() and attempt < 9:
                     time.sleep(0.25 * (attempt + 1))
                     continue
+                raise
+
+    def normalize_torrent_name(self, ih: str, actor: str, cleanup_tags: list[str],
+                               strip_www_prefix: bool = True) -> tuple[bool, str]:
+        ih_upper = (ih or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih_upper):
+            return False, 'Invalid info hash.'
+        for attempt in range(6):
+            try:
+                c = self._conn()
+                row = c.execute(
+                    'SELECT name FROM torrents WHERE info_hash=?', (ih_upper,)
+                ).fetchone()
+                if not row:
+                    return False, 'Torrent not found.'
+                old_name = str(row['name'] or '')
+                new_name = _normalize_torrent_display_name(
+                    old_name, cleanup_tags, strip_www_prefix=strip_www_prefix
+                )
+                if not new_name:
+                    return False, 'Normalized name would be empty; update aborted.'
+                if new_name == old_name:
+                    return True, 'Torrent name is already normalized.'
+                c.execute(
+                    'UPDATE torrents SET name=? WHERE info_hash=?',
+                    (new_name[:500], ih_upper)
+                )
+                c.commit()
+                self._log(actor, 'normalize_torrent_name', ih_upper,
+                          f'{old_name[:140]} -> {new_name[:140]}')
+                return True, 'Torrent name normalized.'
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower() and attempt < 5:
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    log.warning('normalize_torrent_name lock after retries (non-fatal): ih=%s actor=%s err=%s',
+                                ih_upper, actor, e)
+                    return False, 'Database is busy, please retry name normalization.'
                 raise
 
     # ── Credits & Invite Codes ────────────────────────────
@@ -12146,6 +12228,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_torrent_update_peers()
         elif path == '/manage/torrent/update-metadata':
             self._post_torrent_update_metadata()
+        elif path == '/manage/torrent/normalize-name':
+            self._post_torrent_normalize_name()
         elif path == '/manage/torrent/vote':
             self._post_torrent_vote()
         elif path == '/manage/torrent/report':
@@ -13623,6 +13707,14 @@ class ManageHandler(BaseHTTPRequestHandler):
         skipped_invalid   = 0
         skipped_over_max_files = 0
         skipped_db_locked = 0
+        normalized_names = 0
+        cleanup_enabled = REGISTRATION_DB.get_setting('torrent_name_cleanup_enabled', '1') == '1'
+        cleanup_tags = _parse_torrent_name_cleanup_tags(
+            REGISTRATION_DB.get_setting('torrent_name_cleanup_tags', '')
+        )
+        cleanup_strip_www = REGISTRATION_DB.get_setting(
+            'torrent_name_cleanup_strip_www_prefix', '1'
+        ) == '1'
         for idx, (fname, file_data) in enumerate(file_list):
             if idx >= max_files:
                 skipped_over_max_files += 1
@@ -13635,8 +13727,18 @@ class ManageHandler(BaseHTTPRequestHandler):
             except Exception:
                 skipped_invalid += 1
                 continue
+            if cleanup_enabled:
+                normalized_name = _normalize_torrent_display_name(
+                    name, cleanup_tags, strip_www_prefix=cleanup_strip_www
+                )
+            else:
+                normalized_name = (name or '').strip()
+            if normalized_name and normalized_name != name:
+                normalized_names += 1
             try:
-                ok = REGISTRATION_DB.register_torrent(ih, name, total_size, user['id'], user['username'], meta=meta)
+                ok = REGISTRATION_DB.register_torrent(
+                    ih, normalized_name, total_size, user['id'], user['username'], meta=meta
+                )
             except sqlite3.OperationalError as e:
                 if 'locked' in str(e).lower():
                     skipped_db_locked += 1
@@ -13644,11 +13746,12 @@ class ManageHandler(BaseHTTPRequestHandler):
                     continue
                 raise
             if ok:
-                log.info('REGISTRATION torrent registered  ih=%s  name=%s  by=%s', ih, name, user['username'])
-                REGISTRATION_DB.award_upload_points(user['id'], name, ih)
+                log.info('REGISTRATION torrent registered  ih=%s  name=%s  by=%s',
+                         ih, normalized_name, user['username'])
+                REGISTRATION_DB.award_upload_points(user['id'], normalized_name, ih)
                 REGISTRATION_DB.check_auto_promote(user['id'])
-                added.append(name)
-                added_with_hash.append((ih, name))
+                added.append(normalized_name)
+                added_with_hash.append((ih, normalized_name))
             else:
                 skipped_duplicate += 1
         auto_peer_queued = 0
@@ -13683,6 +13786,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             parts.append(f'{skipped_over_max_files} skipped (max files per upload is {max_files})')
         if skipped_db_locked:
             parts.append(f'{skipped_db_locked} skipped (temporary database lock)')
+        if normalized_names:
+            parts.append(f'{normalized_names} names normalized')
         if auto_peer_queued:
             parts.append(f'{auto_peer_queued} peer snapshots queued')
         over_cap = max(0, len(added_with_hash) - cap) if (added_with_hash and peer_cfg.get('active') and peer_cfg.get('auto_on_upload')) else 0
@@ -13701,6 +13806,30 @@ class ManageHandler(BaseHTTPRequestHandler):
         # PRG pattern: prevent browser back button from replaying POST /manage/upload.
         msg_q = urllib.parse.quote_plus(msg[:500])
         return self._redirect(f'/manage/dashboard?msg={msg_q}&msg_type={msg_type}')
+
+    def _post_torrent_normalize_name(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not t:
+            return self._redirect('/manage/dashboard')
+        cleanup_tags = _parse_torrent_name_cleanup_tags(
+            REGISTRATION_DB.get_setting('torrent_name_cleanup_tags', '')
+        )
+        cleanup_strip_www = REGISTRATION_DB.get_setting(
+            'torrent_name_cleanup_strip_www_prefix', '1'
+        ) == '1'
+        ok, msg = REGISTRATION_DB.normalize_torrent_name(
+            ih, user['username'], cleanup_tags, strip_www_prefix=cleanup_strip_www
+        )
+        q = urllib.parse.quote(msg)
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type={"success" if ok else "error"}')
 
     def _get_notifications(self):
         user = self._get_session_user()
@@ -15550,6 +15679,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.set_setting('peer_query_auto_on_upload', auto_on_upload, user['username'])
             REGISTRATION_DB.set_setting('peer_query_auto_upload_cap', auto_cap, user['username'])
             return self._redirect('/manage/admin?tab=trackers&msg=Peer+query+settings+saved&msg_type=success')
+        elif form_id == 'torrent_name_cleanup_settings':
+            enabled = '1' if fields.get('torrent_name_cleanup_enabled') == '1' else '0'
+            strip_www = '1' if fields.get('torrent_name_cleanup_strip_www_prefix') == '1' else '0'
+            cleanup_tags = _parse_torrent_name_cleanup_tags(
+                fields.get('torrent_name_cleanup_tags', '')
+            )
+            REGISTRATION_DB.set_setting('torrent_name_cleanup_enabled', enabled, user['username'])
+            REGISTRATION_DB.set_setting('torrent_name_cleanup_strip_www_prefix', strip_www, user['username'])
+            REGISTRATION_DB.set_setting('torrent_name_cleanup_tags', '\n'.join(cleanup_tags)[:8000], user['username'])
+            return self._redirect('/manage/admin?tab=trackers&msg=Torrent+name+normalization+settings+saved&msg_type=success')
         elif form_id == 'auto_promote':
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('auto_promote_enabled', val, user['username'])
@@ -17449,6 +17588,8 @@ _MANAGE_CSS = '''
   .btn-green:hover { background: var(--green); color: #000; }
   .btn-accent-rev { border-color: var(--accent); color: var(--accent); }
   .btn-accent-rev:hover { background: var(--accent); color: #000; border-color: var(--green); }
+  .btn-blue-rev { border-color: var(--blue); color: var(--blue); }
+  .btn-blue-rev:hover { background: var(--blue); color: #000; border-color: var(--blue); }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
           padding: 24px 28px; margin-bottom: 24px; }
   .card-title { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.2em;
@@ -21123,6 +21264,9 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _peer_wait = _h(settings.get('peer_query_retry_wait_sec', '2'))
     _peer_auto_upload = settings.get('peer_query_auto_on_upload', '0') == '1'
     _peer_auto_cap = _h(settings.get('peer_query_auto_upload_cap', '5'))
+    _cleanup_enabled = settings.get('torrent_name_cleanup_enabled', '1') == '1'
+    _cleanup_strip_www = settings.get('torrent_name_cleanup_strip_www_prefix', '1') == '1'
+    _cleanup_tags = _h(settings.get('torrent_name_cleanup_tags', ''))
     _peer_disabled_attr = '' if is_super else 'disabled'
     _peer_save_cta = ('<button type="submit" class="btn btn-primary">Save Peer Query Settings</button>'
                       if is_super else
@@ -21180,6 +21324,36 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           Saving fails if the tool path does not exist. Enabling requires all fields plus both placeholders: {{hash}}, {{tracker}}.
         </div>
         {_peer_save_cta}
+      </form>
+    </div>'''
+    torrent_name_cleanup_card = f'''
+    <div class="card">
+      <div class="card-title">Torrent Name Normalization</div>
+      <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+        Remove known junk tags/prefixes from torrent names during upload. You can also trigger
+        manual normalization from any torrent detail page.
+      </p>
+      <form method="POST" action="/manage/admin/save-settings">
+        <input type="hidden" name="form_id" value="torrent_name_cleanup_settings">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+          <input type="checkbox" name="torrent_name_cleanup_enabled" value="1" {'checked' if _cleanup_enabled else ''} {_peer_disabled_attr}>
+          Enable automatic normalization on upload
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px">
+          <input type="checkbox" name="torrent_name_cleanup_strip_www_prefix" value="1" {'checked' if _cleanup_strip_www else ''} {_peer_disabled_attr}>
+          Strip leading site prefix (example: <span class="hash">www.site.tld - </span>)
+        </label>
+        <div class="form-group">
+          <label>Junk tags (one per line or comma-separated)</label>
+          <textarea name="torrent_name_cleanup_tags" rows="6"
+                    placeholder="[PianYuan]\n[EtHD]\nwww.UIndex.org -"
+                    style="width:100%;padding:10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem;resize:vertical"
+                    {_peer_disabled_attr}>{_cleanup_tags}</textarea>
+        </div>
+        <div style="font-size:0.8rem;color:var(--muted);margin:6px 0 14px 0">
+          Tags are matched case-insensitively. Empty lines are ignored.
+        </div>
+        {('<button type="submit" class="btn btn-primary">Save Normalization Settings</button>' if is_super else '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')}
       </form>
     </div>'''
 
@@ -21268,7 +21442,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     </div>
   </div>
 
-  <div class="panel" id="panel-trackers">
+    <div class="panel" id="panel-trackers">
     <div class="card">
       <div class="card-title">Magnet Link Trackers</div>
       <div class="table-wrap"><table>
@@ -21287,6 +21461,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
       </form>
     </div>
     {peer_query_card}
+    {torrent_name_cleanup_card}
   </div>
 
   {'<div class="panel" id="panel-settings">' + settings_html + '</div>' if is_super else ''}
@@ -23225,6 +23400,11 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet</button>
         {peer_update_btn}
         {metadata_update_btn}
+        <form method="POST" action="/manage/torrent/normalize-name" style="display:inline">
+          <input type="hidden" name="info_hash" value="{ih}">
+          <input type="hidden" name="_csrf" value="{_h(csrf)}">
+          <button type="submit" class="btn btn-sm btn-blue-rev">&#x1F9F9; Normalize Name</button>
+        </form>
         {del_btn}
         {lock_btn}
         {del_comments_btn}
