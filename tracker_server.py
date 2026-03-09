@@ -1498,6 +1498,7 @@ _TITLE_STOP_TOKENS = {
     'dv', 'dolbyvision', 'proper', 'repack', 'internal', 'extended', 'remux', 'uhd',
     'dd', 'ddp', 'ddp5', 'ddp51', 'ddp7', 'aac', 'ac3', 'dts', 'atmos', 'truehd',
     'amzn', 'amazon', 'nf', 'netflix', 'dsnp', 'hmax', 'atvp', 'pcok', 'roku', 'itunes',
+    'true',
 }
 
 
@@ -6653,6 +6654,9 @@ class RegistrationDB:
             return False, {}, 'Missing title query.'
         base = (cfg.get('omdb_base_url') or 'https://www.omdbapi.com/').rstrip('/')
         timeout = int(cfg.get('fetch_timeout_sec', 5))
+        # Remove obvious non-title wrappers while preserving year for `y=` query param.
+        tq = re.sub(r'\(\s*(19\d{2}|20\d{2})\s*\)', ' ', tq)
+        tq = re.sub(r'\s+', ' ', tq).strip()
         title_variants: list[str] = [tq]
         stripped = re.sub(r'(?i)^(the|a|an)\s+', '', tq).strip()
         if stripped and stripped.lower() != tq.lower():
@@ -6670,6 +6674,7 @@ class RegistrationDB:
         # Release names often strip apostrophes (were -> we're). Add conservative variants.
         contraction_map = {
             'were': "we're",
+            'youre': "you're",
             'dont': "don't",
             'cant': "can't",
             'wont': "won't",
@@ -6719,6 +6724,48 @@ class RegistrationDB:
                 if probe:
                     possessive_variants.append(probe)
         for candidate in possessive_variants:
+            if candidate and all(candidate.lower() != existing.lower() for existing in title_variants):
+                title_variants.append(candidate)
+        # Compact cleanup for noisy release tokens that can leak into title query.
+        compact_variants: list[str] = []
+        # Common language/audio tags that should not be part of OMDb title queries.
+        stop_words = {
+            'true',
+            'hindi', 'hin',
+            'tamil', 'tam',
+            'telugu', 'tel',
+            'malayalam', 'mal',
+            'kannada', 'kan',
+            'english', 'eng',
+            'bengali', 'ben',
+            'punjabi', 'pan',
+            'marathi', 'mar',
+            'gujarati', 'guj',
+            'urdu',
+            'japanese', 'jpn',
+            'korean', 'kor',
+            'chinese', 'chi',
+            'french', 'fre', 'fra',
+            'spanish', 'spa',
+            'german', 'ger', 'deu',
+            'italian', 'ita',
+            'russian', 'rus',
+            'arabic', 'ara',
+            'dubbed', 'subbed', 'esub',
+            'multi', 'multi2', 'multi3',
+        }
+        for title in list(title_variants):
+            words = [w for w in re.split(r'\s+', title) if w]
+            kept = []
+            for w in words:
+                key = re.sub(r'[^a-z0-9]+', '', w.lower())
+                if key in stop_words:
+                    continue
+                kept.append(w)
+            compact = re.sub(r'\s+', ' ', ' '.join(kept)).strip()
+            if compact:
+                compact_variants.append(compact)
+        for candidate in compact_variants:
             if candidate and all(candidate.lower() != existing.lower() for existing in title_variants):
                 title_variants.append(candidate)
         # Generic base-title fallback: long release names often include franchise subtitles
