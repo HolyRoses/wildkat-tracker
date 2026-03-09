@@ -6165,9 +6165,14 @@ class RegistrationDB:
         closes_at = now + datetime.timedelta(hours=cfg['vote_window_hours'])
         ts_now = self._ts()
         c = self._conn()
+        use_savepoint = bool(getattr(c, 'in_transaction', False))
+        sp_name = 'wk_meta_propose'
         for attempt in range(8):
             try:
-                c.execute('BEGIN IMMEDIATE')
+                if use_savepoint:
+                    c.execute(f'SAVEPOINT {sp_name}')
+                else:
+                    c.execute('BEGIN IMMEDIATE')
                 # Guard: one active proposal per provider per torrent.
                 active = c.execute(
                     '''SELECT id FROM torrent_metadata_proposals
@@ -6176,7 +6181,11 @@ class RegistrationDB:
                     (ih, p)
                 ).fetchone()
                 if active:
-                    c.execute('ROLLBACK')
+                    if use_savepoint:
+                        c.execute(f'ROLLBACK TO SAVEPOINT {sp_name}')
+                        c.execute(f'RELEASE SAVEPOINT {sp_name}')
+                    else:
+                        c.execute('ROLLBACK')
                     return False, 'An active proposal already exists for this provider.'
                 c.execute(
                     '''INSERT INTO torrent_metadata_proposals (
@@ -6192,17 +6201,28 @@ class RegistrationDB:
                      ts_now, closes_at.isoformat(), closes_at.isoformat(),
                      None, ts_now, ts_now)
                 )
-                c.execute('COMMIT')
+                if use_savepoint:
+                    c.execute(f'RELEASE SAVEPOINT {sp_name}')
+                else:
+                    c.execute('COMMIT')
                 break
             except sqlite3.IntegrityError:
                 try:
-                    c.execute('ROLLBACK')
+                    if use_savepoint:
+                        c.execute(f'ROLLBACK TO SAVEPOINT {sp_name}')
+                        c.execute(f'RELEASE SAVEPOINT {sp_name}')
+                    else:
+                        c.execute('ROLLBACK')
                 except Exception:
                     pass
                 return False, 'This metadata target has already been proposed for this torrent.'
             except sqlite3.OperationalError as e:
                 try:
-                    c.execute('ROLLBACK')
+                    if use_savepoint:
+                        c.execute(f'ROLLBACK TO SAVEPOINT {sp_name}')
+                        c.execute(f'RELEASE SAVEPOINT {sp_name}')
+                    else:
+                        c.execute('ROLLBACK')
                 except Exception:
                     pass
                 if 'locked' in str(e).lower() and attempt < 7:
