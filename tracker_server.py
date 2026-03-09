@@ -6898,6 +6898,40 @@ class RegistrationDB:
         if level == 'low':
             self._log(actor_username, 'metadata_auto_match_low', ih,
                       f'provider={provider} id={ext_id} score={score} source={source} {explain}')
+            # Fallback: if SRRDB has a valid IMDb id, enqueue a pending IMDb proposal.
+            try:
+                srow = self.get_torrent_srrdb_cache(ih)
+            except Exception:
+                srow = None
+            srrdb_imdb = ''
+            if srow:
+                srrdb_imdb = _validate_imdb_id(str(srow['imdb_id'] or ''))
+            if srrdb_imdb and not self.has_active_metadata_link(ih, 'imdb'):
+                srrdb_url = f'https://www.imdb.com/title/{srrdb_imdb}/'
+                ok_fb, fb_result = self.create_metadata_proposal(
+                    ih, 'imdb', srrdb_imdb, int(actor_user_id), actor_username,
+                    proposed_url=srrdb_url
+                )
+                if ok_fb:
+                    fb_pid = int(fb_result)
+                    try:
+                        self._stage_pending_metadata_preview(fb_pid)
+                    except Exception:
+                        pass
+                    self.notify_metadata_proposed(fb_pid, actor_username)
+                    self._log(actor_username, 'metadata_auto_match_srrdb_fallback', ih,
+                              f'proposal_id={fb_pid} imdb={srrdb_imdb} score={score} source={source}')
+                    return True, (
+                        f'Auto-match score too low ({score}); '
+                        f'queued SRRDB IMDb fallback proposal ({srrdb_imdb}); '
+                        f'pending metadata card was pre-populated.'
+                    ), 'medium', int(score)
+                self._log(actor_username, 'metadata_auto_match_srrdb_fallback_failed', ih,
+                          f'imdb={srrdb_imdb} score={score} source={source} err={fb_result}')
+                return False, (
+                    f'Auto-match score too low ({score}); '
+                    f'SRRDB fallback proposal failed ({str(fb_result)}).'
+                ), 'low', int(score)
             return False, f'Auto-match score too low ({score}); no proposal created.', 'low', int(score)
 
         ok_prop, result = self.create_metadata_proposal(
