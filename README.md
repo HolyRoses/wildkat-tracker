@@ -33,6 +33,9 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Self-service account deletion** — multi-step forced logout + fresh login + final phrase/password confirmation flow
 - **Followers system** — follow/unfollow members, follower activity notifications, and Most Followed leaderboard category
 - **Torrent peer snapshots** — manual Seeds/Peers refresh from torrent detail pages (3-hour cooldown) plus optional auto-queued refresh after upload with configurable cap
+- **Torrent name normalization** — configurable cleanup engine with optional upload-time normalization and manual per-torrent normalization action
+- **Metadata auto-match** — configurable IMDb/TVMaze/Steam auto-match engine with confidence thresholds, upload caps, and SRRDB IMDb fallback to pending proposals
+- **Scene verification (srrDB)** — optional SRRDB match/caching, scene release verification card, and manual per-torrent srrDB match action
 - **Direct messages** — threaded inbox/sent/compose/blocked flow with optional point cost and daily limits
 - **Comments and notifications** — threaded torrent/bounty comments, comment upvote/downvote controls, @mentions, bell dropdown, and full notifications page
 - **Torrent reporting subsystem** — in-page torrent reports with typed reasons, moderator workflow, assignment, notes, and contextual notifications

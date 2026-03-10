@@ -418,6 +418,14 @@ You should see `2.0Gi` under the Swap row.
 
 When `--registration` is enabled the management interface is available at `https://tracker.example.net/manage`.
 
+After first login as Super, review **Admin Panel → Trackers** and configure optional automation engines as needed:
+
+- Torrent name normalization (master toggle + on-upload toggle + tag list)
+- Metadata auto-match (master toggle + on-upload toggle + thresholds/caps)
+- SRRDB matching (master toggle + on-upload toggle + timeout/cache controls)
+
+These features are optional and can be enabled incrementally. SRRDB matching is intended for scene-style releases.
+
 ### 9.1 Set the Superuser Password
 
 On first run the superuser account is created automatically. To set its password, stop the service and run the server directly with `--super-user-password`:

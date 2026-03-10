@@ -162,6 +162,33 @@ If peer-query settings are enabled by Super, the torrent Actions card includes *
 - On success, Seeders/Peers/Downloads, Last Peer Update, and Peer Source are updated.
 - On failure or no-data responses, existing stored counts are not overwritten.
 - Optional tracker setting can auto-queue peer refreshes after successful uploads (background, non-blocking).
+- Admin and Super bypass the cooldown; non-privileged roles follow cooldown timing.
+
+### Normalize Name
+
+If the normalization engine is enabled, the torrent Actions card includes **Normalize Name**.
+
+- Runs the configured normalization rules for that torrent name only.
+- Keeps torrent file list entries unchanged; only display name is updated.
+- Typical cleanup includes known junk tags, optional `www.domain -` prefixes, and optional trailing extension stripping.
+
+### Auto Match Metadata
+
+If metadata auto-match is enabled, the torrent Actions card includes **Auto Match Metadata**.
+
+- Attempts provider matching from the cleaned release name.
+- High-confidence matches are approved immediately.
+- Medium-confidence matches are queued for community review.
+- Low-confidence/no-match can fall back to SRRDB IMDb proposal when SRRDB cache for that torrent includes a valid IMDb id.
+- SRRDB fallback proposals remain **pending** (not auto-approved) and pre-populate the pending metadata card for review context.
+
+### Refresh Metadata
+
+If metadata fetch is enabled and the torrent has active metadata, the Actions card includes **Refresh Metadata**.
+
+- Refreshes active metadata from upstream provider APIs.
+- Cooldown applies for non-privileged users.
+- Admin and Super bypass metadata refresh cooldown.
 
 If there are confidently linked active members in the swarm, a full-width **Members Currently Sharing This Torrent** card appears with member links and last activity times. If no linked members are active, the card is not shown.
 
@@ -216,6 +243,31 @@ Torrent detail pages include a **Metadata** card with proposal, review, and acti
 
 - If post-revoke is enabled, owner/editor/admin/super can revoke active metadata and submit replacement
 - Community users cannot replace already-active metadata directly
+
+### Scene Verification (srrDB)
+
+If SRRDB matching is enabled and a match has been cached for the torrent, detail pages show a **Scene Verification (srrDB)** card.
+
+Card contents:
+
+- Matched SRRDB release name
+- srrDB details button and NFO link (when available)
+- Archived and NFO expected size/CRC from SRRDB
+- Local MKV/NFO presence and size comparison status
+- SRRDB IMDb id/title and IMDb alignment state
+
+Status meanings:
+
+- **🟢 Match** — exact filename and size match
+- **🟡 Match** — size match but filename differs after normalization fallback
+- **🔴 Mismatch** — size mismatch
+
+Hover behavior:
+
+- Yellow state shows a tooltip with local vs SRRDB filename differences.
+- Red state shows a tooltip with exact local and SRRDB byte counts.
+
+The **srrDB Match** action button tooltip notes that SRRDB matching is intended for scene releases.
 
 ---
 
@@ -656,6 +708,37 @@ Validation rules:
 - Arguments must request JSON output.
 - Saving fails if the configured tool path does not exist.
 - Auto-run upload refresh uses a background queue so upload responses return immediately.
+
+The Trackers tab also contains three metadata-related engine cards:
+
+1. **Torrent Name Normalization**
+
+- Enable/disable normalization engine (master switch)
+- Run on upload toggle
+- Strip leading `www.domain -` prefix toggle
+- Remove trailing extension toggle (for display-name cleanup flow)
+- Configurable junk-tag list (one per line or comma-separated)
+
+2. **Metadata Auto-Match**
+
+- Enable/disable auto-match engine (master switch)
+- Run on upload toggle
+- Movie and TV toggles
+- Upload cap per batch
+- High/medium confidence thresholds
+
+3. **SRRDB Matching**
+
+- Enable/disable SRRDB engine (master switch)
+- Run on upload toggle
+- Upload cap, timeout, and cache TTL
+- SRRDB API base URL (validated)
+
+Operational notes:
+
+- Action-card buttons are shown only when their related engine is enabled.
+- Upload-triggered automations are capped per batch to avoid blocking upload responses.
+- SRRDB matching is intended for scene-style releases.
 
 ### Settings Tab
 
