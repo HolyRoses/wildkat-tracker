@@ -147,6 +147,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 log = logging.getLogger('tracker')
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 class _WKSQLiteConnection(sqlite3.Connection):
@@ -179,11 +180,12 @@ class _WKSQLiteConnection(sqlite3.Connection):
                 '_rollback_if_locked', '_log_lock_diagnostic', '_log_slow_diagnostic',
             }
             for frame in reversed(stack):
-                fname = os.path.basename(frame.filename or '')
-                if fname != 'tracker_server.py':
+                fpath = os.path.abspath(frame.filename or '')
+                if not fpath.startswith(APP_ROOT + os.sep):
                     continue
                 if frame.name in ignored:
                     continue
+                fname = os.path.basename(fpath)
                 return f'{fname}:{frame.lineno}:{frame.name}'
         except Exception:
             pass
