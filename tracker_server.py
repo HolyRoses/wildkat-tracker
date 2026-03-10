@@ -58,6 +58,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import queue
 import urllib.parse
 import urllib.request
@@ -152,8 +153,71 @@ class _WKSQLiteConnection(sqlite3.Connection):
     """SQLite connection that self-recovers after lock contention."""
 
     @staticmethod
+    def _is_locked_error(err: Exception) -> bool:
+        msg = str(err).lower()
+        return (
+            'database is locked' in msg or
+            'database table is locked' in msg or
+            'database schema is locked' in msg or
+            'database busy' in msg
+        )
+
+    @staticmethod
+    def _sql_brief(sql: str, max_len: int = 180) -> str:
+        text = re.sub(r'\s+', ' ', str(sql or '')).strip()
+        if len(text) > max_len:
+            return text[: max_len - 3] + '...'
+        return text
+
+    @staticmethod
+    def _callsite() -> str:
+        try:
+            stack = traceback.extract_stack(limit=32)
+            ignored = {
+                'execute', 'executemany', 'executescript',
+                '_callsite', '_sql_brief', '_is_locked_error',
+                '_rollback_if_locked', '_log_lock_diagnostic', '_log_slow_diagnostic',
+            }
+            for frame in reversed(stack):
+                fname = os.path.basename(frame.filename or '')
+                if fname != 'tracker_server.py':
+                    continue
+                if frame.name in ignored:
+                    continue
+                return f'{fname}:{frame.lineno}:{frame.name}'
+        except Exception:
+            pass
+        return 'unknown'
+
+    @classmethod
+    def _log_lock_diagnostic(cls, op: str, sql: str, err: Exception, elapsed_ms: int) -> None:
+        log.warning(
+            'DBLOCK op=%s elapsed_ms=%d thread=%s callsite=%s sql=%s err=%s',
+            op,
+            int(elapsed_ms),
+            threading.current_thread().name,
+            cls._callsite(),
+            cls._sql_brief(sql),
+            str(err),
+        )
+
+    @classmethod
+    def _log_slow_diagnostic(cls, op: str, sql: str, elapsed_ms: int) -> None:
+        # 2s indicates lock wait / contention pressure in this app profile.
+        if elapsed_ms < 2000:
+            return
+        log.warning(
+            'DBSLOW op=%s elapsed_ms=%d thread=%s callsite=%s sql=%s',
+            op,
+            int(elapsed_ms),
+            threading.current_thread().name,
+            cls._callsite(),
+            cls._sql_brief(sql),
+        )
+
+    @staticmethod
     def _rollback_if_locked(conn: sqlite3.Connection, err: Exception) -> None:
-        if 'locked' not in str(err).lower():
+        if not _WKSQLiteConnection._is_locked_error(err):
             return
         try:
             conn.rollback()
@@ -161,24 +225,126 @@ class _WKSQLiteConnection(sqlite3.Connection):
             pass
 
     def execute(self, sql, parameters=(), /):
+        _sql_text = str(sql or '')
+        _sql_head = re.sub(r'\s+', ' ', _sql_text.strip().upper())
+        _callsite = self._callsite()
+        if _sql_head.startswith('BEGIN IMMEDIATE'):
+            self._wk_txn_started_at = time.monotonic()
+            self._wk_txn_started_callsite = _callsite
+            self._wk_txn_started_thread = threading.current_thread().name
+            log.debug(
+                'DBTX begin mode=immediate thread=%s callsite=%s',
+                self._wk_txn_started_thread,
+                self._wk_txn_started_callsite,
+            )
+        _start = time.monotonic()
         try:
-            return super().execute(sql, parameters)
+            cur = super().execute(sql, parameters)
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            self._log_slow_diagnostic('execute', sql, _elapsed_ms)
+            return cur
         except sqlite3.OperationalError as e:
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            if self._is_locked_error(e):
+                self._log_lock_diagnostic('execute', sql, e, _elapsed_ms)
             self._rollback_if_locked(self, e)
             raise
 
     def executemany(self, sql, seq_of_parameters, /):
+        _start = time.monotonic()
         try:
-            return super().executemany(sql, seq_of_parameters)
+            cur = super().executemany(sql, seq_of_parameters)
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            self._log_slow_diagnostic('executemany', sql, _elapsed_ms)
+            return cur
         except sqlite3.OperationalError as e:
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            if self._is_locked_error(e):
+                self._log_lock_diagnostic('executemany', sql, e, _elapsed_ms)
             self._rollback_if_locked(self, e)
             raise
 
     def executescript(self, sql_script, /):
+        _start = time.monotonic()
         try:
-            return super().executescript(sql_script)
+            cur = super().executescript(sql_script)
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            self._log_slow_diagnostic('executescript', sql_script, _elapsed_ms)
+            return cur
         except sqlite3.OperationalError as e:
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            if self._is_locked_error(e):
+                self._log_lock_diagnostic('executescript', sql_script, e, _elapsed_ms)
             self._rollback_if_locked(self, e)
+            raise
+
+    def commit(self):
+        _start = time.monotonic()
+        try:
+            out = super().commit()
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            if _elapsed_ms >= 2000:
+                log.warning(
+                    'DBSLOW op=commit elapsed_ms=%d thread=%s callsite=%s',
+                    _elapsed_ms,
+                    threading.current_thread().name,
+                    self._callsite(),
+                )
+            _txn_started = getattr(self, '_wk_txn_started_at', None)
+            if _txn_started is not None:
+                _txn_elapsed_ms = int((time.monotonic() - float(_txn_started)) * 1000)
+                if _txn_elapsed_ms >= 2000:
+                    log.warning(
+                        'DBTX duration_ms=%d begin_thread=%s begin_callsite=%s commit_thread=%s commit_callsite=%s',
+                        _txn_elapsed_ms,
+                        getattr(self, '_wk_txn_started_thread', 'unknown'),
+                        getattr(self, '_wk_txn_started_callsite', 'unknown'),
+                        threading.current_thread().name,
+                        self._callsite(),
+                    )
+            self._wk_txn_started_at = None
+            self._wk_txn_started_callsite = ''
+            self._wk_txn_started_thread = ''
+            return out
+        except sqlite3.OperationalError as e:
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            if self._is_locked_error(e):
+                log.warning(
+                    'DBLOCK op=commit elapsed_ms=%d thread=%s callsite=%s err=%s',
+                    _elapsed_ms,
+                    threading.current_thread().name,
+                    self._callsite(),
+                    str(e),
+                )
+            self._rollback_if_locked(self, e)
+            raise
+
+    def rollback(self):
+        _start = time.monotonic()
+        try:
+            out = super().rollback()
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            if _elapsed_ms >= 2000:
+                log.warning(
+                    'DBSLOW op=rollback elapsed_ms=%d thread=%s callsite=%s',
+                    _elapsed_ms,
+                    threading.current_thread().name,
+                    self._callsite(),
+                )
+            self._wk_txn_started_at = None
+            self._wk_txn_started_callsite = ''
+            self._wk_txn_started_thread = ''
+            return out
+        except sqlite3.OperationalError as e:
+            _elapsed_ms = int((time.monotonic() - _start) * 1000)
+            if self._is_locked_error(e):
+                log.warning(
+                    'DBLOCK op=rollback elapsed_ms=%d thread=%s callsite=%s err=%s',
+                    _elapsed_ms,
+                    threading.current_thread().name,
+                    self._callsite(),
+                    str(e),
+                )
             raise
 
 try:
@@ -2011,6 +2177,18 @@ class RegistrationDB:
             self._local.conn = conn
             self._local.conn_gen = self._restore_gen
         return self._local.conn
+
+    def _rollback_quiet(self, conn: sqlite3.Connection | None = None) -> None:
+        """Best-effort rollback helper for failed write attempts.
+
+        Centralizes rollback-on-error behavior so IntegrityError paths do not
+        accidentally leave open transactions behind.
+        """
+        c = conn if conn is not None else self._conn()
+        try:
+            c.rollback()
+        except Exception:
+            pass
 
     def _init_schema(self):
         c = self._conn()
@@ -4668,6 +4846,7 @@ class RegistrationDB:
             self._log(actor, 'add_magnet_tracker', url)
             return True
         except sqlite3.IntegrityError:
+            self._rollback_quiet()
             return False
 
     def delete_magnet_tracker(self, tid: int, actor: str):
@@ -4744,6 +4923,7 @@ class RegistrationDB:
             self._log(created_by, 'create_user', username, f'is_admin={is_admin}')
             return True
         except sqlite3.IntegrityError:
+            self._rollback_quiet()
             return False
 
     def get_user(self, username: str) -> sqlite3.Row | None:
@@ -4982,6 +5162,7 @@ class RegistrationDB:
             self._log(actor, 'ip_allowlist_add', str(user_id), ip)
             return True
         except sqlite3.IntegrityError:
+            self._rollback_quiet()
             return False
 
     def remove_ip_allowlist(self, entry_id: int, actor: str):
@@ -5153,6 +5334,7 @@ class RegistrationDB:
             c.commit()
             return True, 'Now following.'
         except sqlite3.IntegrityError:
+            self._rollback_quiet(c)
             return False, 'Already following.'
 
     def unfollow_user(self, follower_user_id: int, followed_user_id: int) -> tuple[bool, str]:
@@ -5265,6 +5447,7 @@ class RegistrationDB:
                 self._log(username, 'register_torrent', ih.upper(), name)
                 return True
             except sqlite3.IntegrityError:
+                self._rollback_quiet()
                 return False
             except sqlite3.OperationalError as e:
                 if 'locked' in str(e).lower() and attempt < 9:
@@ -8140,6 +8323,7 @@ class RegistrationDB:
                       (bounty_id, voter, self._ts()))
             c.commit()
         except sqlite3.IntegrityError:
+            self._rollback_quiet(c)
             return False, 'You have already voted.'
         # Check if threshold reached
         vote_count = c.execute('SELECT COUNT(*) FROM bounty_votes WHERE bounty_id=?',
@@ -9442,6 +9626,7 @@ class RegistrationDB:
             self._conn().commit()
             return True
         except sqlite3.IntegrityError:
+            self._rollback_quiet()
             return False
 
     def touch_webauthn_credential(self, cred_id: int, sign_count: int):
@@ -10195,6 +10380,7 @@ class RegistrationDB:
                 c.commit()
                 return hits
             except sqlite3.IntegrityError:
+                self._rollback_quiet(c if c is not None else None)
                 if attempt < 2:
                     time.sleep(0.02 * (attempt + 1))
                     continue
