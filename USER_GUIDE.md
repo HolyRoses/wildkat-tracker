@@ -85,6 +85,7 @@ The Dashboard is your home page after login. It shows all of **your** registered
 From the Dashboard you can:
 
 - **Register new torrents** — upload one or more `.torrent` files
+- **Queue magnet submission jobs** — submit one magnet URI or one raw info hash (when engine is enabled)
 - **Copy magnet links** — click the Magnet button on any row
 - **Delete your torrents** — shown only on the torrent's detail page
 - **Filter the current page** — type in the filter box to narrow the visible list by name
@@ -116,6 +117,21 @@ If a torrent with the same info hash is already registered the upload is silentl
 ### Multi-file Uploads
 
 You can select and upload multiple `.torrent` files at once. The result summary shows how many were registered, how many were skipped, and if any failed to parse.
+
+### Magnet Submission
+
+If enabled by admin settings, the Dashboard also shows an **Add Magnet** card.
+
+- Input accepts either:
+  - Full magnet URI (`magnet:?xt=urn:btih:...`)
+  - Raw info hash (`40`-char hex)
+- One submission per action (no bulk magnet intake).
+- Work is asynchronous:
+  - Success/failure notifications are sent to the submitter.
+  - Failure notifications include the info hash so the user can resubmit quickly.
+- Duplicate handling:
+  - Immediate error if info hash is already registered.
+  - Immediate error if same info hash is already queued/running.
 
 ### Upload Limits and Partial Success
 
@@ -739,6 +755,44 @@ Operational notes:
 - Action-card buttons are shown only when their related engine is enabled.
 - Upload-triggered automations are capped per batch to avoid blocking upload responses.
 - SRRDB matching is intended for scene-style releases.
+
+The Trackers tab also contains the **Magnet Submission Engine** card:
+
+- Enable/disable magnet submission engine
+- `aria2c` binary path
+- Working directory for magnet jobs
+- Mode:
+  - `direct`
+  - `proxy`
+- Proxy URL (for proxy mode, example `http://127.0.0.1:3128`)
+- Per-user running job cap
+- Global running job cap
+- Worker concurrency
+- Per-job timeout seconds
+
+Prerequisite:
+
+- Magnet submission depends on `aria2c` being installed on the tracker host.
+- Ubuntu install example:
+
+```bash
+sudo apt update
+sudo apt install -y aria2
+```
+
+Magnet tracker behavior:
+
+- Magnet submission uses the same enabled tracker list/order configured in this tab.
+- In `proxy` mode:
+  - `udp://` trackers are removed from aria2 runtime arguments.
+  - DHT and DHT6 are disabled for magnet fetch jobs.
+
+Proxy mode tradeoff:
+
+- Privacy improves because outbound fetch traffic is routed through your proxy/VPN bridge.
+- Retrieval coverage is reduced (often significantly) because UDP tracker and DHT paths are unavailable, so some magnets that would resolve in direct mode will time out in proxy mode.
+
+For recommended proxy setup and validation, see `PRIVOXY_GUIDE.md`.
 
 ### Settings Tab
 

@@ -122,6 +122,10 @@ DEFAULT_INTERVAL    = 1800   # seconds
 DEFAULT_MIN_INTERVAL = 60
 PEER_SCRAPE_MIN_INTERVAL_SECONDS = 3 * 60 * 60
 METADATA_REFRESH_COOLDOWN_SECONDS = 24 * 60 * 60
+MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS = 300
+MAGNET_JOB_DEFAULT_USER_MAX_ACTIVE = 2
+MAGNET_JOB_DEFAULT_GLOBAL_MAX_ACTIVE = 10
+MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY = 2
 ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES = 5
 WEBAUTHN_CHALLENGE_TTL_SECONDS = 300
 TFA_CHALLENGE_TTL_SECONDS = 300
@@ -1193,6 +1197,7 @@ OPEN_TRACKER       = False  # mirrors settings[open_tracker]; updated without re
 SUPER_USER         = ''
 _MANAGE_HTTPS_PORT = 0      # set in main() so /manage routes know the HTTPS port
 PEER_UPDATE_QUEUE  = None   # background queue for async peer snapshot refresh
+MAGNET_WORKERS_STARTED = False
 AUTH_BREAK_GLASS   = False  # startup override to bypass auth-factor enforcement gates
 AUTH_BREAK_GLASS_UNTIL_TS = 0.0
 
@@ -1658,6 +1663,57 @@ def _normalize_torrent_display_name(name: str, cleanup_tags: list[str],
         normalized = re.sub(r'\s*[-:|.]\s*$', '', normalized)
     normalized = normalized.strip()
     return normalized or original
+
+
+def _parse_magnet_uri(magnet_uri: str) -> tuple[bool, str, str]:
+    """Return (ok, normalized_btih_upper_hex, error_msg) for magnet URI or raw info hash."""
+    raw = str(magnet_uri or '').strip()
+    if not raw:
+        return False, '', 'Magnet URI or info hash is required.'
+    # Allow direct info-hash submissions (hex40 or base32-32).
+    if re.fullmatch(r'(?i)[a-f0-9]{40}', raw):
+        return True, raw.upper(), ''
+    if re.fullmatch(r'(?i)[a-z2-7]{32}', raw):
+        try:
+            padded = raw.upper() + '=' * ((8 - (len(raw) % 8)) % 8)
+            decoded = base64.b32decode(padded, casefold=True)
+            ih = decoded.hex().upper()
+            if re.fullmatch(r'[A-F0-9]{40}', ih):
+                return True, ih, ''
+        except Exception:
+            pass
+        return False, '', 'Info hash is invalid.'
+    if len(raw) > 8192:
+        return False, '', 'Magnet URI is too long.'
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except Exception:
+        return False, '', 'Invalid magnet URI or info hash.'
+    if (parsed.scheme or '').lower() != 'magnet':
+        return False, '', 'Input must be a magnet URI (magnet:?) or a raw 40-char info hash.'
+    q = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+    xt_values = [v for v in q.get('xt', []) if isinstance(v, str) and v]
+    btih_values: list[str] = []
+    for xt in xt_values:
+        m = re.match(r'(?i)^urn:btih:(.+)$', xt.strip())
+        if not m:
+            continue
+        btih_values.append(m.group(1).strip())
+    if len(btih_values) != 1:
+        return False, '', 'Magnet URI must include exactly one xt=urn:btih value.'
+    btih_raw = btih_values[0]
+    if re.fullmatch(r'(?i)[a-f0-9]{40}', btih_raw):
+        return True, btih_raw.upper(), ''
+    if re.fullmatch(r'(?i)[a-z2-7]{32}', btih_raw):
+        try:
+            padded = btih_raw.upper() + '=' * ((8 - (len(btih_raw) % 8)) % 8)
+            decoded = base64.b32decode(padded, casefold=True)
+            ih = decoded.hex().upper()
+            if re.fullmatch(r'[A-F0-9]{40}', ih):
+                return True, ih, ''
+        except Exception:
+            pass
+    return False, '', 'Magnet URI has an invalid btih hash.'
 
 
 _TITLE_STOP_TOKENS = {
@@ -2272,6 +2328,36 @@ class RegistrationDB:
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS magnet_jobs (
+                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                submitted_by_user_id   INTEGER NOT NULL,
+                submitted_by_username  TEXT    NOT NULL,
+                submitted_magnet_raw   TEXT    NOT NULL,
+                info_hash              TEXT    NOT NULL,
+                mode                   TEXT    NOT NULL DEFAULT 'direct',
+                status                 TEXT    NOT NULL DEFAULT 'queued',
+                created_at             TEXT    NOT NULL,
+                started_at             TEXT,
+                finished_at            TEXT,
+                updated_at             TEXT    NOT NULL,
+                timeout_sec            INTEGER NOT NULL DEFAULT 300,
+                working_dir            TEXT    NOT NULL DEFAULT '',
+                result_info_hash       TEXT    NOT NULL DEFAULT '',
+                result_torrent_name    TEXT    NOT NULL DEFAULT '',
+                result_torrent_url     TEXT    NOT NULL DEFAULT '',
+                error_code             TEXT    NOT NULL DEFAULT '',
+                error_detail           TEXT    NOT NULL DEFAULT '',
+                cleanup_done           INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (submitted_by_user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_magnet_jobs_status_id
+              ON magnet_jobs(status, id);
+            CREATE INDEX IF NOT EXISTS idx_magnet_jobs_user_status
+              ON magnet_jobs(submitted_by_user_id, status, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_magnet_jobs_hash_status
+              ON magnet_jobs(info_hash, status, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_magnet_jobs_created
+              ON magnet_jobs(created_at DESC);
             CREATE TABLE IF NOT EXISTS sessions (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id     INTEGER NOT NULL,
@@ -3330,6 +3416,16 @@ class RegistrationDB:
             'peer_query_retry_wait_sec':    '2',
             'peer_query_auto_on_upload':    '0',
             'peer_query_auto_upload_cap':   '5',
+            # ── Magnet metadata submission (aria2c) ─────────
+            'magnet_submission_enabled':              '0',
+            'magnet_submission_aria2_path':           '',
+            'magnet_submission_work_dir':             '',
+            'magnet_submission_mode':                 'direct',
+            'magnet_submission_proxy_url':            'http://127.0.0.1:3128',
+            'magnet_submission_max_user_running':     str(MAGNET_JOB_DEFAULT_USER_MAX_ACTIVE),
+            'magnet_submission_max_global_running':   str(MAGNET_JOB_DEFAULT_GLOBAL_MAX_ACTIVE),
+            'magnet_submission_worker_concurrency':   str(MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY),
+            'magnet_submission_job_timeout_sec':      str(MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS),
             'stats_persist_enabled':        '0',
             'stats_persist_interval_sec':   '300',
             'security_auto_ban_enabled':    '1',
@@ -4902,6 +4998,222 @@ class RegistrationDB:
             parts.append('tr=' + urllib.parse.quote(str(t[0] or ''), safe=''))
         return 'magnet:?' + '&'.join(parts)
 
+    def list_enabled_magnet_tracker_urls(self) -> list[str]:
+        rows = self._conn().execute(
+            'SELECT url FROM magnet_trackers WHERE is_enabled=1 ORDER BY sort_order,id'
+        ).fetchall()
+        return [str(r['url'] or '').strip() for r in rows if str(r['url'] or '').strip()]
+
+    def _count_magnet_jobs(self, status_filter: tuple[str, ...], user_id: int | None = None) -> int:
+        c = self._conn()
+        placeholders = ','.join('?' for _ in status_filter)
+        params: list[Any] = list(status_filter)
+        where = f'status IN ({placeholders})'
+        if user_id is not None:
+            where += ' AND submitted_by_user_id=?'
+            params.append(int(user_id))
+        row = c.execute(f'SELECT COUNT(*) AS n FROM magnet_jobs WHERE {where}', params).fetchone()
+        return int(row['n'] or 0) if row else 0
+
+    def submit_magnet_job(self, actor_user_id: int, actor_username: str,
+                          magnet_uri: str) -> tuple[bool, str, int, str]:
+        cfg = self.get_magnet_submission_config()
+        if not cfg.get('enabled'):
+            return False, 'Magnet submission engine is disabled.', 0, ''
+        ok_m, info_hash, parse_err = _parse_magnet_uri(magnet_uri)
+        if not ok_m:
+            return False, parse_err, 0, ''
+        if self.get_torrent(info_hash):
+            return False, 'Torrent already registered (duplicate info hash).', 0, info_hash
+        now = self._ts()
+        uid = int(actor_user_id or 0)
+        uname = str(actor_username or '')[:64]
+        if uid <= 0 or not uname:
+            return False, 'Invalid submitter.', 0, info_hash
+        for attempt in range(8):
+            try:
+                c = self._conn()
+                c.execute('BEGIN IMMEDIATE')
+                if c.execute(
+                    "SELECT 1 FROM torrents WHERE info_hash=? LIMIT 1",
+                    (info_hash,)
+                ).fetchone():
+                    c.execute('ROLLBACK')
+                    return False, 'Torrent already registered (duplicate info hash).', 0, info_hash
+                if c.execute(
+                    "SELECT 1 FROM magnet_jobs WHERE info_hash=? AND status IN ('queued','running') LIMIT 1",
+                    (info_hash,)
+                ).fetchone():
+                    c.execute('ROLLBACK')
+                    return False, 'This info hash is already queued/running.', 0, info_hash
+                user_active = c.execute(
+                    "SELECT COUNT(*) AS n FROM magnet_jobs WHERE submitted_by_user_id=? AND status IN ('queued','running')",
+                    (uid,)
+                ).fetchone()
+                if int((user_active['n'] if user_active else 0) or 0) >= int(cfg['max_user_running']):
+                    c.execute('ROLLBACK')
+                    return False, f'Per-user queue limit reached ({int(cfg["max_user_running"])}).', 0, info_hash
+                global_active = c.execute(
+                    "SELECT COUNT(*) AS n FROM magnet_jobs WHERE status IN ('queued','running')"
+                ).fetchone()
+                if int((global_active['n'] if global_active else 0) or 0) >= int(cfg['max_global_running']):
+                    c.execute('ROLLBACK')
+                    return False, 'Queue full. Try again shortly.', 0, info_hash
+                c.execute(
+                    '''INSERT INTO magnet_jobs (
+                           submitted_by_user_id, submitted_by_username, submitted_magnet_raw,
+                           info_hash, mode, status, created_at, updated_at, timeout_sec
+                       ) VALUES (?,?,?,?,?,?,?,?,?)''',
+                    (uid, uname, str(magnet_uri or '')[:8192],
+                     info_hash, str(cfg['mode']), 'queued', now, now, int(cfg['job_timeout_sec']))
+                )
+                job_id = int(c.execute('SELECT last_insert_rowid()').fetchone()[0])
+                c.execute('COMMIT')
+                self._log(uname, 'magnet_job_queued', info_hash, f'job_id={job_id}')
+                return True, f'Magnet queued for info hash {info_hash}.', job_id, info_hash
+            except sqlite3.OperationalError as e:
+                self._rollback_quiet()
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+                return False, 'Database is busy, please retry shortly.', 0, info_hash
+        return False, 'Database is busy, please retry shortly.', 0, info_hash
+
+    def claim_next_magnet_job(self, worker_name: str = ''):
+        cfg = self.get_magnet_submission_config()
+        for attempt in range(8):
+            try:
+                c = self._conn()
+                # Avoid unnecessary IMMEDIATE transactions while idle.
+                queued = c.execute(
+                    "SELECT id FROM magnet_jobs WHERE status='queued' ORDER BY id ASC LIMIT 1"
+                ).fetchone()
+                if not queued:
+                    return None
+                c.execute('BEGIN IMMEDIATE')
+                running_total = c.execute(
+                    "SELECT COUNT(*) AS n FROM magnet_jobs WHERE status='running'"
+                ).fetchone()
+                if int((running_total['n'] if running_total else 0) or 0) >= int(cfg['worker_concurrency']):
+                    c.execute('ROLLBACK')
+                    return None
+                row = c.execute(
+                    '''SELECT * FROM magnet_jobs
+                       WHERE status='queued'
+                       ORDER BY id ASC
+                       LIMIT 1'''
+                ).fetchone()
+                if not row:
+                    c.execute('ROLLBACK')
+                    return None
+                cur = c.execute(
+                    '''UPDATE magnet_jobs
+                       SET status='running', started_at=?, updated_at=?, error_code='', error_detail=''
+                       WHERE id=? AND status='queued' ''',
+                    (self._ts(), self._ts(), int(row['id']))
+                )
+                if int(cur.rowcount or 0) <= 0:
+                    c.execute('ROLLBACK')
+                    return None
+                c.execute('COMMIT')
+                return dict(self.get_magnet_job(int(row['id'])) or {})
+            except sqlite3.OperationalError as e:
+                self._rollback_quiet()
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.10 * (attempt + 1))
+                    continue
+                log.warning('claim_next_magnet_job failed (non-fatal): worker=%s err=%s',
+                            worker_name, e)
+                return None
+        return None
+
+    def get_magnet_job(self, job_id: int):
+        return self._conn().execute(
+            'SELECT * FROM magnet_jobs WHERE id=?',
+            (int(job_id),)
+        ).fetchone()
+
+    def set_magnet_job_running_context(self, job_id: int, working_dir: str) -> None:
+        self._conn().execute(
+            'UPDATE magnet_jobs SET working_dir=?, updated_at=? WHERE id=?',
+            (str(working_dir or '')[:500], self._ts(), int(job_id))
+        )
+        self._conn().commit()
+
+    def finish_magnet_job(self, job_id: int, status: str, actor_username: str,
+                          result_info_hash: str = '', result_torrent_name: str = '',
+                          result_torrent_url: str = '', error_code: str = '',
+                          error_detail: str = '', cleanup_done: bool = False) -> None:
+        st = (status or '').strip().lower()
+        if st not in ('done', 'failed', 'timeout'):
+            st = 'failed'
+        c = self._conn()
+        c.execute(
+            '''UPDATE magnet_jobs
+               SET status=?, finished_at=?, updated_at=?,
+                   result_info_hash=?, result_torrent_name=?, result_torrent_url=?,
+                   error_code=?, error_detail=?, cleanup_done=?
+               WHERE id=?''',
+            (st, self._ts(), self._ts(),
+             str(result_info_hash or '')[:40],
+             str(result_torrent_name or '')[:500],
+             str(result_torrent_url or '')[:500],
+             str(error_code or '')[:64],
+             str(error_detail or '')[:500],
+             1 if cleanup_done else 0,
+             int(job_id))
+        )
+        c.commit()
+        self._log(actor_username or 'system', f'magnet_job_{st}',
+                  str(result_info_hash or ''), f'job_id={int(job_id)} {error_code} {error_detail[:120]}')
+
+    def list_stale_magnet_jobs(self, statuses: tuple[str, ...], older_than_sec: int) -> list:
+        if not statuses:
+            return []
+        cutoff = (datetime.datetime.now() - datetime.timedelta(seconds=max(1, int(older_than_sec)))).isoformat()
+        placeholders = ','.join('?' for _ in statuses)
+        return self._conn().execute(
+            f'''SELECT * FROM magnet_jobs
+                WHERE status IN ({placeholders})
+                  AND created_at < ?
+                ORDER BY id ASC''',
+            [*statuses, cutoff]
+        ).fetchall()
+
+    def reconcile_magnet_jobs_on_startup(self) -> list[dict]:
+        c = self._conn()
+        rows = c.execute(
+            '''SELECT * FROM magnet_jobs
+               WHERE status IN ('queued','running')
+               ORDER BY id ASC'''
+        ).fetchall()
+        out = []
+        for r in rows:
+            c.execute(
+                '''UPDATE magnet_jobs
+                   SET status='timeout', finished_at=?, updated_at=?,
+                       error_code='startup_reconcile',
+                       error_detail='Server restart interrupted magnet job.'
+                   WHERE id=?''',
+                (self._ts(), self._ts(), int(r['id']))
+            )
+            out.append(dict(r))
+        c.commit()
+        return out
+
+    def prune_old_magnet_jobs(self, older_than_hours: int = 48) -> int:
+        cutoff = (datetime.datetime.now() - datetime.timedelta(hours=max(1, int(older_than_hours)))).isoformat()
+        c = self._conn()
+        cur = c.execute(
+            '''DELETE FROM magnet_jobs
+               WHERE status IN ('done','failed','timeout')
+                 AND finished_at IS NOT NULL
+                 AND finished_at < ?''',
+            (cutoff,)
+        )
+        c.commit()
+        return int(cur.rowcount or 0)
+
     def _ts(self) -> str:
         return datetime.datetime.now().isoformat(timespec='seconds')
 
@@ -5899,6 +6211,35 @@ class RegistrationDB:
                 srrdb_base_default,
                 {'api.srrdb.com'},
             ),
+        }
+
+    def get_magnet_submission_config(self) -> dict:
+        settings = self.get_all_settings()
+        def _to_int(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                return max(lo, min(hi, int(settings.get(key, str(default)) or default)))
+            except Exception:
+                return default
+        mode = (settings.get('magnet_submission_mode', 'direct') or 'direct').strip().lower()
+        if mode not in ('direct', 'proxy'):
+            mode = 'direct'
+        aria2_path = (settings.get('magnet_submission_aria2_path', '') or '').strip()
+        work_dir = (settings.get('magnet_submission_work_dir', '') or '').strip()
+        proxy_url = (settings.get('magnet_submission_proxy_url', 'http://127.0.0.1:3128') or '').strip()
+        return {
+            'enabled': settings.get('magnet_submission_enabled', '0') == '1',
+            'aria2_path': aria2_path,
+            'work_dir': work_dir,
+            'mode': mode,
+            'proxy_url': proxy_url,
+            'max_user_running': _to_int('magnet_submission_max_user_running',
+                                        MAGNET_JOB_DEFAULT_USER_MAX_ACTIVE, 1, 50),
+            'max_global_running': _to_int('magnet_submission_max_global_running',
+                                          MAGNET_JOB_DEFAULT_GLOBAL_MAX_ACTIVE, 1, 500),
+            'worker_concurrency': _to_int('magnet_submission_worker_concurrency',
+                                          MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY, 1, 50),
+            'job_timeout_sec': _to_int('magnet_submission_job_timeout_sec',
+                                       MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS, 30, 1800),
         }
 
     def get_torrent_srrdb_cache(self, info_hash: str):
@@ -10180,6 +10521,24 @@ class RegistrationDB:
             torrent_name, int(comment_id)
         )
 
+    def notify_magnet_job_success(self, recipient_user_id: int, actor_username: str,
+                                  info_hash: str, torrent_name: str, job_id: int) -> None:
+        self.add_notification(
+            int(recipient_user_id), 'magnet_job_done', actor_username,
+            str(info_hash or '').upper(), str(torrent_name or '')[:120], int(job_id)
+        )
+
+    def notify_magnet_job_failure(self, recipient_user_id: int, actor_username: str,
+                                  job_id: int, detail: str, info_hash: str = '') -> None:
+        ih = str(info_hash or '').strip().upper()
+        detail_text = str(detail or 'Magnet job failed.')
+        if re.fullmatch(r'[A-F0-9]{40}', ih):
+            detail_text = f'{detail_text} (IH: {ih})'
+        self.add_notification(
+            int(recipient_user_id), 'magnet_job_failed', actor_username,
+            f'MAGNET:{int(job_id)}', detail_text[:200], int(job_id)
+        )
+
     def _metadata_proposal_recipient_user_ids(self, info_hash: str) -> list[int]:
         ih = (info_hash or '').strip().upper()
         if not ih:
@@ -12647,6 +13006,286 @@ def _start_peer_update_worker():
     t.start()
     log.info('Peer update background worker started')
 
+
+def _magnet_tracker_list_for_mode(mode: str) -> list[str]:
+    if not REGISTRATION_DB:
+        return []
+    urls = REGISTRATION_DB.list_enabled_magnet_tracker_urls()
+    if (mode or '').strip().lower() != 'proxy':
+        return urls
+    # Proxy mode: strip udp trackers because common HTTP proxy chains cannot transport UDP tracker traffic.
+    out = []
+    for u in urls:
+        if str(u or '').strip().lower().startswith('udp://'):
+            continue
+        out.append(u)
+    return out
+
+
+def _proxy_preflight(proxy_url: str, timeout_sec: float = 2.0) -> tuple[bool, str]:
+    try:
+        p = urllib.parse.urlparse(str(proxy_url or '').strip())
+        if p.scheme not in ('http', 'https') or not (p.hostname and p.port):
+            return False, 'Proxy URL must be http(s)://host:port'
+        with socket.create_connection((p.hostname, int(p.port)), timeout=max(0.5, float(timeout_sec))):
+            return True, ''
+    except Exception as e:
+        return False, f'proxy unreachable: {e}'
+
+
+def _register_single_torrent_blob_from_magnet(job: dict, torrent_blob: bytes) -> tuple[bool, str, str, str]:
+    """Register one downloaded .torrent in the same style as normal upload flow."""
+    if not REGISTRATION_DB:
+        return False, 'Registration DB unavailable.', '', ''
+    try:
+        ih, name, total_size, meta = parse_torrent(torrent_blob)
+    except Exception:
+        return False, 'Downloaded metadata was not a valid torrent.', '', ''
+    cleanup_enabled = REGISTRATION_DB.get_setting('torrent_name_cleanup_enabled', '1') == '1'
+    cleanup_tags = _parse_torrent_name_cleanup_tags(
+        REGISTRATION_DB.get_setting('torrent_name_cleanup_tags', '')
+    )
+    cleanup_strip_www = REGISTRATION_DB.get_setting(
+        'torrent_name_cleanup_strip_www_prefix', '1'
+    ) == '1'
+    cleanup_strip_extensions = REGISTRATION_DB.get_setting(
+        'torrent_name_cleanup_strip_extensions', '1'
+    ) == '1'
+    if cleanup_enabled:
+        normalized_name = _normalize_torrent_display_name(
+            name, cleanup_tags,
+            strip_www_prefix=cleanup_strip_www,
+            strip_extensions=cleanup_strip_extensions,
+        )
+    else:
+        normalized_name = (name or '').strip()
+    actor_uid = int(job.get('submitted_by_user_id') or 0)
+    actor_name = str(job.get('submitted_by_username') or 'system')
+    if REGISTRATION_DB.get_torrent(ih):
+        return False, 'Torrent already registered (duplicate info hash).', ih, normalized_name
+    ok_reg = REGISTRATION_DB.register_torrent(
+        ih, normalized_name, total_size, actor_uid, actor_name, meta=meta
+    )
+    if not ok_reg:
+        return False, 'Torrent already registered (duplicate info hash).', ih, normalized_name
+    REGISTRATION_DB.award_upload_points(actor_uid, normalized_name, ih)
+    REGISTRATION_DB.check_auto_promote(actor_uid)
+    peer_cfg = REGISTRATION_DB.get_peer_query_config()
+    if peer_cfg.get('active') and peer_cfg.get('auto_on_upload'):
+        _enqueue_peer_update(ih, actor_name, 'magnet')
+    srr_cfg = REGISTRATION_DB.get_srrdb_config()
+    if srr_cfg.get('enabled', False):
+        try:
+            REGISTRATION_DB.refresh_torrent_srrdb_cache(ih, actor_username=actor_name, force=True)
+        except Exception as e:
+            log.warning('magnet srrdb refresh failed (non-fatal): ih=%s err=%s', ih, e)
+    meta_cfg = REGISTRATION_DB.get_metadata_config()
+    if meta_cfg.get('enabled', True) and meta_cfg.get('auto_match_enabled', False):
+        try:
+            REGISTRATION_DB.auto_match_torrent_metadata(
+                ih, actor_uid, actor_name, source='magnet'
+            )
+        except Exception as e:
+            log.warning('magnet auto-match failed (non-fatal): ih=%s err=%s', ih, e)
+    try:
+        REGISTRATION_DB.notify_followers_torrent_upload(actor_uid, actor_name, ih, normalized_name)
+    except Exception:
+        pass
+    return True, 'Registered successfully.', ih, normalized_name
+
+
+def _discover_downloaded_torrent(work_dir: str) -> str:
+    try:
+        files = [
+            os.path.join(work_dir, fn)
+            for fn in os.listdir(work_dir)
+            if str(fn or '').lower().endswith('.torrent')
+        ]
+    except Exception:
+        return ''
+    if not files:
+        return ''
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files[0]
+
+
+def _build_aria2_magnet_argv(cfg: dict, info_hash: str, work_dir: str, log_path: str) -> list[str]:
+    argv = [
+        str(cfg.get('aria2_path') or '').strip(),
+        '--seed-time=0',
+        '--bt-metadata-only=true',
+        '--bt-save-metadata=true',
+        f'--dir={work_dir}',
+        '--summary-interval=1',
+        '--console-log-level=warn',
+        f'--log={log_path}',
+    ]
+    mode = str(cfg.get('mode') or 'direct').strip().lower()
+    if mode == 'proxy':
+        argv.append(f'--all-proxy={str(cfg.get("proxy_url") or "").strip()}')
+        # DHT uses UDP and is not compatible with the HTTP proxy bridge path.
+        argv.append('--enable-dht=false')
+        argv.append('--enable-dht6=false')
+    trackers = _magnet_tracker_list_for_mode(mode)
+    if trackers:
+        argv.append('--bt-tracker=' + ','.join(trackers))
+    # Avoid running arbitrary query args from user input; only normalized info hash is used.
+    argv.append(f'magnet:?xt=urn:btih:{str(info_hash or "").lower()}')
+    return argv
+
+
+def _run_magnet_job(job: dict) -> tuple[bool, dict]:
+    if not REGISTRATION_DB:
+        return False, {'error_code': 'db_unavailable', 'error_detail': 'Registration DB unavailable.'}
+    cfg = REGISTRATION_DB.get_magnet_submission_config()
+    if not cfg.get('enabled', False):
+        return False, {'error_code': 'engine_disabled', 'error_detail': 'Magnet submission engine is disabled.'}
+    aria2_path = str(cfg.get('aria2_path') or '').strip()
+    work_root = str(cfg.get('work_dir') or '').strip()
+    info_hash = str(job.get('info_hash') or '').strip().upper()
+    timeout_sec = int(job.get('timeout_sec') or cfg.get('job_timeout_sec') or MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS)
+    if not aria2_path or not os.path.isfile(aria2_path):
+        return False, {'error_code': 'aria2_path_invalid', 'error_detail': 'aria2 path is invalid.'}
+    if not os.access(aria2_path, os.X_OK):
+        return False, {'error_code': 'aria2_not_executable', 'error_detail': 'aria2 path is not executable.'}
+    if not work_root:
+        return False, {'error_code': 'work_dir_missing', 'error_detail': 'Magnet work directory is not configured.'}
+    if str(cfg.get('mode') or 'direct').strip().lower() == 'proxy':
+        ok_proxy, proxy_err = _proxy_preflight(str(cfg.get('proxy_url') or ''), timeout_sec=2.5)
+        if not ok_proxy:
+            return False, {'error_code': 'proxy_unavailable', 'error_detail': proxy_err}
+    job_id = int(job.get('id') or 0)
+    job_dir = os.path.join(work_root, f'{info_hash.lower()}-{job_id}')
+    try:
+        os.makedirs(job_dir, exist_ok=True)
+    except Exception as e:
+        return False, {'error_code': 'work_dir_create_failed', 'error_detail': f'Cannot create work dir: {e}'}
+    REGISTRATION_DB.set_magnet_job_running_context(job_id, job_dir)
+    log_path = os.path.join(job_dir, 'aria2.log')
+    argv = _build_aria2_magnet_argv(cfg, info_hash, job_dir, log_path)
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=max(30, int(timeout_sec)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, {'error_code': 'timeout', 'error_detail': f'aria2 metadata fetch timed out after {int(timeout_sec)}s.', 'work_dir': job_dir}
+    except Exception as e:
+        return False, {'error_code': 'exec_failed', 'error_detail': f'aria2 launch failed: {e}', 'work_dir': job_dir}
+    if int(proc.returncode or 0) != 0:
+        stderr = (proc.stderr or proc.stdout or '').strip()
+        return False, {'error_code': 'aria2_failed', 'error_detail': (stderr[:500] or f'aria2 exit code {proc.returncode}'), 'work_dir': job_dir}
+    torrent_path = _discover_downloaded_torrent(job_dir)
+    if not torrent_path or not os.path.exists(torrent_path):
+        return False, {'error_code': 'torrent_missing', 'error_detail': 'No .torrent metadata file was produced.', 'work_dir': job_dir}
+    try:
+        with open(torrent_path, 'rb') as f:
+            blob = f.read()
+    except Exception as e:
+        return False, {'error_code': 'torrent_read_failed', 'error_detail': f'Failed reading downloaded torrent: {e}', 'work_dir': job_dir}
+    ok_reg, reg_msg, reg_ih, reg_name = _register_single_torrent_blob_from_magnet(job, blob)
+    if not ok_reg:
+        return False, {'error_code': 'register_failed', 'error_detail': reg_msg[:500], 'work_dir': job_dir}
+    return True, {
+        'info_hash': reg_ih,
+        'torrent_name': reg_name,
+        'torrent_url': f'/manage/torrent/{reg_ih.lower()}',
+        'work_dir': job_dir,
+    }
+
+
+def _cleanup_magnet_job_dir(path: str) -> bool:
+    p = str(path or '').strip()
+    if not p:
+        return True
+    try:
+        if os.path.isdir(p):
+            for root, dirs, files in os.walk(p, topdown=False):
+                for fn in files:
+                    try:
+                        os.unlink(os.path.join(root, fn))
+                    except Exception:
+                        pass
+                for dn in dirs:
+                    try:
+                        os.rmdir(os.path.join(root, dn))
+                    except Exception:
+                        pass
+            os.rmdir(p)
+        return True
+    except Exception:
+        return False
+
+
+def _magnet_worker():
+    while True:
+        try:
+            if not REGISTRATION_DB:
+                time.sleep(1.0)
+                continue
+            cfg = REGISTRATION_DB.get_magnet_submission_config()
+            if not cfg.get('enabled', False):
+                time.sleep(1.0)
+                continue
+            job = REGISTRATION_DB.claim_next_magnet_job(threading.current_thread().name)
+            if not job:
+                time.sleep(0.6)
+                continue
+            job_id = int(job.get('id') or 0)
+            actor_uid = int(job.get('submitted_by_user_id') or 0)
+            actor_name = str(job.get('submitted_by_username') or 'system')
+            ok, result = _run_magnet_job(job)
+            work_dir = str(result.get('work_dir') or job.get('working_dir') or '')
+            cleanup_ok = _cleanup_magnet_job_dir(work_dir)
+            if ok:
+                ih = str(result.get('info_hash') or '').upper()
+                tname = str(result.get('torrent_name') or '')[:500]
+                turl = str(result.get('torrent_url') or '')
+                REGISTRATION_DB.finish_magnet_job(
+                    job_id, 'done', actor_name,
+                    result_info_hash=ih,
+                    result_torrent_name=tname,
+                    result_torrent_url=turl,
+                    cleanup_done=cleanup_ok
+                )
+                if actor_uid > 0:
+                    REGISTRATION_DB.notify_magnet_job_success(actor_uid, 'system', ih, tname, job_id)
+            else:
+                code = str(result.get('error_code') or 'failed')
+                detail = str(result.get('error_detail') or 'Magnet job failed.')
+                status = 'timeout' if code == 'timeout' else 'failed'
+                REGISTRATION_DB.finish_magnet_job(
+                    job_id, status, actor_name,
+                    error_code=code,
+                    error_detail=detail,
+                    cleanup_done=cleanup_ok
+                )
+                if actor_uid > 0:
+                    REGISTRATION_DB.notify_magnet_job_failure(
+                        actor_uid, 'system', job_id, detail, str(job.get('info_hash') or '')
+                    )
+        except Exception:
+            log.exception('magnet worker unexpected error')
+            time.sleep(0.5)
+
+
+def _start_magnet_workers():
+    global MAGNET_WORKERS_STARTED
+    if MAGNET_WORKERS_STARTED:
+        return
+    if not REGISTRATION_DB:
+        return
+    cfg = REGISTRATION_DB.get_magnet_submission_config()
+    workers = max(1, int(cfg.get('worker_concurrency') or MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY))
+    for idx in range(workers):
+        t = threading.Thread(target=_magnet_worker, daemon=True, name=f'magnet-worker-{idx+1}')
+        t.start()
+    MAGNET_WORKERS_STARTED = True
+    log.info('Magnet submission workers started: %d', workers)
+
 def _render_profile_sharing_card(target_user) -> str:
     """Full-width profile card listing torrents currently shared by this member."""
     if not target_user:
@@ -13352,6 +13991,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_account_delete_cancel()
         elif path == '/manage/upload':
             self._post_upload()
+        elif path == '/manage/magnet/submit':
+            self._post_magnet_submit()
         elif path == '/manage/delete-torrent':
             self._post_delete_torrent()
         elif path == '/manage/torrent/lock':
@@ -14919,29 +15560,6 @@ class ManageHandler(BaseHTTPRequestHandler):
                 else:
                     auto_peer_not_queued += 1
                     log.debug('UPLOAD auto peer queue failed ih=%s', ih)
-        if (added_with_hash and meta_cfg.get('enabled', True)
-                and meta_cfg.get('auto_match_enabled', False)
-                and meta_cfg.get('auto_match_on_upload', False)):
-            mcap = max(1, min(100, int(meta_cfg.get('auto_match_upload_cap', 5))))
-            for ih, _tname in added_with_hash[:mcap]:
-                try:
-                    m_ok, _m_msg, m_level, _m_score = REGISTRATION_DB.auto_match_torrent_metadata(
-                        ih, int(user['id']), user['username'], source='upload'
-                    )
-                    if m_ok and m_level == 'high':
-                        auto_match_approved += 1
-                    elif m_ok and m_level == 'medium':
-                        auto_match_pending += 1
-                    else:
-                        auto_match_skipped += 1
-                except sqlite3.OperationalError as e:
-                    if 'locked' in str(e).lower():
-                        auto_match_skipped += 1
-                        log.warning('UPLOAD auto match skipped due DB lock ih=%s user=%s', ih, user['username'])
-                    else:
-                        raise
-            if len(added_with_hash) > mcap:
-                auto_match_skipped += (len(added_with_hash) - mcap)
         if (added_with_hash and srrdb_cfg.get('enabled', False)
                 and srrdb_cfg.get('on_upload', False)):
             scap = max(1, min(50, int(srrdb_cfg.get('upload_cap', 5))))
@@ -14966,6 +15584,29 @@ class ManageHandler(BaseHTTPRequestHandler):
                         raise
             if len(added_with_hash) > scap:
                 srrdb_skipped += (len(added_with_hash) - scap)
+        if (added_with_hash and meta_cfg.get('enabled', True)
+                and meta_cfg.get('auto_match_enabled', False)
+                and meta_cfg.get('auto_match_on_upload', False)):
+            mcap = max(1, min(100, int(meta_cfg.get('auto_match_upload_cap', 5))))
+            for ih, _tname in added_with_hash[:mcap]:
+                try:
+                    m_ok, _m_msg, m_level, _m_score = REGISTRATION_DB.auto_match_torrent_metadata(
+                        ih, int(user['id']), user['username'], source='upload'
+                    )
+                    if m_ok and m_level == 'high':
+                        auto_match_approved += 1
+                    elif m_ok and m_level == 'medium':
+                        auto_match_pending += 1
+                    else:
+                        auto_match_skipped += 1
+                except sqlite3.OperationalError as e:
+                    if 'locked' in str(e).lower():
+                        auto_match_skipped += 1
+                        log.warning('UPLOAD auto match skipped due DB lock ih=%s user=%s', ih, user['username'])
+                    else:
+                        raise
+            if len(added_with_hash) > mcap:
+                auto_match_skipped += (len(added_with_hash) - mcap)
         follower_notifs = 0
         for ih, tname in added_with_hash:
             follower_notifs += REGISTRATION_DB.notify_followers_torrent_upload(
@@ -15014,6 +15655,23 @@ class ManageHandler(BaseHTTPRequestHandler):
         # PRG pattern: prevent browser back button from replaying POST /manage/upload.
         msg_q = urllib.parse.quote_plus(msg[:500])
         return self._redirect(f'/manage/dashboard?msg={msg_q}&msg_type={msg_type}')
+
+    def _post_magnet_submit(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        cfg = REGISTRATION_DB.get_magnet_submission_config() if REGISTRATION_DB else {'enabled': False}
+        if not cfg.get('enabled', False):
+            q = urllib.parse.quote_plus('Magnet submission engine is disabled.')
+            return self._redirect(f'/manage/dashboard?msg={q}&msg_type=error')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        magnet_uri = (fields.get('magnet_uri', '') or '').strip()
+        ok, msg, _job_id, _ih = REGISTRATION_DB.submit_magnet_job(
+            int(user['id']), user['username'], magnet_uri
+        )
+        q = urllib.parse.quote_plus(msg[:500])
+        return self._redirect(f'/manage/dashboard?msg={q}&msg_type={"success" if ok else "error"}')
 
     def _post_torrent_normalize_name(self):
         user = self._get_session_user()
@@ -16997,6 +17655,60 @@ class ManageHandler(BaseHTTPRequestHandler):
                     return self._redirect('/manage/admin?tab=trackers&msg=Invalid+SRRDB+API+base+URL.&msg_type=error')
             return self._redirect('/manage/admin?tab=trackers&msg=SRRDB+settings+saved&msg_type=success')
             return self._redirect('/manage/admin?tab=trackers&msg=Metadata+auto-match+settings+saved&msg_type=success')
+        elif form_id == 'magnet_submission_settings':
+            enabled = '1' if fields.get('magnet_submission_enabled') == '1' else '0'
+            mode = (fields.get('magnet_submission_mode', 'direct') or 'direct').strip().lower()
+            if mode not in ('direct', 'proxy'):
+                mode = 'direct'
+            aria2_path = (fields.get('magnet_submission_aria2_path', '') or '').strip()
+            work_dir = (fields.get('magnet_submission_work_dir', '') or '').strip()
+            proxy_url = (fields.get('magnet_submission_proxy_url', 'http://127.0.0.1:3128') or '').strip()
+            def _safe_int(key: str, default: int, lo: int, hi: int) -> str:
+                try:
+                    return str(max(lo, min(hi, int(fields.get(key, str(default)) or default))))
+                except Exception:
+                    return str(default)
+            max_user_running = _safe_int('magnet_submission_max_user_running', MAGNET_JOB_DEFAULT_USER_MAX_ACTIVE, 1, 50)
+            max_global_running = _safe_int('magnet_submission_max_global_running', MAGNET_JOB_DEFAULT_GLOBAL_MAX_ACTIVE, 1, 500)
+            worker_concurrency = _safe_int('magnet_submission_worker_concurrency', MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY, 1, 50)
+            timeout_sec = _safe_int('magnet_submission_job_timeout_sec', MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS, 30, 1800)
+            if enabled == '1':
+                if not aria2_path:
+                    return self._redirect('/manage/admin?tab=trackers&msg=aria2c+path+is+required+before+enabling+magnet+submission.&msg_type=error')
+                if not os.path.isabs(aria2_path):
+                    return self._redirect('/manage/admin?tab=trackers&msg=aria2c+path+must+be+absolute.&msg_type=error')
+                if not os.path.exists(aria2_path):
+                    q = urllib.parse.quote_plus(f'aria2c path not found: {aria2_path}')
+                    return self._redirect(f'/manage/admin?tab=trackers&msg={q}&msg_type=error')
+                if not os.access(aria2_path, os.X_OK):
+                    q = urllib.parse.quote_plus(f'aria2c path is not executable: {aria2_path}')
+                    return self._redirect(f'/manage/admin?tab=trackers&msg={q}&msg_type=error')
+                if not work_dir:
+                    return self._redirect('/manage/admin?tab=trackers&msg=Magnet+working+directory+is+required+before+enabling.&msg_type=error')
+                if not os.path.isabs(work_dir):
+                    return self._redirect('/manage/admin?tab=trackers&msg=Magnet+working+directory+must+be+absolute.&msg_type=error')
+                try:
+                    os.makedirs(work_dir, exist_ok=True)
+                except Exception as e:
+                    q = urllib.parse.quote_plus(f'Cannot create magnet working directory: {e}')
+                    return self._redirect(f'/manage/admin?tab=trackers&msg={q}&msg_type=error')
+                if mode == 'proxy':
+                    try:
+                        pu = urllib.parse.urlparse(proxy_url)
+                        if pu.scheme not in ('http', 'https') or not (pu.hostname and pu.port):
+                            raise ValueError('invalid proxy URL')
+                    except Exception:
+                        return self._redirect('/manage/admin?tab=trackers&msg=Proxy+URL+must+be+http%28s%29%3A%2F%2Fhost%3Aport+in+proxy+mode.&msg_type=error')
+            REGISTRATION_DB.set_setting('magnet_submission_enabled', enabled, user['username'])
+            REGISTRATION_DB.set_setting('magnet_submission_mode', mode, user['username'])
+            REGISTRATION_DB.set_setting('magnet_submission_aria2_path', aria2_path[:500], user['username'])
+            REGISTRATION_DB.set_setting('magnet_submission_work_dir', work_dir[:500], user['username'])
+            REGISTRATION_DB.set_setting('magnet_submission_proxy_url', proxy_url[:500], user['username'])
+            REGISTRATION_DB.set_setting('magnet_submission_max_user_running', max_user_running, user['username'])
+            REGISTRATION_DB.set_setting('magnet_submission_max_global_running', max_global_running, user['username'])
+            REGISTRATION_DB.set_setting('magnet_submission_worker_concurrency', worker_concurrency, user['username'])
+            REGISTRATION_DB.set_setting('magnet_submission_job_timeout_sec', timeout_sec, user['username'])
+            return self._redirect('/manage/admin?tab=trackers&msg=Magnet+submission+settings+saved&msg_type=success')
         elif form_id == 'auto_promote':
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('auto_promote_enabled', val, user['username'])
@@ -17996,7 +18708,7 @@ class ManageHandler(BaseHTTPRequestHandler):
             elif is_security:
                 icon = '🛡️'
                 label = 'security event alert'
-                event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n.get('comment_id') or '')
+                event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n['comment_id'] or '')
                 if event_id.isdigit():
                     url = f'/manage/admin/security/event/{event_id}'
                 else:
@@ -18049,6 +18761,17 @@ class ManageHandler(BaseHTTPRequestHandler):
                         url = f'/manage/admin/report/{rid}'
                     else:
                         url = f'/manage/torrent/{n["info_hash"].lower()}#torrent-report'
+                elif n['type'] == 'magnet_job_done':
+                    icon = '🧲'
+                    label = 'finished your magnet submission'
+                    if re.fullmatch(r'[A-Fa-f0-9]{40}', str(n['info_hash'] or '')):
+                        url = f'/manage/torrent/{str(n["info_hash"]).lower()}'
+                    else:
+                        url = '/manage/notifications'
+                elif n['type'] == 'magnet_job_failed':
+                    icon = '⚠️'
+                    label = 'magnet submission failed'
+                    url = '/manage/notifications'
                 elif n['type'] == 'metadata_proposed':
                     icon = '🧩'
                     label = 'proposed metadata for your torrent'
@@ -19705,7 +20428,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
                 n_id = n['id']
                 msg_h = _h(n['torrent_name'] or '')
-                event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n.get('comment_id') or '')
+                event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n['comment_id'] or '')
                 target_url = f'/manage/admin/security/event/{event_id}' if event_id.isdigit() else '/manage/admin?tab=security'
                 dropdown_items += (
                     f'<button class="notif-item" '
@@ -19722,7 +20445,30 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 ts_h = _h((n['created_at'] or '')[:16].replace('T', ' '))
                 n_id   = n['id']
                 n_hash = n['info_hash'].lower()
-                if n['type'] == 'metadata_proposed':
+                if n['type'] == 'magnet_job_done':
+                    target = '/manage/notifications'
+                    if re.fullmatch(r'[A-Fa-f0-9]{40}', str(n['info_hash'] or '')):
+                        target = f'/manage/torrent/{str(n["info_hash"]).lower()}'
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'data-notif-id="{n_id}" data-notif-url="{target}"'
+                        f' aria-label="magnet submission success">'
+                        f'<div class="notif-item-type">🧲 <strong>{from_h}</strong> finished your magnet submission</div>'
+                        f'<div class="notif-item-text"><em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
+                elif n['type'] == 'magnet_job_failed':
+                    dropdown_items += (
+                        f'<button class="notif-item" '
+                        f'data-notif-id="{n_id}" data-notif-url="/manage/notifications"'
+                        f' aria-label="magnet submission failure">'
+                        f'<div class="notif-item-type">⚠️ <strong>{from_h}</strong> magnet submission failed</div>'
+                        f'<div class="notif-item-text"><em>{tname_h}</em></div>'
+                        f'<div class="notif-item-ts">{ts_h}</div>'
+                        f'</button>'
+                    )
+                elif n['type'] == 'metadata_proposed':
                     n_pid = int(n['comment_id'] or 0)
                     anchor = f'#metadata-pending-{n_pid}' if n_pid > 0 else '#metadata'
                     dropdown_items += (
@@ -20541,6 +21287,29 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
     upload_limits_hint = (f'Limits: {max_content_mb} MB/request \u2022 '
                           f'{max_files} files/upload \u2022 '
                           f'{max_file_mb} MB/file')
+    mag_cfg = REGISTRATION_DB.get_magnet_submission_config() if REGISTRATION_DB else {'enabled': False}
+    magnet_card = ''
+    if mag_cfg.get('enabled', False):
+        magnet_card = '''
+  <div class="card" style="margin-top:16px">
+    <div class="card-title">Add Magnet</div>
+    <form method="POST" action="/manage/magnet/submit">
+      <div class="two-col">
+        <div class="form-group" style="margin:0">
+          <label for="dash-magnet-uri">Magnet URI or Info Hash</label>
+          <input id="dash-magnet-uri" type="text" name="magnet_uri"
+                 placeholder="magnet:?xt=urn:btih:...  or infohash"
+                 autocomplete="off" required>
+          <div style="color:var(--muted);font-size:0.82rem;margin-top:6px">
+            Submit one magnet URI or one raw info hash. Metadata-only fetch; queue limits apply.
+          </div>
+        </div>
+        <div style="display:flex;align-items:flex-start;padding-top:32px">
+          <button type="submit" class="btn btn-primary">Queue Magnet</button>
+        </div>
+      </div>
+    </form>
+  </div>'''
 
     body = f'''
   <style>
@@ -20573,6 +21342,7 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
       </div>
     </form>
   </div>
+  {magnet_card}
   <div class="card">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:12px">
       <div class="card-title" style="margin:0">Registered Torrents ({total})</div>
@@ -22592,6 +23362,15 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _srr_timeout = _h(settings.get('srrdb_timeout_sec', '5'))
     _srr_ttl = _h(settings.get('srrdb_cache_ttl_hours', '72'))
     _srr_api_base = _h(settings.get('srrdb_api_base_url', 'https://api.srrdb.com/v1'))
+    _mag_enabled = settings.get('magnet_submission_enabled', '0') == '1'
+    _mag_mode = _h(settings.get('magnet_submission_mode', 'direct'))
+    _mag_aria2 = _h(settings.get('magnet_submission_aria2_path', ''))
+    _mag_work_dir = _h(settings.get('magnet_submission_work_dir', ''))
+    _mag_proxy_url = _h(settings.get('magnet_submission_proxy_url', 'http://127.0.0.1:3128'))
+    _mag_user_max = _h(settings.get('magnet_submission_max_user_running', str(MAGNET_JOB_DEFAULT_USER_MAX_ACTIVE)))
+    _mag_global_max = _h(settings.get('magnet_submission_max_global_running', str(MAGNET_JOB_DEFAULT_GLOBAL_MAX_ACTIVE)))
+    _mag_workers = _h(settings.get('magnet_submission_worker_concurrency', str(MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY)))
+    _mag_timeout = _h(settings.get('magnet_submission_job_timeout_sec', str(MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS)))
     _peer_disabled_attr = '' if is_super else 'disabled'
     _peer_save_cta = ('<button type="submit" class="btn btn-primary">Save Peer Query Settings</button>'
                       if is_super else
@@ -22776,6 +23555,65 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         {('<button type="submit" class="btn btn-primary">Save SRRDB Settings</button>' if is_super else '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')}
       </form>
     </div>'''
+    magnet_submission_card = f'''
+    <div class="card">
+      <div class="card-title">Magnet Metadata Submission</div>
+      <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+        Accept one magnet URI per request, fetch metadata-only using <span class="hash">aria2c</span>,
+        then register through the normal upload pipeline. Warning: this can expose server IP to external peers/trackers.
+      </p>
+      <form method="POST" action="/manage/admin/save-settings">
+        <input type="hidden" name="form_id" value="magnet_submission_settings">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+          <input type="checkbox" name="magnet_submission_enabled" value="1" {'checked' if _mag_enabled else ''} {_peer_disabled_attr}>
+          Enable magnet submission engine
+        </label>
+        <div class="form-group">
+          <label>aria2c path</label>
+          <input type="text" name="magnet_submission_aria2_path" value="{_mag_aria2}" placeholder="/usr/bin/aria2c" {_peer_disabled_attr}>
+        </div>
+        <div class="form-group">
+          <label>Working directory</label>
+          <input type="text" name="magnet_submission_work_dir" value="{_mag_work_dir}" placeholder="/var/lib/tracker/magnet-jobs" {_peer_disabled_attr}>
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <div class="form-group" style="min-width:180px">
+            <label>Mode</label>
+            <select name="magnet_submission_mode" {_peer_disabled_attr}>
+              <option value="direct" {'selected' if _mag_mode == 'direct' else ''}>direct</option>
+              <option value="proxy" {'selected' if _mag_mode == 'proxy' else ''}>proxy</option>
+            </select>
+          </div>
+          <div class="form-group" style="min-width:240px;flex:1">
+            <label>Proxy URL (proxy mode)</label>
+            <input type="text" name="magnet_submission_proxy_url" value="{_mag_proxy_url}" placeholder="http://127.0.0.1:3128" {_peer_disabled_attr}>
+          </div>
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <div class="form-group" style="min-width:160px">
+            <label>Max active per user</label>
+            <input type="number" name="magnet_submission_max_user_running" value="{_mag_user_max}" min="1" max="50" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:170px">
+            <label>Max active global</label>
+            <input type="number" name="magnet_submission_max_global_running" value="{_mag_global_max}" min="1" max="500" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:170px">
+            <label>Worker concurrency</label>
+            <input type="number" name="magnet_submission_worker_concurrency" value="{_mag_workers}" min="1" max="50" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:170px">
+            <label>Job timeout (sec)</label>
+            <input type="number" name="magnet_submission_job_timeout_sec" value="{_mag_timeout}" min="30" max="1800" {_peer_disabled_attr}>
+          </div>
+        </div>
+        <div style="font-size:0.8rem;color:var(--muted);margin:6px 0 14px 0">
+          Proxy mode strips <span class="hash">udp://</span> trackers automatically when building aria2 runtime args.
+          Keep high-confidence trackers first in the tracker list.
+        </div>
+        {('<button type="submit" class="btn btn-primary">Save Magnet Settings</button>' if is_super else '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')}
+      </form>
+    </div>'''
 
     body = f'''
   <div class="page-title">Admin Panel</div>
@@ -22884,6 +23722,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     {metadata_auto_match_card}
     {torrent_name_cleanup_card}
     {srrdb_card}
+    {magnet_submission_card}
   </div>
 
   {'<div class="panel" id="panel-settings">' + settings_html + '</div>' if is_super else ''}
@@ -23876,7 +24715,7 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
                 f'</div>'
             )
         elif is_security:
-            event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n.get('comment_id') or '')
+            event_id = str(n['info_hash']).split(':', 1)[1] if ':' in str(n['info_hash']) else str(n['comment_id'] or '')
             url = f'/manage/admin/security/event/{event_id}' if event_id.isdigit() else '/manage/admin?tab=security'
             read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
             rows += (
@@ -23892,7 +24731,39 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
                 f'</div>'
             )
         else:
-            if n['type'] in (
+            if n['type'] == 'magnet_job_done':
+                url = '/manage/notifications'
+                if re.fullmatch(r'[A-Fa-f0-9]{40}', str(n['info_hash'] or '')):
+                    url = f'/manage/torrent/{str(n["info_hash"]).lower()}'
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">🧲</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' finished your magnet submission: '
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                    f'</div>'
+                )
+            elif n['type'] == 'magnet_job_failed':
+                url = '/manage/notifications'
+                read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
+                rows += (
+                    f'<div class="notif-page-item{unread_cls}">'
+                    f'<div>'
+                    f'<div style="font-size:0.9rem"><span style="margin-right:6px">⚠️</span>'
+                    f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
+                    f' magnet submission failed: '
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<div class="notif-page-meta">{ts_h}</div>'
+                    f'</div>'
+                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                    f'</div>'
+                )
+            elif n['type'] in (
                 'torrent_report_open', 'torrent_report_high', 'torrent_report_update',
                 'torrent_report_opened', 'torrent_report_reviewing',
                 'torrent_report_resolved', 'torrent_report_dismissed',
@@ -26593,6 +27464,38 @@ def main():
             REGISTRATION_DB.set_setting('webauthn_rp_id', args.domain.split(':')[0].strip().lower(), 'system')
         _init_csrf_secret(REGISTRATION_DB)
         _start_peer_update_worker()
+        try:
+            _reconciled = REGISTRATION_DB.reconcile_magnet_jobs_on_startup()
+            if _reconciled:
+                _cleaned = 0
+                _notified = 0
+                for _job in _reconciled:
+                    _jid = int(_job.get('id') or 0)
+                    _uid = int(_job.get('submitted_by_user_id') or 0)
+                    _wdir = str(_job.get('working_dir') or '').strip()
+                    _cleanup_ok = _cleanup_magnet_job_dir(_wdir)
+                    if _cleanup_ok:
+                        _cleaned += 1
+                    REGISTRATION_DB.finish_magnet_job(
+                        _jid, 'timeout', 'system',
+                        error_code='startup_reconcile',
+                        error_detail='Server restart interrupted magnet job.',
+                        cleanup_done=_cleanup_ok
+                    )
+                    if _uid > 0:
+                        REGISTRATION_DB.notify_magnet_job_failure(
+                            _uid, 'system', _jid,
+                            'Magnet job timed out after server restart.',
+                            str(_job.get('info_hash') or '')
+                        )
+                        _notified += 1
+                log.warning(
+                    'magnet startup reconcile: timed out=%d cleaned=%d notified=%d',
+                    len(_reconciled), _cleaned, _notified
+                )
+        except Exception as _e:
+            log.warning('magnet startup reconcile failed (non-fatal): %s', _e)
+        _start_magnet_workers()
         OPEN_TRACKER = REGISTRATION_DB.get_setting('open_tracker') == '1'
         REWARD_ENABLED = REGISTRATION_DB.get_setting('reward_enabled') == '1'
         try:
@@ -26955,6 +27858,12 @@ def main():
                         _last_stats_persist_flush = _now
                 except Exception as _e:
                     log.warning('stats persistence flush failed (non-fatal): %s', _e)
+                try:
+                    _mag_pruned = REGISTRATION_DB.prune_old_magnet_jobs(older_than_hours=48)
+                    if _mag_pruned:
+                        log.info('magnet reconcile: pruned %d old job(s)', _mag_pruned)
+                except Exception as _e:
+                    log.warning('prune_old_magnet_jobs failed (non-fatal): %s', _e)
             active_torrents, total_peers = REGISTRY.live_stats()
             log.info('Stats: %d torrents  %d peers', active_torrents, total_peers)
     except KeyboardInterrupt:
