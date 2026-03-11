@@ -13110,13 +13110,15 @@ def _discover_downloaded_torrent(work_dir: str) -> str:
 
 
 def _build_aria2_magnet_argv(cfg: dict, info_hash: str, work_dir: str, log_path: str) -> list[str]:
+    work_root = str(cfg.get('work_dir') or '').strip() or work_dir
     argv = [
         str(cfg.get('aria2_path') or '').strip(),
         '--seed-time=0',
         '--bt-metadata-only=true',
         '--bt-save-metadata=true',
         f'--dir={work_dir}',
-        '--summary-interval=1',
+        f'--dht-file-path={os.path.join(work_root, "dht.dat")}',
+        f'--dht-file-path6={os.path.join(work_root, "dht6.dat")}',
         '--console-log-level=warn',
         f'--log={log_path}',
     ]
@@ -13126,6 +13128,10 @@ def _build_aria2_magnet_argv(cfg: dict, info_hash: str, work_dir: str, log_path:
         # DHT uses UDP and is not compatible with the HTTP proxy bridge path.
         argv.append('--enable-dht=false')
         argv.append('--enable-dht6=false')
+    else:
+        # Make direct-mode behavior explicit and avoid relying on aria2 defaults.
+        argv.append('--enable-dht=true')
+        argv.append('--enable-dht6=true')
     trackers = _magnet_tracker_list_for_mode(mode)
     if trackers:
         argv.append('--bt-tracker=' + ','.join(trackers))
@@ -13993,6 +13999,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_upload()
         elif path == '/manage/magnet/submit':
             self._post_magnet_submit()
+        elif path == '/manage/magnet/resubmit':
+            self._post_magnet_resubmit()
         elif path == '/manage/delete-torrent':
             self._post_delete_torrent()
         elif path == '/manage/torrent/lock':
@@ -15672,6 +15680,32 @@ class ManageHandler(BaseHTTPRequestHandler):
         )
         q = urllib.parse.quote_plus(msg[:500])
         return self._redirect(f'/manage/dashboard?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_magnet_resubmit(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        cfg = REGISTRATION_DB.get_magnet_submission_config() if REGISTRATION_DB else {'enabled': False}
+        if not cfg.get('enabled', False):
+            q = urllib.parse.quote_plus('Magnet submission engine is disabled.')
+            return self._redirect(f'/manage/notifications?msg={q}&msg_type=error')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        info_hash = (fields.get('info_hash', '') or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', info_hash):
+            q = urllib.parse.quote_plus('Invalid info hash for resubmit.')
+            return self._redirect(f'/manage/notifications?msg={q}&msg_type=error')
+        ok, msg, _job_id, _ih = REGISTRATION_DB.submit_magnet_job(
+            int(user['id']), user['username'], info_hash
+        )
+        notif_id_raw = (fields.get('notif_id', '0') or '0').strip()
+        if notif_id_raw.isdigit() and int(notif_id_raw) > 0:
+            try:
+                REGISTRATION_DB.mark_notification_read(int(notif_id_raw), int(user['id']))
+            except Exception:
+                pass
+        q = urllib.parse.quote_plus(msg[:500])
+        return self._redirect(f'/manage/notifications?msg={q}&msg_type={"success" if ok else "error"}')
 
     def _post_torrent_normalize_name(self):
         user = self._get_session_user()
@@ -24751,16 +24785,56 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
             elif n['type'] == 'magnet_job_failed':
                 url = '/manage/notifications'
                 read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
+                raw_detail = str(n['torrent_name'] or '')
+                ih_match = re.search(r'\(IH:\s*([A-Fa-f0-9]{40})\)', raw_detail)
+                failed_ih = ''
+                if ih_match:
+                    failed_ih = ih_match.group(1).upper()
+                if not failed_ih:
+                    try:
+                        mjid = int(n['comment_id'] or 0)
+                    except Exception:
+                        mjid = 0
+                    if mjid > 0 and REGISTRATION_DB:
+                        mjob = REGISTRATION_DB.get_magnet_job(mjid)
+                        if mjob:
+                            cand = str(mjob['info_hash'] or '').strip().upper()
+                            if re.fullmatch(r'[A-F0-9]{40}', cand):
+                                failed_ih = cand
+                detail_no_ih = re.sub(r'\s*\(IH:\s*[A-Fa-f0-9]{40}\)\s*\.?$', '', raw_detail).strip()
+                detail_no_ih_h = _h(detail_no_ih or raw_detail)
+                ih_html = ''
+                action_html = f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                if failed_ih:
+                    failed_ih_h = _h(failed_ih)
+                    ih_html = f' <span class="hash">IH: {failed_ih_h}</span>'
+                    action_html = (
+                        '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+                        f'<button type="button" class="btn btn-sm" '
+                        f'data-copy="{failed_ih_h}" '
+                        f'onclick="(function(btn){{var v=btn.getAttribute(\'data-copy\')||\'\';'
+                        f'var done=function(){{var old=btn.textContent;btn.textContent=\'Copied!\';setTimeout(function(){{btn.textContent=old;}},1000);}};'
+                        f'if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(v).then(done).catch(function(){{prompt(\'Copy info hash:\', v);}});}}'
+                        f'else{{prompt(\'Copy info hash:\', v);}}}})(this);return false;">Copy IH</button>'
+                        f'<form method="POST" action="/manage/magnet/resubmit" style="display:inline">'
+                        f'<input type="hidden" name="info_hash" value="{failed_ih_h}">'
+                        f'<input type="hidden" name="notif_id" value="{n_id}">'
+                        f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                        f'<button type="submit" class="btn btn-sm btn-green">Resubmit</button>'
+                        f'</form>'
+                        f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                        '</div>'
+                    )
                 rows += (
                     f'<div class="notif-page-item{unread_cls}">'
                     f'<div>'
                     f'<div style="font-size:0.9rem"><span style="margin-right:6px">⚠️</span>'
                     f'<a href="/manage/user/{from_h}" class="user-link">{from_h}</a>'
                     f' magnet submission failed: '
-                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{tname_h}</a></div>'
+                    f'<a href="{url}" {read_attrs} style="color:var(--accent);text-decoration:none">{detail_no_ih_h}</a>{ih_html}</div>'
                     f'<div class="notif-page-meta">{ts_h}</div>'
                     f'</div>'
-                    f'<button class="btn btn-sm" style="white-space:nowrap" {read_attrs}>View →</button>'
+                    f'{action_html}'
                     f'</div>'
                 )
             elif n['type'] in (
