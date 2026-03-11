@@ -16574,11 +16574,14 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
         log.info('REGISTRATION torrent deleted  ih=%s  by=%s', ih, user['username'])
         if redirect and redirect.startswith('/manage') and not redirect.startswith('/manage/torrent'):
-            self._redirect(redirect)
-        elif is_admin:
-            self._redirect('/manage/admin')
-        else:
-            self._redirect('/manage/dashboard')
+            return self._redirect(redirect)
+        referer = self.headers.get('Referer', '')
+        ref = urllib.parse.urlparse(referer)
+        ref_path = ref.path or ''
+        if ref_path.startswith('/manage') and not ref_path.startswith('/manage/torrent'):
+            ref_url = ref_path + (f'?{ref.query}' if ref.query else '')
+            return self._redirect(ref_url)
+        return self._redirect('/manage/dashboard')
 
     def _post_change_password(self):
         user = self._get_session_user()
