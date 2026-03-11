@@ -5,6 +5,8 @@ For day-to-day operation and UI workflows, use `USER_GUIDE.md`.
 
 For pre-production setup and testing with self-signed certificates, use `SANDBOX_GUIDE.md` first. Validate there before promoting changes to a live environment.
 
+For HTTP -> SOCKS5 proxy bridge setup (for magnet submission proxy mode), use `PRIVOXY_GUIDE.md`.
+
 ## Requirements
 
 - Ubuntu 24.04 (or any modern Linux with systemd)

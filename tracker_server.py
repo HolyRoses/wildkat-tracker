@@ -1666,18 +1666,31 @@ def _normalize_torrent_display_name(name: str, cleanup_tags: list[str],
 
 
 def _parse_magnet_uri(magnet_uri: str) -> tuple[bool, str, str]:
-    """Return (ok, normalized_btiH_upper_hex, error_msg)."""
+    """Return (ok, normalized_btih_upper_hex, error_msg) for magnet URI or raw info hash."""
     raw = str(magnet_uri or '').strip()
     if not raw:
-        return False, '', 'Magnet URI is required.'
+        return False, '', 'Magnet URI or info hash is required.'
+    # Allow direct info-hash submissions (hex40 or base32-32).
+    if re.fullmatch(r'(?i)[a-f0-9]{40}', raw):
+        return True, raw.upper(), ''
+    if re.fullmatch(r'(?i)[a-z2-7]{32}', raw):
+        try:
+            padded = raw.upper() + '=' * ((8 - (len(raw) % 8)) % 8)
+            decoded = base64.b32decode(padded, casefold=True)
+            ih = decoded.hex().upper()
+            if re.fullmatch(r'[A-F0-9]{40}', ih):
+                return True, ih, ''
+        except Exception:
+            pass
+        return False, '', 'Info hash is invalid.'
     if len(raw) > 8192:
         return False, '', 'Magnet URI is too long.'
     try:
         parsed = urllib.parse.urlparse(raw)
     except Exception:
-        return False, '', 'Invalid magnet URI.'
+        return False, '', 'Invalid magnet URI or info hash.'
     if (parsed.scheme or '').lower() != 'magnet':
-        return False, '', 'Magnet URI must start with magnet:?'
+        return False, '', 'Input must be a magnet URI (magnet:?) or a raw 40-char info hash.'
     q = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
     xt_values = [v for v in q.get('xt', []) if isinstance(v, str) and v]
     btih_values: list[str] = []
@@ -10516,10 +10529,14 @@ class RegistrationDB:
         )
 
     def notify_magnet_job_failure(self, recipient_user_id: int, actor_username: str,
-                                  job_id: int, detail: str) -> None:
+                                  job_id: int, detail: str, info_hash: str = '') -> None:
+        ih = str(info_hash or '').strip().upper()
+        detail_text = str(detail or 'Magnet job failed.')
+        if re.fullmatch(r'[A-F0-9]{40}', ih):
+            detail_text = f'{detail_text} (IH: {ih})'
         self.add_notification(
             int(recipient_user_id), 'magnet_job_failed', actor_username,
-            f'MAGNET:{int(job_id)}', str(detail or 'Magnet job failed.')[:120], int(job_id)
+            f'MAGNET:{int(job_id)}', detail_text[:200], int(job_id)
         )
 
     def _metadata_proposal_recipient_user_ids(self, info_hash: str) -> list[int]:
@@ -13247,7 +13264,9 @@ def _magnet_worker():
                     cleanup_done=cleanup_ok
                 )
                 if actor_uid > 0:
-                    REGISTRATION_DB.notify_magnet_job_failure(actor_uid, 'system', job_id, detail)
+                    REGISTRATION_DB.notify_magnet_job_failure(
+                        actor_uid, 'system', job_id, detail, str(job.get('info_hash') or '')
+                    )
         except Exception:
             log.exception('magnet worker unexpected error')
             time.sleep(0.5)
@@ -21277,12 +21296,12 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
     <form method="POST" action="/manage/magnet/submit">
       <div class="two-col">
         <div class="form-group" style="margin:0">
-          <label for="dash-magnet-uri">Magnet URI</label>
+          <label for="dash-magnet-uri">Magnet URI or Info Hash</label>
           <input id="dash-magnet-uri" type="text" name="magnet_uri"
-                 placeholder="magnet:?xt=urn:btih:..."
+                 placeholder="magnet:?xt=urn:btih:...  or infohash"
                  autocomplete="off" required>
           <div style="color:var(--muted);font-size:0.82rem;margin-top:6px">
-            One magnet per submit. Metadata-only fetch; queue limits apply.
+            Submit one magnet URI or one raw info hash. Metadata-only fetch; queue limits apply.
           </div>
         </div>
         <div style="display:flex;align-items:flex-start;padding-top:32px">
@@ -27466,7 +27485,8 @@ def main():
                     if _uid > 0:
                         REGISTRATION_DB.notify_magnet_job_failure(
                             _uid, 'system', _jid,
-                            'Magnet job timed out after server restart.'
+                            'Magnet job timed out after server restart.',
+                            str(_job.get('info_hash') or '')
                         )
                         _notified += 1
                 log.warning(
