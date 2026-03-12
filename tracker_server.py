@@ -1198,6 +1198,8 @@ SUPER_USER         = ''
 _MANAGE_HTTPS_PORT = 0      # set in main() so /manage routes know the HTTPS port
 PEER_UPDATE_QUEUE  = None   # background queue for async peer snapshot refresh
 MAGNET_WORKERS_STARTED = False
+MAGNET_WORKER_THREADS: list[threading.Thread] = []
+MAGNET_WORKERS_LOCK = threading.Lock()
 AUTH_BREAK_GLASS   = False  # startup override to bypass auth-factor enforcement gates
 AUTH_BREAK_GLASS_UNTIL_TS = 0.0
 
@@ -13279,18 +13281,22 @@ def _magnet_worker():
 
 
 def _start_magnet_workers():
-    global MAGNET_WORKERS_STARTED
-    if MAGNET_WORKERS_STARTED:
-        return
+    global MAGNET_WORKERS_STARTED, MAGNET_WORKER_THREADS
     if not REGISTRATION_DB:
         return
-    cfg = REGISTRATION_DB.get_magnet_submission_config()
-    workers = max(1, int(cfg.get('worker_concurrency') or MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY))
-    for idx in range(workers):
-        t = threading.Thread(target=_magnet_worker, daemon=True, name=f'magnet-worker-{idx+1}')
-        t.start()
-    MAGNET_WORKERS_STARTED = True
-    log.info('Magnet submission workers started: %d', workers)
+    with MAGNET_WORKERS_LOCK:
+        cfg = REGISTRATION_DB.get_magnet_submission_config()
+        target_workers = max(1, int(cfg.get('worker_concurrency') or MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY))
+        current_workers = len(MAGNET_WORKER_THREADS)
+        if MAGNET_WORKERS_STARTED and current_workers >= target_workers:
+            return
+        for idx in range(current_workers, target_workers):
+            t = threading.Thread(target=_magnet_worker, daemon=True, name=f'magnet-worker-{idx+1}')
+            t.start()
+            MAGNET_WORKER_THREADS.append(t)
+        MAGNET_WORKERS_STARTED = True
+        if target_workers > current_workers:
+            log.info('Magnet submission workers active: %d', len(MAGNET_WORKER_THREADS))
 
 def _render_profile_sharing_card(target_user) -> str:
     """Full-width profile card listing torrents currently shared by this member."""
@@ -15672,6 +15678,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not cfg.get('enabled', False):
             q = urllib.parse.quote_plus('Magnet submission engine is disabled.')
             return self._redirect(f'/manage/dashboard?msg={q}&msg_type=error')
+        _start_magnet_workers()
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         magnet_uri = (fields.get('magnet_uri', '') or '').strip()
@@ -15689,6 +15696,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not cfg.get('enabled', False):
             q = urllib.parse.quote_plus('Magnet submission engine is disabled.')
             return self._redirect(f'/manage/notifications?msg={q}&msg_type=error')
+        _start_magnet_workers()
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
         info_hash = (fields.get('info_hash', '') or '').strip().upper()
@@ -17745,6 +17753,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             REGISTRATION_DB.set_setting('magnet_submission_max_global_running', max_global_running, user['username'])
             REGISTRATION_DB.set_setting('magnet_submission_worker_concurrency', worker_concurrency, user['username'])
             REGISTRATION_DB.set_setting('magnet_submission_job_timeout_sec', timeout_sec, user['username'])
+            if enabled == '1':
+                _start_magnet_workers()
             return self._redirect('/manage/admin?tab=trackers&msg=Magnet+submission+settings+saved&msg_type=success')
         elif form_id == 'auto_promote':
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
