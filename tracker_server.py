@@ -20419,6 +20419,13 @@ _MANAGE_CSS = '''
                            display:flex; justify-content:space-between; align-items:center; }
   .notif-dropdown-title { font-family:var(--mono); font-size:0.68rem; letter-spacing:0.15em;
                           text-transform:uppercase; color:var(--muted); }
+  .notif-markall-btn { font-family:var(--mono); font-size:0.62rem; letter-spacing:0.08em;
+                       text-transform:uppercase; padding:4px 8px; border-radius:6px;
+                       border:1px solid var(--border); background:transparent; color:var(--muted);
+                       cursor:pointer; transition:all 0.15s; }
+  .notif-markall-btn:hover { border-color:var(--accent); color:var(--accent);
+                             background:rgba(245,166,35,0.08); }
+  .notif-markall-btn:disabled { opacity:0.55; cursor:not-allowed; }
   .notif-item { display:block; padding:12px 16px; border-bottom:1px solid var(--border);
                 text-decoration:none; color:var(--text); transition:background 0.1s; cursor:pointer;
                 background:transparent; border:none; width:100%; text-align:left; }
@@ -20670,9 +20677,21 @@ function copyInvite(btn, path) {
 (function() {
   var bellBtn = document.getElementById('nav-bell');
   var notifDropdown = document.getElementById('notif-dropdown');
+  var markAllBtn = document.getElementById('notif-mark-all');
 
   function _esc(s) {
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function _clearUnreadUi() {
+    var body = notifDropdown ? notifDropdown.querySelector('.notif-dropdown-body') : null;
+    if (body) body.innerHTML = '<div class="notif-empty">No unread notifications</div>';
+    if (markAllBtn) markAllBtn.disabled = true;
+    if (bellBtn) {
+      bellBtn.classList.add('notif-bell-inactive');
+      var badge = bellBtn.querySelector('.notif-count');
+      if (badge) badge.remove();
+    }
   }
 
   function readNotif(id, url) {
@@ -20680,6 +20699,19 @@ function copyInvite(btn, path) {
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
       body:'_csrf=' + encodeURIComponent(document.cookie.match(/wkcsrf=([^;]+)/)?.[1] || '')
     }).then(function() { window.location = url; });
+  }
+
+  function markAllRead(e) {
+    if (e) { e.preventDefault(); e.stopPropagation(); }
+    if (markAllBtn) markAllBtn.disabled = true;
+    fetch('/manage/notifications/read-all', {method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'_csrf=' + encodeURIComponent(document.cookie.match(/wkcsrf=([^;]+)/)?.[1] || '')
+    }).then(function() {
+      _clearUnreadUi();
+    }).catch(function() {
+      if (markAllBtn) markAllBtn.disabled = false;
+    });
   }
 
   function toggleNotifDropdown(e) {
@@ -20696,8 +20728,10 @@ function copyInvite(btn, path) {
         if (!body) return;
         if (!data || !data.items || !data.items.length) {
           body.innerHTML = '<div class="notif-empty">No unread notifications</div>';
+          if (markAllBtn) markAllBtn.disabled = true;
           return;
         }
+        if (markAllBtn) markAllBtn.disabled = false;
         var html = '';
         data.items.forEach(function(n){
           var tname = n.torrent.length >= 40 ? n.torrent + '...' : n.torrent;
@@ -20715,6 +20749,7 @@ function copyInvite(btn, path) {
   }
 
   if (bellBtn) bellBtn.addEventListener('click', toggleNotifDropdown);
+  if (markAllBtn) markAllBtn.addEventListener('click', markAllRead);
 
   document.addEventListener('click', function(e) {
     var notifTarget = e.target.closest('[data-notif-id][data-notif-url]');
@@ -21162,6 +21197,11 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                     )
         if not dropdown_items:
             dropdown_items = '<div class="notif-empty">No unread notifications</div>'
+        mark_all_btn = (
+            f'<button id="notif-mark-all" class="notif-markall-btn"'
+            + ('' if unread else ' disabled')
+            + '>Mark all read</button>'
+        )
         bell_html = (
             f'<div class="notif-wrap">'
             f'<button id="nav-bell" class="{bell_cls}" aria-label="Notifications" aria-haspopup="true" aria-controls="notif-dropdown" aria-expanded="false">'
@@ -21169,6 +21209,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             f'<div class="notif-dropdown" id="notif-dropdown">'
             f'<div class="notif-dropdown-header">'
             f'<span class="notif-dropdown-title">Notifications</span>'
+            f'{mark_all_btn}'
             f'</div>'
             f'<div class="notif-dropdown-body">{dropdown_items}</div>'
             f'<div class="notif-footer"><a href="/manage/notifications">View all notifications</a></div>'
