@@ -1593,6 +1593,13 @@ def _infer_tv_season_episode(release_name: str) -> tuple[int | None, int | None]
     m = re.search(r'(?i)\bseason[ ._-]*(\d{1,2})[ ._-]*episode[ ._-]*(\d{1,2})\b', text)
     if m:
         return int(m.group(1)), int(m.group(2))
+    # Season-pack releases often use S01 / S01.COMPLETE without episode token.
+    m = re.search(r'(?i)\bS(\d{1,2})(?!\d)\b', text)
+    if m:
+        return int(m.group(1)), None
+    m = re.search(r'(?i)\bseason[ ._-]*(\d{1,2})\b', text)
+    if m:
+        return int(m.group(1)), None
     return None, None
 
 
@@ -1665,6 +1672,177 @@ def _normalize_torrent_display_name(name: str, cleanup_tags: list[str],
         normalized = re.sub(r'\s*[-:|.]\s*$', '', normalized)
     normalized = normalized.strip()
     return normalized or original
+
+
+_FACET_PROVIDER_PATTERNS: list[tuple[str, str]] = [
+    (r'(?i)(?:^|[ ._\-])(AMZN|AMAZON)(?:[ ._\-]|$)', 'amzn'),
+    (r'(?i)(?:^|[ ._\-])(NF|NFLX|NETFLIX)(?:[ ._\-]|$)', 'nf'),
+    (r'(?i)(?:^|[ ._\-])(DSNP|DISNEYPLUS)(?:[ ._\-]|$)', 'dsnp'),
+    (r'(?i)(?:^|[ ._\-])(ATVP|APTV|ATV|APPLE)(?:[ ._\-]|$)', 'atvp'),
+    (r'(?i)(?:^|[ ._\-])(HMAX|MAX|HBO)(?:[ ._\-]|$)', 'hmax'),
+    (r'(?i)(?:^|[ ._\-])(PMTP|PARAMOUNT)(?:[ ._\-]|$)', 'pmtp'),
+    (r'(?i)(?:^|[ ._\-])(PCOK|PEACOCK)(?:[ ._\-]|$)', 'pcok'),
+    (r'(?i)(?:^|[ ._\-])(HULU)(?:[ ._\-]|$)', 'hulu'),
+    (r'(?i)(?:^|[ ._\-])(NOW)(?:[ ._\-]|$)', 'now'),
+    (r'(?i)(?:^|[ ._\-])(ROKU)(?:[ ._\-]|$)', 'roku'),
+    (r'(?i)(?:^|[ ._\-])(MA|MOVIESANYWHERE)(?:[ ._\-]|$)', 'ma'),
+    (r'(?i)(?:^|[ ._\-])(PLEX)(?:[ ._\-]|$)', 'plex'),
+    (r'(?i)(?:^|[ ._\-])(LBXD)(?:[ ._\-]|$)', 'lbxd'),
+]
+
+
+def _csv_tags(values: list[str]) -> str:
+    cleaned = []
+    seen = set()
+    for v in values:
+        item = str(v or '').strip().lower()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        cleaned.append(item)
+    cleaned.sort()
+    return ','.join(cleaned)
+
+
+def _parse_release_facets(raw_name: str) -> dict[str, Any]:
+    cleaned = _normalize_torrent_display_name(
+        raw_name, [], strip_www_prefix=True, strip_extensions=True
+    )
+    upper = str(cleaned or '').upper().strip()
+    if not upper:
+        return {}
+
+    facets: dict[str, Any] = {}
+
+    # Optional scene/p2p group suffix at end of release name.
+    gm = re.search(r'(?i)-([A-Z0-9][A-Z0-9._-]{1,63})$', upper)
+    if gm:
+        grp = str(gm.group(1) or '').strip('.-_ ').lower()
+        if grp:
+            facets['release_group'] = grp[:64]
+
+    # Shared technical tokens for movies and TV.
+    if re.search(r'(?i)(?:^|[ ._\-])2160P(?:[ ._\-]|$)|(?:^|[ ._\-])(4K|UHD)(?:[ ._\-]|$)', upper):
+        facets['release_resolution'] = '2160p'
+    elif re.search(r'(?i)(?:^|[ ._\-])1080P(?:[ ._\-]|$)', upper):
+        facets['release_resolution'] = '1080p'
+    elif re.search(r'(?i)(?:^|[ ._\-])720P(?:[ ._\-]|$)', upper):
+        facets['release_resolution'] = '720p'
+    elif re.search(r'(?i)(?:^|[ ._\-])480P(?:[ ._\-]|$)', upper):
+        facets['release_resolution'] = '480p'
+
+    if re.search(r'(?i)(?:^|[ ._\-])REMUX(?:[ ._\-]|$)', upper):
+        facets['release_source_class'] = 'remux'
+    elif re.search(r'(?i)(?:^|[ ._\-])(BLURAY|BLU-RAY|BDRIP|BRRIP)(?:[ ._\-]|$)', upper):
+        facets['release_source_class'] = 'bluray'
+    elif re.search(r'(?i)(?:^|[ ._\-])(DVDRIP|DVD)(?:[ ._\-]|$)', upper):
+        facets['release_source_class'] = 'dvdrip'
+    elif re.search(r'(?i)(?:^|[ ._\-])(WEB-DL|WEBDL)(?:[ ._\-]|$)', upper):
+        facets['release_source_class'] = 'web-dl'
+    elif re.search(r'(?i)(?:^|[ ._\-])WEBRIP(?:[ ._\-]|$)', upper):
+        facets['release_source_class'] = 'webrip'
+    elif re.search(r'(?i)(?:^|[ ._\-])WEB(?:[ ._\-]|$)', upper):
+        facets['release_source_class'] = 'web'
+
+    for pattern, provider in _FACET_PROVIDER_PATTERNS:
+        if re.search(pattern, upper):
+            facets['release_provider'] = provider
+            break
+
+    if re.search(r'(?i)(?:^|[ ._\-])(X265|H265|HEVC)(?:[ ._\-]|$)', upper):
+        facets['release_video_codec'] = 'h265'
+    elif re.search(r'(?i)(?:^|[ ._\-])(X264|H264|AVC)(?:[ ._\-]|$)', upper):
+        facets['release_video_codec'] = 'h264'
+
+    if re.search(r'(?i)(?:^|[ ._\-])DDP?[0-9.]*(?:[ ._\-]|$)', upper):
+        facets['release_audio_codec'] = 'ddp'
+    elif re.search(r'(?i)(?:^|[ ._\-])TRUEHD(?:[ ._\-]|$)', upper):
+        facets['release_audio_codec'] = 'truehd'
+    elif re.search(r'(?i)(?:^|[ ._\-])DTS(?:[ ._\-]|$)', upper):
+        facets['release_audio_codec'] = 'dts'
+    elif re.search(r'(?i)(?:^|[ ._\-])AC3(?:[ ._\-]|$)', upper):
+        facets['release_audio_codec'] = 'ac3'
+    elif re.search(r'(?i)(?:^|[ ._\-])AAC[0-9.]*(?:[ ._\-]|$)', upper):
+        facets['release_audio_codec'] = 'aac'
+
+    audio_features: list[str] = []
+    if re.search(r'(?i)(?:^|[ ._\-])ATMOS(?:[ ._\-]|$)', upper):
+        audio_features.append('atmos')
+    if re.search(r'(?i)(?:^|[ ._\-])(?:DDP?|AAC|AC3|DTS|TRUEHD)?5[.]1(?:[ ._\-]|$)', upper):
+        audio_features.append('5.1')
+    if re.search(r'(?i)(?:^|[ ._\-])(?:DDP?|AAC|AC3|DTS|TRUEHD)?7[.]1(?:[ ._\-]|$)', upper):
+        audio_features.append('7.1')
+    audio_csv = _csv_tags(audio_features)
+    if audio_csv:
+        facets['release_audio_features'] = audio_csv
+
+    hdr_flags: list[str] = []
+    if re.search(r'(?i)(?:^|[ ._\-])HDR10[+]?|(?:^|[ ._\-])HDR(?:[ ._\-]|$)', upper):
+        hdr_flags.append('hdr')
+    if re.search(r'(?i)DOLBY[ ._\-]?VISION|(?:^|[ ._\-])DV(?:[ ._\-]|$)', upper):
+        hdr_flags.append('dv')
+    hdr_csv = _csv_tags(hdr_flags)
+    if hdr_csv:
+        facets['release_hdr_flags'] = hdr_csv
+
+    edition_flags: list[str] = []
+    for flag in ('proper', 'repack', 'internal', 'extended', 'unrated', 'remastered', 'limited', 'imax'):
+        if re.search(rf'(?i)(?:^|[ ._\-]){re.escape(flag)}(?:[ ._\-]|$)', upper):
+            edition_flags.append(flag)
+    edition_csv = _csv_tags(edition_flags)
+    if edition_csv:
+        facets['release_edition_flags'] = edition_csv
+
+    # Semantic detector fallback from name only.
+    season, episode = _infer_tv_season_episode(upper)
+    if season is not None or re.search(r'(?i)(?:^|[ ._\-])SEASON(?:[ ._\-]|$)', upper):
+        facets['media_type'] = 'tv'
+    elif re.search(r'(?i)(?:^|[^0-9])(19[0-9]{2}|20[0-9]{2})(?:[^0-9]|$)', upper):
+        facets['media_type'] = 'movie'
+    else:
+        facets['media_type'] = 'other'
+
+    # Confidence score from number of independent facet families matched.
+    score = 0
+    families = (
+        'release_resolution', 'release_source_class', 'release_provider',
+        'release_video_codec', 'release_audio_codec', 'release_audio_features',
+        'release_hdr_flags', 'release_edition_flags', 'release_group',
+    )
+    for k in families:
+        if facets.get(k):
+            score += 10
+    if re.search(r'(?i)(?:^|[^0-9])(19[0-9]{2}|20[0-9]{2})(?:[^0-9]|$)', upper):
+        score += 10
+    facets['classification_confidence'] = max(0, min(100, score))
+    return facets
+
+
+def _parse_torrent_facets_from_qs(params: dict[str, list[str]]) -> dict[str, str]:
+    def _pick(key: str) -> str:
+        return str((params.get(key, [''])[0] or '')).strip().lower()
+    out: dict[str, str] = {}
+    media_type = _pick('fmt')
+    if media_type in ('movie', 'tv', 'game', 'other'):
+        out['media_type'] = media_type
+    resolution = _pick('fr')
+    if resolution in ('2160p', '1080p', '720p', '480p'):
+        out['release_resolution'] = resolution
+    source = _pick('fs')
+    if source in ('web-dl', 'webrip', 'web', 'bluray', 'dvdrip', 'remux'):
+        out['release_source_class'] = source
+    provider = _pick('fp')
+    if provider in ('amzn', 'nf', 'dsnp', 'atvp', 'hmax', 'pmtp', 'pcok', 'hulu', 'now', 'roku', 'ma', 'plex', 'lbxd'):
+        out['release_provider'] = provider
+    genre = re.sub(r'[^a-z0-9 _-]+', '', _pick('fg')).strip()
+    if genre:
+        out['genre'] = genre[:40]
+    if _pick('fa') in ('1', 'true', 'yes', 'on', 'atmos'):
+        out['audio_feature'] = 'atmos'
+    hdr = _pick('fh')
+    if hdr in ('hdr', 'dv'):
+        out['hdr_flag'] = hdr
+    return out
 
 
 def _parse_magnet_uri(magnet_uri: str) -> tuple[bool, str, str]:
@@ -2318,7 +2496,20 @@ class RegistrationDB:
                 piece_length        INTEGER NOT NULL DEFAULT 0,
                 is_private          INTEGER NOT NULL DEFAULT 0,
                 is_multifile        INTEGER NOT NULL DEFAULT 0,
-                files_json          TEXT    NOT NULL DEFAULT '[]'
+                files_json          TEXT    NOT NULL DEFAULT '[]',
+                media_type          TEXT    NOT NULL DEFAULT '',
+                release_resolution  TEXT    NOT NULL DEFAULT '',
+                release_source_class TEXT   NOT NULL DEFAULT '',
+                release_provider    TEXT    NOT NULL DEFAULT '',
+                release_video_codec TEXT    NOT NULL DEFAULT '',
+                release_audio_codec TEXT    NOT NULL DEFAULT '',
+                release_audio_features TEXT NOT NULL DEFAULT '',
+                release_hdr_flags   TEXT    NOT NULL DEFAULT '',
+                release_edition_flags TEXT  NOT NULL DEFAULT '',
+                release_group       TEXT    NOT NULL DEFAULT '',
+                content_genres      TEXT    NOT NULL DEFAULT '',
+                classification_source TEXT  NOT NULL DEFAULT '',
+                classification_confidence INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS magnet_trackers (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2617,6 +2808,32 @@ class RegistrationDB:
             c.execute('ALTER TABLE torrents ADD COLUMN peer_last_updated TEXT')
         if 'peer_last_tracker' not in cols:
             c.execute('ALTER TABLE torrents ADD COLUMN peer_last_tracker TEXT')
+        if 'media_type' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN media_type TEXT NOT NULL DEFAULT ''")
+        if 'release_resolution' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN release_resolution TEXT NOT NULL DEFAULT ''")
+        if 'release_source_class' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN release_source_class TEXT NOT NULL DEFAULT ''")
+        if 'release_provider' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN release_provider TEXT NOT NULL DEFAULT ''")
+        if 'release_video_codec' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN release_video_codec TEXT NOT NULL DEFAULT ''")
+        if 'release_audio_codec' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN release_audio_codec TEXT NOT NULL DEFAULT ''")
+        if 'release_audio_features' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN release_audio_features TEXT NOT NULL DEFAULT ''")
+        if 'release_hdr_flags' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN release_hdr_flags TEXT NOT NULL DEFAULT ''")
+        if 'release_edition_flags' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN release_edition_flags TEXT NOT NULL DEFAULT ''")
+        if 'release_group' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN release_group TEXT NOT NULL DEFAULT ''")
+        if 'content_genres' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN content_genres TEXT NOT NULL DEFAULT ''")
+        if 'classification_source' not in cols:
+            c.execute("ALTER TABLE torrents ADD COLUMN classification_source TEXT NOT NULL DEFAULT ''")
+        if 'classification_confidence' not in cols:
+            c.execute('ALTER TABLE torrents ADD COLUMN classification_confidence INTEGER NOT NULL DEFAULT 0')
         ucols = [r[1] for r in c.execute('PRAGMA table_info(users)').fetchall()]
         if 'login_count' not in ucols:
             c.execute('ALTER TABLE users ADD COLUMN login_count INTEGER NOT NULL DEFAULT 0')
@@ -2654,7 +2871,16 @@ class RegistrationDB:
         tcols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
         if 'comments_locked' not in tcols:
             c.execute('ALTER TABLE torrents ADD COLUMN comments_locked INTEGER NOT NULL DEFAULT 0')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_torrents_media_type ON torrents(media_type)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_torrents_release_resolution ON torrents(release_resolution)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_torrents_release_source_class ON torrents(release_source_class)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_torrents_release_provider ON torrents(release_provider)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_torrents_media_res_source ON torrents(media_type, release_resolution, release_source_class)')
         c.commit()
+        try:
+            self.backfill_torrent_classifications(limit=500)
+        except Exception as e:
+            log.debug('facet backfill deferred (non-fatal): %s', e)
         # invite_codes table (may not exist on older installs)
         c.execute('''
             CREATE TABLE IF NOT EXISTS invite_codes (
@@ -5760,6 +5986,10 @@ class RegistrationDB:
                      meta.get('files', '[]'))
                 )
                 self._conn().commit()
+                try:
+                    self.classify_torrent(ih.upper())
+                except Exception as e:
+                    log.debug('torrent classify deferred (non-fatal): ih=%s err=%s', ih.upper(), e)
                 self._log(username, 'register_torrent', ih.upper(), name)
                 return True
             except sqlite3.IntegrityError:
@@ -5770,6 +6000,164 @@ class RegistrationDB:
                     time.sleep(0.25 * (attempt + 1))
                     continue
                 raise
+
+    @staticmethod
+    def _normalize_genre_token(v: str) -> str:
+        token = re.sub(r'[^a-z0-9 _-]+', '', str(v or '').strip().lower())
+        token = re.sub(r'\s+', ' ', token).strip()
+        return token[:40]
+
+    @classmethod
+    def _normalize_genres_csv(cls, raw_values: list[str]) -> str:
+        vals: list[str] = []
+        seen: set[str] = set()
+        for v in raw_values:
+            t = cls._normalize_genre_token(v)
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            vals.append(t)
+        return ','.join(vals[:16])
+
+    @staticmethod
+    def _normalize_csv_token(v: str) -> str:
+        token = re.sub(r'[^a-z0-9.+_-]+', '', str(v or '').strip().lower())
+        return token[:40]
+
+    @classmethod
+    def _csv_contains_token_sql(cls, column: str) -> str:
+        return f"instr(',' || lower(COALESCE({column},'')) || ',', ?) > 0"
+
+    def _metadata_facets_for_torrent(self, ih_upper: str) -> dict[str, str]:
+        row = self._conn().execute(
+            '''SELECT l.provider, c.media_type, c.genres_json
+               FROM torrent_metadata_links l
+               LEFT JOIN torrent_metadata_cache c
+                 ON c.provider=l.provider
+                AND c.external_id=l.external_id
+                AND COALESCE(c.episode_external_id,'')=COALESCE(l.episode_external_id,'')
+               WHERE l.info_hash=? AND l.status='active'
+               ORDER BY l.id DESC
+               LIMIT 4''',
+            (ih_upper,)
+        ).fetchall()
+        out: dict[str, str] = {}
+        genres: list[str] = []
+        for r in row:
+            provider = str(r['provider'] or '').strip().lower()
+            media_type = str(r['media_type'] or '').strip().lower()
+            if media_type in ('series', 'episode'):
+                out['media_type'] = 'tv'
+            elif media_type in ('movie', 'tv', 'game'):
+                out['media_type'] = media_type
+            elif provider == 'steam':
+                out['media_type'] = 'game'
+            try:
+                for g in json.loads(str(r['genres_json'] or '[]')):
+                    if isinstance(g, str):
+                        genres.append(g)
+            except Exception:
+                pass
+        genres_csv = self._normalize_genres_csv(genres)
+        if genres_csv:
+            out['content_genres'] = genres_csv
+        return out
+
+    def _build_torrent_classification(self, ih_upper: str, name: str) -> dict[str, Any]:
+        facets = _parse_release_facets(str(name or ''))
+        metadata = self._metadata_facets_for_torrent(ih_upper)
+        src = 'name'
+        if metadata.get('media_type'):
+            facets['media_type'] = metadata['media_type']
+            src = 'metadata'
+        if metadata.get('content_genres'):
+            facets['content_genres'] = metadata['content_genres']
+            src = 'metadata' if src == 'name' else src
+        facets['classification_source'] = src
+        facets['classification_confidence'] = int(max(0, min(100, int(facets.get('classification_confidence') or 0))))
+        return facets
+
+    def _persist_torrent_classification(self, ih_upper: str, facets: dict[str, Any]) -> None:
+        self._conn().execute(
+            '''UPDATE torrents
+               SET media_type=?,
+                   release_resolution=?,
+                   release_source_class=?,
+                   release_provider=?,
+                   release_video_codec=?,
+                   release_audio_codec=?,
+                   release_audio_features=?,
+                   release_hdr_flags=?,
+                   release_edition_flags=?,
+                   release_group=?,
+                   content_genres=?,
+                   classification_source=?,
+                   classification_confidence=?
+               WHERE info_hash=?''',
+            (
+                str(facets.get('media_type') or '')[:32],
+                str(facets.get('release_resolution') or '')[:24],
+                str(facets.get('release_source_class') or '')[:24],
+                str(facets.get('release_provider') or '')[:24],
+                str(facets.get('release_video_codec') or '')[:24],
+                str(facets.get('release_audio_codec') or '')[:24],
+                str(facets.get('release_audio_features') or '')[:120],
+                str(facets.get('release_hdr_flags') or '')[:80],
+                str(facets.get('release_edition_flags') or '')[:120],
+                str(facets.get('release_group') or '')[:64],
+                str(facets.get('content_genres') or '')[:240],
+                str(facets.get('classification_source') or '')[:24],
+                int(facets.get('classification_confidence') or 0),
+                ih_upper,
+            )
+        )
+        self._conn().commit()
+
+    def classify_torrent(self, info_hash: str) -> bool:
+        ih_upper = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih_upper):
+            return False
+        for attempt in range(6):
+            try:
+                row = self._conn().execute(
+                    'SELECT name FROM torrents WHERE info_hash=?',
+                    (ih_upper,)
+                ).fetchone()
+                if not row:
+                    return False
+                facets = self._build_torrent_classification(ih_upper, str(row['name'] or ''))
+                self._persist_torrent_classification(ih_upper, facets)
+                return True
+            except sqlite3.OperationalError as e:
+                if 'locked' in str(e).lower() and attempt < 5:
+                    time.sleep(0.08 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    log.debug('classify_torrent deferred (non-fatal lock): ih=%s err=%s', ih_upper, e)
+                    return False
+                raise
+        return False
+
+    def backfill_torrent_classifications(self, limit: int = 500) -> int:
+        lim = max(1, min(int(limit or 500), 5000))
+        rows = self._conn().execute(
+            '''SELECT info_hash FROM torrents
+               WHERE COALESCE(classification_source,'')=''
+                  OR COALESCE(media_type,'')=''
+               ORDER BY id DESC
+               LIMIT ?''',
+            (lim,)
+        ).fetchall()
+        done = 0
+        for r in rows:
+            ih = str(r['info_hash'] or '').strip().upper()
+            if not ih:
+                continue
+            if self.classify_torrent(ih):
+                done += 1
+        if done:
+            log.debug('facet backfill classified=%s', done)
+        return done
 
     def normalize_torrent_name(self, ih: str, actor: str, cleanup_tags: list[str],
                                strip_www_prefix: bool = True,
@@ -5800,6 +6188,11 @@ class RegistrationDB:
                     (new_name[:500], ih_upper)
                 )
                 c.commit()
+                try:
+                    self.classify_torrent(ih_upper)
+                except Exception as e:
+                    log.debug('normalize classify deferred (non-fatal): ih=%s err=%s',
+                              ih_upper, e)
                 self._log(actor, 'normalize_torrent_name', ih_upper,
                           f'{old_name[:140]} -> {new_name[:140]}')
                 return True, 'Torrent name normalized.'
@@ -7712,6 +8105,13 @@ class RegistrationDB:
                      episode_external_id[:64],
                      int(job['proposal_id']))
                 )
+                try:
+                    prow = self.get_metadata_proposal(int(job['proposal_id']))
+                    if prow:
+                        self.classify_torrent(str(prow['info_hash'] or ''))
+                except Exception as e:
+                    log.debug('classify after metadata fetch deferred (non-fatal): proposal=%s err=%s',
+                              int(job['proposal_id']), e)
                 c.execute(
                     '''UPDATE torrent_metadata_fetch_jobs
                        SET status='done', last_error='', next_attempt_at=NULL, updated_at=?
@@ -7959,6 +8359,10 @@ class RegistrationDB:
              creator_uid, creator_un, self._ts())
         )
         c.commit()
+        try:
+            self.classify_torrent(ih)
+        except Exception as e:
+            log.debug('classify after metadata activate deferred (non-fatal): ih=%s err=%s', ih, e)
 
     def resolve_metadata_proposal(self, proposal_id: int, actor_user_id: int,
                                   actor_username: str, decision: str,
@@ -8022,6 +8426,10 @@ class RegistrationDB:
         self._conn().commit()
         if cur.rowcount < 1:
             return False, 'No active metadata link to revoke.'
+        try:
+            self.classify_torrent(ih)
+        except Exception as e:
+            log.debug('classify after metadata revoke deferred (non-fatal): ih=%s err=%s', ih, e)
         self._log(actor_username, 'metadata_revoked', ih, f'provider={p} reason={(reason or "")[:120]}')
         return True, 'Metadata revoked.'
 
@@ -9079,158 +9487,253 @@ class RegistrationDB:
             return 'steam', m.group(1)
         return '', ''
 
+    @classmethod
+    def _facet_clauses(cls, facets: dict[str, str] | None, table_alias: str = '') -> tuple[str, list[str]]:
+        if not facets:
+            return '', []
+        alias = f'{table_alias}.' if table_alias else ''
+        clauses: list[str] = []
+        params: list[str] = []
+        media_type = str(facets.get('media_type') or '').strip().lower()
+        if media_type in ('movie', 'tv', 'game'):
+            clauses.append(f'LOWER(COALESCE({alias}media_type,\'\'))=?')
+            params.append(media_type)
+        elif media_type == 'other':
+            clauses.append(f'LOWER(COALESCE({alias}media_type,\'\')) NOT IN (\'movie\',\'tv\',\'game\')')
+        resolution = str(facets.get('release_resolution') or '').strip().lower()
+        if resolution in ('2160p', '1080p', '720p', '480p'):
+            clauses.append(f'LOWER(COALESCE({alias}release_resolution,\'\'))=?')
+            params.append(resolution)
+        source = str(facets.get('release_source_class') or '').strip().lower()
+        if source in ('web-dl', 'webrip', 'web', 'bluray', 'dvdrip', 'remux'):
+            clauses.append(f'LOWER(COALESCE({alias}release_source_class,\'\'))=?')
+            params.append(source)
+        provider = str(facets.get('release_provider') or '').strip().lower()
+        if provider in ('amzn', 'nf', 'dsnp', 'atvp', 'hmax', 'pmtp', 'pcok', 'hulu', 'now', 'roku', 'ma', 'plex', 'lbxd'):
+            clauses.append(f'LOWER(COALESCE({alias}release_provider,\'\'))=?')
+            params.append(provider)
+        genre = cls._normalize_genre_token(str(facets.get('genre') or ''))
+        if genre:
+            clauses.append(cls._csv_contains_token_sql(f'{alias}content_genres'))
+            params.append(f',{genre},')
+        audio_feature = cls._normalize_csv_token(str(facets.get('audio_feature') or ''))
+        if audio_feature:
+            clauses.append(cls._csv_contains_token_sql(f'{alias}release_audio_features'))
+            params.append(f',{audio_feature},')
+        hdr_flag = cls._normalize_csv_token(str(facets.get('hdr_flag') or ''))
+        if hdr_flag in ('hdr', 'dv'):
+            clauses.append(cls._csv_contains_token_sql(f'{alias}release_hdr_flags'))
+            params.append(f',{hdr_flag},')
+        if not clauses:
+            return '', []
+        return ' AND '.join(clauses), params
+
     def search_torrents(self, query: str, user_id: int | None = None,
-                        page: int = 1, per_page: int = 50) -> list:
+                        page: int = 1, per_page: int = 50,
+                        facets: dict[str, str] | None = None) -> list:
         mode, value = self._parse_special_torrent_search(query)
         where, params = self._build_search_clauses(query)
+        facet_sql, facet_params = self._facet_clauses(facets, table_alias='t')
+        facet_sql_plain, facet_params_plain = self._facet_clauses(facets, table_alias='')
         offset = (max(1, page) - 1) * per_page
         if mode == 'imdb':
             if user_id is None:
+                tail = (f' AND {facet_sql}' if facet_sql else '')
                 return self._conn().execute(
                     '''SELECT t.* FROM torrents t
                        JOIN torrent_metadata_links l
                          ON l.info_hash=t.info_hash
                       WHERE l.status='active' AND l.provider='imdb' AND LOWER(l.external_id)=?
+                      ''' + tail + '''
                       ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                    (value, per_page, offset)
+                    (value, *facet_params, per_page, offset)
                 ).fetchall()
+            tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
                 '''SELECT t.* FROM torrents t
                    JOIN torrent_metadata_links l
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
                     AND l.provider='imdb' AND LOWER(l.external_id)=?
+                  ''' + tail + '''
                   ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                (user_id, value, per_page, offset)
+                (user_id, value, *facet_params, per_page, offset)
             ).fetchall()
         if mode == 'tvmaze':
             if user_id is None:
+                tail = (f' AND {facet_sql}' if facet_sql else '')
                 return self._conn().execute(
                     '''SELECT t.* FROM torrents t
                        JOIN torrent_metadata_links l
                          ON l.info_hash=t.info_hash
                       WHERE l.status='active' AND l.provider='tvmaze' AND l.external_id=?
+                      ''' + tail + '''
                       ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                    (value, per_page, offset)
+                    (value, *facet_params, per_page, offset)
                 ).fetchall()
+            tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
                 '''SELECT t.* FROM torrents t
                    JOIN torrent_metadata_links l
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
                     AND l.provider='tvmaze' AND l.external_id=?
+                  ''' + tail + '''
                   ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                (user_id, value, per_page, offset)
+                (user_id, value, *facet_params, per_page, offset)
             ).fetchall()
         if mode == 'steam':
             if user_id is None:
+                tail = (f' AND {facet_sql}' if facet_sql else '')
                 return self._conn().execute(
                     '''SELECT t.* FROM torrents t
                        JOIN torrent_metadata_links l
                          ON l.info_hash=t.info_hash
                       WHERE l.status='active' AND l.provider='steam' AND l.external_id=?
+                      ''' + tail + '''
                       ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                    (value, per_page, offset)
+                    (value, *facet_params, per_page, offset)
                 ).fetchall()
+            tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
                 '''SELECT t.* FROM torrents t
                    JOIN torrent_metadata_links l
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
                     AND l.provider='steam' AND l.external_id=?
+                  ''' + tail + '''
                   ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                (user_id, value, per_page, offset)
+                (user_id, value, *facet_params, per_page, offset)
             ).fetchall()
         if user_id is None:
+            facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
             return self._conn().execute(
                 f'SELECT * FROM torrents WHERE {where} '
+                f'{facet_tail} '
                 'ORDER BY registered_at DESC LIMIT ? OFFSET ?',
-                (*params, per_page, offset)
+                (*params, *facet_params_plain, per_page, offset)
             ).fetchall()
+        facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
         return self._conn().execute(
             f'SELECT * FROM torrents WHERE uploaded_by_id=? AND ({where}) '
+            f'{facet_tail} '
             'ORDER BY registered_at DESC LIMIT ? OFFSET ?',
-            (user_id, *params, per_page, offset)
+            (user_id, *params, *facet_params_plain, per_page, offset)
         ).fetchall()
 
-    def count_search_torrents(self, query: str, user_id: int | None = None) -> int:
+    def count_search_torrents(self, query: str, user_id: int | None = None,
+                              facets: dict[str, str] | None = None) -> int:
         mode, value = self._parse_special_torrent_search(query)
         where, params = self._build_search_clauses(query)
+        facet_sql, facet_params = self._facet_clauses(facets, table_alias='t')
+        facet_sql_plain, facet_params_plain = self._facet_clauses(facets, table_alias='')
         if mode == 'imdb':
             if user_id is None:
+                tail = (f' AND {facet_sql}' if facet_sql else '')
                 return self._conn().execute(
                     '''SELECT COUNT(*) FROM torrents t
                        JOIN torrent_metadata_links l
                          ON l.info_hash=t.info_hash
-                      WHERE l.status='active' AND l.provider='imdb' AND LOWER(l.external_id)=?''',
-                    (value,)
+                      WHERE l.status='active' AND l.provider='imdb' AND LOWER(l.external_id)=?''' + tail,
+                    (value, *facet_params)
                 ).fetchone()[0]
+            tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
                 '''SELECT COUNT(*) FROM torrents t
                    JOIN torrent_metadata_links l
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
-                    AND l.provider='imdb' AND LOWER(l.external_id)=?''',
-                (user_id, value)
+                    AND l.provider='imdb' AND LOWER(l.external_id)=?''' + tail,
+                (user_id, value, *facet_params)
             ).fetchone()[0]
         if mode == 'tvmaze':
             if user_id is None:
+                tail = (f' AND {facet_sql}' if facet_sql else '')
                 return self._conn().execute(
                     '''SELECT COUNT(*) FROM torrents t
                        JOIN torrent_metadata_links l
                          ON l.info_hash=t.info_hash
-                      WHERE l.status='active' AND l.provider='tvmaze' AND l.external_id=?''',
-                    (value,)
+                      WHERE l.status='active' AND l.provider='tvmaze' AND l.external_id=?''' + tail,
+                    (value, *facet_params)
                 ).fetchone()[0]
+            tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
                 '''SELECT COUNT(*) FROM torrents t
                    JOIN torrent_metadata_links l
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
-                    AND l.provider='tvmaze' AND l.external_id=?''',
-                (user_id, value)
+                    AND l.provider='tvmaze' AND l.external_id=?''' + tail,
+                (user_id, value, *facet_params)
             ).fetchone()[0]
         if mode == 'steam':
             if user_id is None:
+                tail = (f' AND {facet_sql}' if facet_sql else '')
                 return self._conn().execute(
                     '''SELECT COUNT(*) FROM torrents t
                        JOIN torrent_metadata_links l
                          ON l.info_hash=t.info_hash
-                      WHERE l.status='active' AND l.provider='steam' AND l.external_id=?''',
-                    (value,)
+                      WHERE l.status='active' AND l.provider='steam' AND l.external_id=?''' + tail,
+                    (value, *facet_params)
                 ).fetchone()[0]
+            tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
                 '''SELECT COUNT(*) FROM torrents t
                    JOIN torrent_metadata_links l
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
-                    AND l.provider='steam' AND l.external_id=?''',
-                (user_id, value)
+                    AND l.provider='steam' AND l.external_id=?''' + tail,
+                (user_id, value, *facet_params)
             ).fetchone()[0]
         if user_id is None:
+            facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
             return self._conn().execute(
-                f'SELECT COUNT(*) FROM torrents WHERE {where}',
-                params
+                f'SELECT COUNT(*) FROM torrents WHERE {where}{facet_tail}',
+                (*params, *facet_params_plain)
             ).fetchone()[0]
+        facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
         return self._conn().execute(
-            f'SELECT COUNT(*) FROM torrents WHERE uploaded_by_id=? AND ({where})',
-            (user_id, *params)
+            f'SELECT COUNT(*) FROM torrents WHERE uploaded_by_id=? AND ({where}){facet_tail}',
+            (user_id, *params, *facet_params_plain)
         ).fetchone()[0]
 
-    def count_torrents(self, user_id: int | None = None) -> int:
+    def count_torrents(self, user_id: int | None = None,
+                       facets: dict[str, str] | None = None) -> int:
+        facet_sql, facet_params = self._facet_clauses(facets, table_alias='')
         if user_id is None:
+            if facet_sql:
+                return self._conn().execute(
+                    f'SELECT COUNT(*) FROM torrents WHERE {facet_sql}',
+                    facet_params
+                ).fetchone()[0]
             return self._conn().execute('SELECT COUNT(*) FROM torrents').fetchone()[0]
+        if facet_sql:
+            return self._conn().execute(
+                f'SELECT COUNT(*) FROM torrents WHERE uploaded_by_id=? AND ({facet_sql})',
+                (user_id, *facet_params)
+            ).fetchone()[0]
         return self._conn().execute(
             'SELECT COUNT(*) FROM torrents WHERE uploaded_by_id=?', (user_id,)
         ).fetchone()[0]
 
     def list_torrents(self, user_id: int | None = None,
-                      page: int = 1, per_page: int = 0) -> list:
+                      page: int = 1, per_page: int = 0,
+                      facets: dict[str, str] | None = None) -> list:
         """Return torrents. per_page=0 means no pagination (all rows)."""
+        facet_sql, facet_params = self._facet_clauses(facets, table_alias='')
         if per_page <= 0:
             if user_id is None:
+                if facet_sql:
+                    return self._conn().execute(
+                        f'SELECT * FROM torrents WHERE {facet_sql} ORDER BY registered_at DESC',
+                        facet_params
+                    ).fetchall()
                 return self._conn().execute(
                     'SELECT * FROM torrents ORDER BY registered_at DESC'
+                ).fetchall()
+            if facet_sql:
+                return self._conn().execute(
+                    f'SELECT * FROM torrents WHERE uploaded_by_id=? AND ({facet_sql}) ORDER BY registered_at DESC',
+                    (user_id, *facet_params)
                 ).fetchall()
             return self._conn().execute(
                 'SELECT * FROM torrents WHERE uploaded_by_id=? ORDER BY registered_at DESC',
@@ -9238,9 +9741,19 @@ class RegistrationDB:
             ).fetchall()
         offset = (max(1, page) - 1) * per_page
         if user_id is None:
+            if facet_sql:
+                return self._conn().execute(
+                    f'SELECT * FROM torrents WHERE {facet_sql} ORDER BY registered_at DESC LIMIT ? OFFSET ?',
+                    (*facet_params, per_page, offset)
+                ).fetchall()
             return self._conn().execute(
                 'SELECT * FROM torrents ORDER BY registered_at DESC LIMIT ? OFFSET ?',
                 (per_page, offset)
+            ).fetchall()
+        if facet_sql:
+            return self._conn().execute(
+                f'SELECT * FROM torrents WHERE uploaded_by_id=? AND ({facet_sql}) ORDER BY registered_at DESC LIMIT ? OFFSET ?',
+                (user_id, *facet_params, per_page, offset)
             ).fetchall()
         return self._conn().execute(
             'SELECT * FROM torrents WHERE uploaded_by_id=? ORDER BY registered_at DESC LIMIT ? OFFSET ?',
@@ -14191,17 +14704,19 @@ class ManageHandler(BaseHTTPRequestHandler):
         role    = _user_role(user)
         per_page = int(REGISTRATION_DB.get_setting('torrents_per_page', '50'))
         page     = _get_page_param(self.path)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        facets = _parse_torrent_facets_from_qs(qs)
         uid      = None if role in ('super', 'admin', 'editor', 'standard') else user['id']
-        total    = REGISTRATION_DB.count_torrents(user_id=uid)
-        torrents = REGISTRATION_DB.list_torrents(user_id=uid, page=page, per_page=per_page)
+        total    = REGISTRATION_DB.count_torrents(user_id=uid, facets=facets)
+        torrents = REGISTRATION_DB.list_torrents(user_id=uid, page=page, per_page=per_page, facets=facets)
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg = urllib.parse.unquote(qs.get('msg', [''])[0])
         msg_type = qs.get('msg_type', ['info'])[0]
         self._send_html(_render_dashboard(user, torrents, page=page,
                                           total_pages=total_pages, total=total,
-                                          msg=msg, msg_type=msg_type))
+                                          msg=msg, msg_type=msg_type,
+                                          facets=facets))
 
     def _get_admin(self):
         user = self._get_session_user()
@@ -17083,18 +17598,19 @@ class ManageHandler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(qs)
         query  = params.get('q', [''])[0].strip()[:200]
         page   = max(1, int(params.get('page', ['1'])[0]))
+        facets = _parse_torrent_facets_from_qs(params)
         per_page = int(REGISTRATION_DB.get_setting('torrents_per_page', '50'))
         role   = _user_role(user)
         uid    = None if role in ('super', 'admin', 'editor', 'standard') else user['id']
         if query:
-            total    = REGISTRATION_DB.count_search_torrents(query, user_id=uid)
-            torrents = REGISTRATION_DB.search_torrents(query, user_id=uid, page=page, per_page=per_page)
+            total    = REGISTRATION_DB.count_search_torrents(query, user_id=uid, facets=facets)
+            torrents = REGISTRATION_DB.search_torrents(query, user_id=uid, page=page, per_page=per_page, facets=facets)
         else:
-            total    = REGISTRATION_DB.count_torrents(user_id=uid)
-            torrents = REGISTRATION_DB.list_torrents(user_id=uid, page=page, per_page=per_page)
+            total    = REGISTRATION_DB.count_torrents(user_id=uid, facets=facets)
+            torrents = REGISTRATION_DB.list_torrents(user_id=uid, page=page, per_page=per_page, facets=facets)
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
-        self._send_html(_render_search(user, torrents, query, page, total_pages, total))
+        self._send_html(_render_search(user, torrents, query, page, total_pages, total, facets=facets))
 
     def _serve_robots(self):
         txt = 'User-agent: *\nDisallow: /manage\n'
@@ -21232,11 +21748,43 @@ def _torrent_row(t, viewer_role: str, viewer_id: int,
     owner_td = (f'<td><a href="/manage/user/{uname_e}" class="user-link">{uname_e}</a></td>'
                 if show_owner else '')
     name_lower = _html_mod.escape(t['name'].lower())
+    facet_chips: list[str] = []
+    media_type = str((t['media_type'] if 'media_type' in t.keys() else '') or '').strip().lower()
+    if media_type in ('movie', 'tv', 'game'):
+        facet_chips.append(media_type.upper())
+    res = str((t['release_resolution'] if 'release_resolution' in t.keys() else '') or '').strip().lower()
+    if res in ('2160p', '1080p', '720p', '480p'):
+        facet_chips.append(res)
+    src = str((t['release_source_class'] if 'release_source_class' in t.keys() else '') or '').strip().lower()
+    if src:
+        facet_chips.append(src)
+    prov = str((t['release_provider'] if 'release_provider' in t.keys() else '') or '').strip().lower()
+    if prov:
+        facet_chips.append(prov.upper())
+    ahdr = str((t['release_hdr_flags'] if 'release_hdr_flags' in t.keys() else '') or '')
+    if 'dv' in (f',{ahdr.lower()},'):
+        facet_chips.append('DV')
+    elif 'hdr' in (f',{ahdr.lower()},'):
+        facet_chips.append('HDR')
+    aaudio = str((t['release_audio_features'] if 'release_audio_features' in t.keys() else '') or '')
+    if 'atmos' in (f',{aaudio.lower()},'):
+        facet_chips.append('ATMOS')
+    genres = str((t['content_genres'] if 'content_genres' in t.keys() else '') or '')
+    for g in [x.strip() for x in genres.split(',') if x.strip()][:2]:
+        facet_chips.append(g.title())
+    chips_html = ''.join(
+        f'<span style="display:inline-block;padding:1px 7px;border:1px solid var(--border);'
+        f'border-radius:999px;font-family:var(--mono);font-size:0.62rem;letter-spacing:0.07em;'
+        f'color:var(--muted);margin:0 6px 4px 0;text-transform:uppercase">{_h(ch)}</span>'
+        for ch in facet_chips[:8]
+    )
+    chips_wrap = f'<div style="margin-top:6px">{chips_html}</div>' if chips_html else ''
+    name_html = f'<a href="/manage/torrent/{ih}" class="user-link">{name_esc}</a>{chips_wrap}'
 
     info_hash_td = '' if hide_info_hash else f'<td class="hash" style="word-break:break-all">{ih}</td>'
     return (
         f'<tr data-name="{name_lower}">'
-        f'<td style="word-break:break-word;overflow-wrap:anywhere"><a href="/manage/torrent/{ih}" class="user-link">{name_esc}</a></td>'
+        f'<td style="word-break:break-word;overflow-wrap:anywhere">{name_html}</td>'
         f'{info_hash_td}'
         f'{owner_td}'
         f'<td class="hash" style="white-space:nowrap">{size_str}</td>'
@@ -21250,8 +21798,163 @@ def _torrent_row(t, viewer_role: str, viewer_id: int,
     )
 
 
+def _facet_params_for_url(facets: dict[str, str] | None = None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    f = facets or {}
+    mapping = (
+        ('media_type', 'fmt'),
+        ('release_resolution', 'fr'),
+        ('release_source_class', 'fs'),
+        ('release_provider', 'fp'),
+        ('genre', 'fg'),
+        ('audio_feature', 'fa'),
+        ('hdr_flag', 'fh'),
+    )
+    for src, dst in mapping:
+        val = str(f.get(src, '') or '').strip()
+        if val:
+            out[dst] = val
+    return out
+
+
+def _facet_known_genres(limit: int = 80) -> list[str]:
+    if not REGISTRATION_DB:
+        return []
+    counts: dict[str, int] = {}
+    try:
+        rows = REGISTRATION_DB._conn().execute(
+            '''SELECT content_genres FROM torrents
+               WHERE COALESCE(content_genres,'') <> '' '''
+        ).fetchall()
+    except Exception:
+        return []
+    for r in rows:
+        raw = str(r['content_genres'] or '')
+        for item in raw.split(','):
+            token = re.sub(r'[^a-z0-9 _-]+', '', item.strip().lower())
+            token = re.sub(r'\s+', ' ', token).strip()
+            if not token:
+                continue
+            counts[token] = int(counts.get(token, 0)) + 1
+    ranked = sorted(counts.keys(), key=lambda x: x.lower())
+    return ranked[:max(1, int(limit or 80))]
+
+
+def _facet_controls_html(base_action: str, query: str = '',
+                         facets: dict[str, str] | None = None,
+                         include_query: bool = True,
+                         render_form: bool = True,
+                         submit_label: str = 'Apply',
+                         compact_actions: bool = True,
+                         submit_btn_variant: str = 'orange') -> str:
+    f = facets or {}
+    fmt = str(f.get('media_type') or '')
+    fr = str(f.get('release_resolution') or '')
+    fs = str(f.get('release_source_class') or '')
+    fp = str(f.get('release_provider') or '')
+    fg = str(f.get('genre') or '')
+    fa = str(f.get('audio_feature') or '')
+    fh = str(f.get('hdr_flag') or '')
+    genre_options = _facet_known_genres(limit=80)
+    genre_html = ''.join(
+        f'<option value="{_h(g)}" {"selected" if fg == g else ""}>{_h(g.title())}</option>'
+        for g in genre_options
+    )
+    q_input = (f'<input type="hidden" name="q" value="{_h(query)}">' if include_query else '')
+    action_btn_class = 'btn btn-sm' if compact_actions else 'btn'
+    action_btn_style = (
+        ('min-width:74px;height:32px;padding:0 12px;font-size:0.78rem;'
+         'display:inline-flex;align-items:center;justify-content:center;'
+         'text-align:center;line-height:1;box-sizing:border-box')
+        if compact_actions else
+        ('min-width:88px;height:auto;padding:8px 18px;font-size:0.78rem;'
+         'display:inline-flex;align-items:center;justify-content:center;'
+         'text-align:center;line-height:1;box-sizing:border-box')
+    )
+    submit_cls = 'btn-orange-rev' if submit_btn_variant == 'orange' else 'btn-primary'
+    submit_btn = (f'<button type="submit" class="{action_btn_class} {submit_cls}" style="{action_btn_style}">'
+                  f'{_h(submit_label)}</button>'
+                  if str(submit_label or '').strip() else '')
+    inner = f'''
+      {q_input}
+      <div class="form-group" style="margin:0;min-width:120px;max-width:140px">
+        <label>Type</label>
+        <select name="fmt">
+          <option value="" {"selected" if not fmt else ""}>Any</option>
+          <option value="movie" {"selected" if fmt=="movie" else ""}>Movie</option>
+          <option value="tv" {"selected" if fmt=="tv" else ""}>TV</option>
+          <option value="game" {"selected" if fmt=="game" else ""}>Game</option>
+          <option value="other" {"selected" if fmt=="other" else ""}>Other</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:110px;max-width:130px">
+        <label>Resolution</label>
+        <select name="fr">
+          <option value="" {"selected" if not fr else ""}>Any</option>
+          <option value="2160p" {"selected" if fr=="2160p" else ""}>2160p</option>
+          <option value="1080p" {"selected" if fr=="1080p" else ""}>1080p</option>
+          <option value="720p" {"selected" if fr=="720p" else ""}>720p</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:110px;max-width:140px">
+        <label>Source</label>
+        <select name="fs">
+          <option value="" {"selected" if not fs else ""}>Any</option>
+          <option value="web-dl" {"selected" if fs=="web-dl" else ""}>WEB-DL</option>
+          <option value="webrip" {"selected" if fs=="webrip" else ""}>WEBRip</option>
+          <option value="bluray" {"selected" if fs=="bluray" else ""}>BluRay</option>
+          <option value="remux" {"selected" if fs=="remux" else ""}>Remux</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:105px;max-width:130px">
+        <label>Provider</label>
+        <select name="fp">
+          <option value="" {"selected" if not fp else ""}>Any</option>
+          <option value="amzn" {"selected" if fp=="amzn" else ""}>AMZN</option>
+          <option value="nf" {"selected" if fp=="nf" else ""}>NF</option>
+          <option value="dsnp" {"selected" if fp=="dsnp" else ""}>DSNP</option>
+          <option value="atvp" {"selected" if fp=="atvp" else ""}>ATVP</option>
+          <option value="hmax" {"selected" if fp=="hmax" else ""}>HMAX</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:145px;max-width:210px">
+        <label>Genre</label>
+        <select name="fg">
+          <option value="" {"selected" if not fg else ""}>Any</option>
+          {genre_html}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:110px;max-width:130px">
+        <label>Audio</label>
+        <select name="fa">
+          <option value="" {"selected" if not fa else ""}>Any</option>
+          <option value="atmos" {"selected" if fa=="atmos" else ""}>Atmos</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;min-width:95px;max-width:110px">
+        <label>HDR</label>
+        <select name="fh">
+          <option value="" {"selected" if not fh else ""}>Any</option>
+          <option value="hdr" {"selected" if fh=="hdr" else ""}>HDR</option>
+          <option value="dv" {"selected" if fh=="dv" else ""}>DV</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:8px;align-items:flex-end;padding-bottom:1px">
+        {submit_btn}
+        <a href="{base_action + (('?q=' + urllib.parse.quote(query)) if include_query and query else '')}"
+           class="{action_btn_class} btn-danger"
+           style="text-decoration:none;{action_btn_style}">Clear</a>
+      </div>
+    '''
+    if render_form:
+        return (f'<form method="GET" action="{base_action}" '
+                f'style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">{inner}</form>')
+    return inner
+
+
 def _render_search(user, torrents: list, query: str = '',
-                   page: int = 1, total_pages: int = 1, total: int = 0) -> str:
+                   page: int = 1, total_pages: int = 1, total: int = 0,
+                   facets: dict[str, str] | None = None) -> str:
     role = _user_role(user)
     show_owner = role in ('super', 'admin', 'editor', 'standard')
 
@@ -21265,8 +21968,10 @@ def _render_search(user, torrents: list, query: str = '',
         cols = 5 if show_owner else 4
         t_rows = f'<tr><td colspan="{cols}" class="empty">No results found</td></tr>'
 
-    q_enc = urllib.parse.quote(query)
-    pagination = _pagination_html(page, total_pages, f'/manage/search?q={q_enc}')
+    qs_params = {'q': query}
+    qs_params.update(_facet_params_for_url(facets))
+    q_enc = urllib.parse.urlencode(qs_params)
+    pagination = _pagination_html(page, total_pages, f'/manage/search?{q_enc}')
 
     body = f'''
   <div class="page-title">🔍 Search Torrents</div>
@@ -21278,10 +21983,12 @@ def _render_search(user, torrents: list, query: str = '',
         <input id="search-q" type="text" name="q" value="{query}" placeholder="Enter name or hash..." autofocus
                style="font-size:1rem">
       </div>
-      <button type="submit" class="btn btn-primary" style="margin-bottom:1px">Search</button>
+      {_facet_controls_html('/manage/search', query=query, facets=facets,
+                            include_query=False, render_form=False, submit_label='Search',
+                            compact_actions=False, submit_btn_variant='primary')}
     </form>
   </div>
-  <div class="card">
+  <div class="card" style="margin-top:16px">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:12px">
       <div class="card-title" style="margin:0">
         {"Results for &ldquo;" + query + "&rdquo; &mdash; " + str(total) + " found" if query else "All Torrents (" + str(total) + ")"}
@@ -21299,7 +22006,8 @@ def _render_search(user, torrents: list, query: str = '',
 
 
 def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'error',
-                      page: int = 1, total_pages: int = 1, total: int = 0) -> str:
+                      page: int = 1, total_pages: int = 1, total: int = 0,
+                      facets: dict[str, str] | None = None) -> str:
     is_super = user['username'] == SUPER_USER
     role = _user_role(user)
     is_admin = role in ('admin','super')
@@ -21358,12 +22066,15 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
     </form>
   </div>'''
 
+    dash_q = urllib.parse.urlencode(_facet_params_for_url(facets))
+    dash_base = '/manage/dashboard' + (f'?{dash_q}' if dash_q else '')
+
     body = f'''
   <style>
     .dash-nav-btn {{
       font-family: var(--mono); font-size: 0.75rem; letter-spacing: 0.1em;
       text-transform: uppercase; padding: 7px 20px; border-radius: 7px;
-      border: none; background: transparent; color: var(--muted);
+      border: 1px solid var(--border); background: transparent; color: var(--muted);
       cursor: pointer; transition: color 0.15s, background 0.15s;
       text-decoration: none; display: inline-block;
     }}
@@ -21400,7 +22111,7 @@ def _render_dashboard(user, torrents: list, msg: str = '', msg_type: str = 'erro
       {_torrent_header(show_owner, hide_info_hash=True)}
       {torrent_rows}
     </table></div>
-    {_pagination_html(page, total_pages, '/manage/dashboard')}
+    {_pagination_html(page, total_pages, dash_base)}
   </div>'''
     return _manage_page('Dashboard', body, user=user, msg=msg, msg_type=msg_type)
 
@@ -25392,6 +26103,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     )
     metadata_card = ''
     srrdb_card = ''
+    classification_card = ''
     if REGISTRATION_DB:
         meta_cfg = REGISTRATION_DB.get_metadata_config()
         meta_enabled = bool(meta_cfg.get('enabled', True))
@@ -25864,6 +26576,83 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                     '</div>'
                 )
 
+    # Release classification card (first-pass standalone layout).
+    def _cls_val(key: str) -> str:
+        try:
+            return str(t[key] or '').strip()
+        except Exception:
+            return ''
+
+    cls_media_type = _cls_val('media_type').lower()
+    cls_resolution = _cls_val('release_resolution').lower()
+    cls_source = _cls_val('release_source_class').lower()
+    cls_provider = _cls_val('release_provider').lower()
+    cls_vcodec = _cls_val('release_video_codec')
+    cls_acodec = _cls_val('release_audio_codec')
+    cls_audio_features = _cls_val('release_audio_features')
+    cls_hdr = _cls_val('release_hdr_flags')
+    cls_edition = _cls_val('release_edition_flags')
+    cls_group = _cls_val('release_group')
+    cls_genres = _cls_val('content_genres')
+    cls_source_label = _cls_val('classification_source')
+    cls_confidence = 0
+    try:
+        cls_confidence = int(t['classification_confidence'] or 0)
+    except Exception:
+        cls_confidence = 0
+
+    chip_items: list[str] = []
+    if cls_media_type in ('movie', 'tv', 'game', 'other'):
+        chip_items.append(cls_media_type.upper())
+    if cls_resolution:
+        chip_items.append(cls_resolution)
+    if cls_source:
+        chip_items.append(cls_source.upper())
+    if cls_provider:
+        chip_items.append(cls_provider.upper())
+    if cls_vcodec:
+        chip_items.append(cls_vcodec.upper())
+    if cls_acodec:
+        chip_items.append(cls_acodec.upper())
+    for af in [x.strip() for x in cls_audio_features.split(',') if x.strip()]:
+        chip_items.append(af.upper())
+    for hf in [x.strip() for x in cls_hdr.split(',') if x.strip()]:
+        chip_items.append(hf.upper())
+    for g in [x.strip() for x in cls_genres.split(',') if x.strip()][:3]:
+        chip_items.append(g.title())
+    if cls_group:
+        chip_items.append(cls_group.upper())
+    chip_items = chip_items[:12]
+    chips_html = ''.join(
+        f'<span style="display:inline-block;padding:2px 8px;border:1px solid var(--border);'
+        f'border-radius:999px;font-family:var(--mono);font-size:0.66rem;letter-spacing:0.07em;'
+        f'color:var(--muted);margin:0 6px 6px 0;text-transform:uppercase">{_h(ch)}</span>'
+        for ch in chip_items
+    )
+
+    if chips_html:
+        source_note = ''
+        if cls_source_label or cls_confidence > 0:
+            src_part = _h(cls_source_label) if cls_source_label else '--'
+            conf_part = f' · {cls_confidence}%' if cls_confidence > 0 else ''
+            source_note = (
+                f'<div class="hash" style="margin-top:6px">Classified by {src_part}{conf_part}</div>'
+            )
+        classification_card = (
+            '<div class="card" id="classification">'
+            '<div class="card-title">Release Classification</div>'
+            + f'<div style="margin-bottom:2px">{chips_html}</div>'
+            + source_note
+            + '</div>'
+        )
+    else:
+        classification_card = (
+            '<div class="card" id="classification">'
+            '<div class="card-title">Release Classification</div>'
+            '<div style="color:var(--muted);font-size:0.84rem">No classification data yet.</div>'
+            '</div>'
+        )
+
     body = f'''
   <div class="page-title">{t["name"]}</div>
   <div class="page-sub">
@@ -25932,6 +26721,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
   </div>
 
   {swarm_card}
+  {classification_card}
   {metadata_card}
   {srrdb_card}
 
