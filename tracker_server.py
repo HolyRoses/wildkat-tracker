@@ -1715,7 +1715,9 @@ def _parse_release_facets(raw_name: str) -> dict[str, Any]:
     facets: dict[str, Any] = {}
 
     # Optional scene/p2p group suffix at end of release name.
-    gm = re.search(r'(?i)-([A-Z0-9][A-Z0-9._-]{1,63})$', upper)
+    # Keep this strict so we don't accidentally capture source/codec tails
+    # like "WEB-DL.DDP5.1.ATMOS.H.264-SCOPE" as one giant group.
+    gm = re.search(r'(?i)-([A-Z0-9][A-Z0-9_]{1,63})$', upper)
     if gm:
         grp = str(gm.group(1) or '').strip('.-_ ').lower()
         if grp:
@@ -14534,6 +14536,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_torrent_auto_match_metadata()
         elif path == '/manage/torrent/srrdb-match':
             self._post_torrent_srrdb_match()
+        elif path == '/manage/torrent/reclassify':
+            self._post_torrent_reclassify()
         elif path == '/manage/torrent/normalize-name':
             self._post_torrent_normalize_name()
         elif path == '/manage/torrent/vote':
@@ -16258,6 +16262,33 @@ class ManageHandler(BaseHTTPRequestHandler):
         )
         q = urllib.parse.quote(msg)
         return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_torrent_reclassify(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        role = _user_role(user)
+        if role == 'basic':
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        ih = fields.get('info_hash', '').strip().upper()
+        if not ih or not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return self._redirect('/manage/dashboard')
+        t = REGISTRATION_DB.get_torrent(ih)
+        if not t:
+            q = urllib.parse.quote('Torrent not found.')
+            return self._redirect(f'/manage/dashboard?msg={q}&msg_type=error')
+        is_owner = int(t['uploaded_by_id'] or 0) == int(user['id'])
+        if role not in ('super', 'admin', 'editor') and not is_owner:
+            q = urllib.parse.quote('Only owner/editor/admin can reclassify this torrent.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        ok = REGISTRATION_DB.classify_torrent(ih)
+        if not ok:
+            q = urllib.parse.quote('Reclassify deferred due to a temporary DB lock. Please retry.')
+            return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=error')
+        q = urllib.parse.quote('Release classification refreshed.')
+        return self._redirect(f'/manage/torrent/{ih.lower()}?msg={q}&msg_type=success')
 
     def _get_notifications(self):
         user = self._get_session_user()
@@ -20186,6 +20217,15 @@ _MANAGE_CSS = '''
   .btn-accent-rev:hover { background: var(--accent); color: #000; border-color: var(--green); }
   .btn-blue-rev { border-color: var(--blue); color: var(--blue); }
   .btn-blue-rev:hover { background: var(--blue); color: #000; border-color: var(--blue); }
+  .facet-chip-link {
+    display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px;
+    font-family:var(--mono); font-size:0.66rem; letter-spacing:0.07em; text-transform:uppercase;
+    color:var(--muted); margin:0 6px 6px 0; text-decoration:none;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+  }
+  .facet-chip-link:hover {
+    color: var(--accent); background: rgba(245,166,35,0.08); border-color: var(--accent);
+  }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
           padding: 24px 28px; margin-bottom: 24px; }
   .card-title { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.2em;
@@ -21748,35 +21788,42 @@ def _torrent_row(t, viewer_role: str, viewer_id: int,
     owner_td = (f'<td><a href="/manage/user/{uname_e}" class="user-link">{uname_e}</a></td>'
                 if show_owner else '')
     name_lower = _html_mod.escape(t['name'].lower())
-    facet_chips: list[str] = []
+    def _search_url_for_chip(label: str, facet_qs: dict[str, str] | None = None) -> str:
+        qs: dict[str, str] = {}
+        if facet_qs:
+            qs.update({k: v for k, v in facet_qs.items() if str(v or '').strip()})
+        if not qs:
+            qs['q'] = label
+        return '/manage/search?' + urllib.parse.urlencode(qs)
+
+    facet_chips: list[tuple[str, str]] = []
     media_type = str((t['media_type'] if 'media_type' in t.keys() else '') or '').strip().lower()
-    if media_type in ('movie', 'tv', 'game'):
-        facet_chips.append(media_type.upper())
+    if media_type in ('movie', 'tv', 'game', 'other'):
+        facet_chips.append((media_type.upper(), _search_url_for_chip(media_type, {'fmt': media_type})))
     res = str((t['release_resolution'] if 'release_resolution' in t.keys() else '') or '').strip().lower()
     if res in ('2160p', '1080p', '720p', '480p'):
-        facet_chips.append(res)
+        facet_chips.append((res, _search_url_for_chip(res, {'fr': res})))
     src = str((t['release_source_class'] if 'release_source_class' in t.keys() else '') or '').strip().lower()
     if src:
-        facet_chips.append(src)
+        facet_chips.append((src.upper(), _search_url_for_chip(src, {'fs': src})))
     prov = str((t['release_provider'] if 'release_provider' in t.keys() else '') or '').strip().lower()
     if prov:
-        facet_chips.append(prov.upper())
+        facet_chips.append((prov.upper(), _search_url_for_chip(prov, {'fp': prov})))
     ahdr = str((t['release_hdr_flags'] if 'release_hdr_flags' in t.keys() else '') or '')
     if 'dv' in (f',{ahdr.lower()},'):
-        facet_chips.append('DV')
+        facet_chips.append(('DV', _search_url_for_chip('dv', {'fh': 'dv'})))
     elif 'hdr' in (f',{ahdr.lower()},'):
-        facet_chips.append('HDR')
+        facet_chips.append(('HDR', _search_url_for_chip('hdr', {'fh': 'hdr'})))
     aaudio = str((t['release_audio_features'] if 'release_audio_features' in t.keys() else '') or '')
     if 'atmos' in (f',{aaudio.lower()},'):
-        facet_chips.append('ATMOS')
+        facet_chips.append(('ATMOS', _search_url_for_chip('atmos', {'fa': 'atmos'})))
     genres = str((t['content_genres'] if 'content_genres' in t.keys() else '') or '')
     for g in [x.strip() for x in genres.split(',') if x.strip()][:2]:
-        facet_chips.append(g.title())
+        facet_chips.append((g.title(), _search_url_for_chip(g, {'fg': g})))
     chips_html = ''.join(
-        f'<span style="display:inline-block;padding:1px 7px;border:1px solid var(--border);'
-        f'border-radius:999px;font-family:var(--mono);font-size:0.62rem;letter-spacing:0.07em;'
-        f'color:var(--muted);margin:0 6px 4px 0;text-transform:uppercase">{_h(ch)}</span>'
-        for ch in facet_chips[:8]
+        f'<a class="facet-chip-link" style="padding:1px 7px;font-size:0.62rem;margin:0 6px 4px 0" '
+        f'href="{_h(url)}">{_h(label)}</a>'
+        for (label, url) in facet_chips[:8]
     )
     chips_wrap = f'<div style="margin-top:6px">{chips_html}</div>' if chips_html else ''
     name_html = f'<a href="/manage/torrent/{ih}" class="user-link">{name_esc}</a>{chips_wrap}'
@@ -25906,7 +25953,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             h = rem // 3600
             m = (rem % 3600) // 60
             peer_update_btn = (
-                f'<button type="button" class="btn btn-green" disabled '
+                f'<button type="button" class="btn btn-sm btn-green" disabled '
                 f'style="opacity:0.95;cursor:not-allowed" '
                 f'title="Available in {h}h {m}m">'
                 f'Refresh Seeds/Peers ({h}h {m}m)</button>'
@@ -25916,14 +25963,25 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 f'<form method="POST" action="/manage/torrent/update-peers" style="display:inline">'
                 f'<input type="hidden" name="info_hash" value="{ih}">'
                 f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
-                f'<button type="submit" class="btn btn-green">Refresh Seeds/Peers</button>'
+                f'<button type="submit" class="btn btn-sm btn-green">Refresh Seeds/Peers</button>'
                 f'</form>'
             )
     metadata_update_btn = ''
     metadata_auto_match_btn = ''
     srrdb_match_btn = ''
     normalize_name_btn = ''
+    reclassify_btn = ''
+    normalize_reclassify_row = ''
+    metadata_srrdb_row = ''
     if REGISTRATION_DB:
+        if _user_role(viewer) != 'basic':
+            reclassify_btn = (
+                f'<form method="POST" action="/manage/torrent/reclassify" style="display:inline">'
+                f'<input type="hidden" name="info_hash" value="{ih}">'
+                f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+                f'<button type="submit" class="btn btn-sm btn-blue-rev">&#x1F3F7; Reclassify</button>'
+                f'</form>'
+            )
         if REGISTRATION_DB.get_setting('torrent_name_cleanup_enabled', '1') == '1':
             normalize_name_btn = (
                 f'<form method="POST" action="/manage/torrent/normalize-name" style="display:inline">'
@@ -25982,6 +26040,18 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 f'<button type="submit" class="btn btn-sm btn-blue-rev" '
                 f'title="srrDB matching is intended for scene releases.">&#x1F50E; srrDB Match</button>'
                 f'</form>'
+            )
+        if normalize_name_btn or reclassify_btn:
+            normalize_reclassify_row = (
+                '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+                f'{normalize_name_btn}{reclassify_btn}'
+                '</div>'
+            )
+        if metadata_auto_match_btn or srrdb_match_btn:
+            metadata_srrdb_row = (
+                '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+                f'{metadata_auto_match_btn}{srrdb_match_btn}'
+                '</div>'
             )
 
     # Delete button
@@ -26601,33 +26671,46 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
     except Exception:
         cls_confidence = 0
 
-    chip_items: list[str] = []
+    def _search_url_for_chip(label: str, facet_qs: dict[str, str] | None = None) -> str:
+        qs: dict[str, str] = {}
+        if facet_qs:
+            qs.update({k: v for k, v in facet_qs.items() if str(v or '').strip()})
+        if not qs:
+            qs['q'] = label
+        return '/manage/search?' + urllib.parse.urlencode(qs)
+
+    chip_links: list[tuple[str, str]] = []
     if cls_media_type in ('movie', 'tv', 'game', 'other'):
-        chip_items.append(cls_media_type.upper())
+        chip_links.append((cls_media_type.upper(), _search_url_for_chip(cls_media_type, {'fmt': cls_media_type})))
     if cls_resolution:
-        chip_items.append(cls_resolution)
+        chip_links.append((cls_resolution, _search_url_for_chip(cls_resolution, {'fr': cls_resolution})))
     if cls_source:
-        chip_items.append(cls_source.upper())
+        chip_links.append((cls_source.upper(), _search_url_for_chip(cls_source, {'fs': cls_source})))
     if cls_provider:
-        chip_items.append(cls_provider.upper())
+        chip_links.append((cls_provider.upper(), _search_url_for_chip(cls_provider, {'fp': cls_provider})))
     if cls_vcodec:
-        chip_items.append(cls_vcodec.upper())
+        chip_links.append((cls_vcodec.upper(), _search_url_for_chip(cls_vcodec)))
     if cls_acodec:
-        chip_items.append(cls_acodec.upper())
+        chip_links.append((cls_acodec.upper(), _search_url_for_chip(cls_acodec)))
     for af in [x.strip() for x in cls_audio_features.split(',') if x.strip()]:
-        chip_items.append(af.upper())
+        if af.lower() == 'atmos':
+            chip_links.append((af.upper(), _search_url_for_chip(af, {'fa': 'atmos'})))
+        else:
+            chip_links.append((af.upper(), _search_url_for_chip(af)))
     for hf in [x.strip() for x in cls_hdr.split(',') if x.strip()]:
-        chip_items.append(hf.upper())
+        low_hf = hf.lower()
+        if low_hf in ('hdr', 'dv'):
+            chip_links.append((hf.upper(), _search_url_for_chip(hf, {'fh': low_hf})))
+        else:
+            chip_links.append((hf.upper(), _search_url_for_chip(hf)))
     for g in [x.strip() for x in cls_genres.split(',') if x.strip()][:3]:
-        chip_items.append(g.title())
+        chip_links.append((g.title(), _search_url_for_chip(g, {'fg': g})))
     if cls_group:
-        chip_items.append(cls_group.upper())
-    chip_items = chip_items[:12]
+        chip_links.append((cls_group.upper(), _search_url_for_chip(cls_group)))
+    chip_links = chip_links[:18]
     chips_html = ''.join(
-        f'<span style="display:inline-block;padding:2px 8px;border:1px solid var(--border);'
-        f'border-radius:999px;font-family:var(--mono);font-size:0.66rem;letter-spacing:0.07em;'
-        f'color:var(--muted);margin:0 6px 6px 0;text-transform:uppercase">{_h(ch)}</span>'
-        for ch in chip_items
+        f'<a class="facet-chip-link" href="{_h(url)}">{_h(label)}</a>'
+        for (label, url) in chip_links
     )
 
     if chips_html:
@@ -26650,7 +26733,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
             '<div class="card" id="classification">'
             '<div class="card-title">Release Classification</div>'
             '<div style="color:var(--muted);font-size:0.84rem">No classification data yet.</div>'
-            '</div>'
+            + '</div>'
         )
 
     body = f'''
@@ -26710,9 +26793,8 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         <button class="btn btn-primary" onclick="copyMagnet(this,{repr(magnet)})">&#x1F9F2; Copy Magnet</button>
         {peer_update_btn}
         {metadata_update_btn}
-        {normalize_name_btn}
-        {metadata_auto_match_btn}
-        {srrdb_match_btn}
+        {normalize_reclassify_row}
+        {metadata_srrdb_row}
         {del_btn}
         {lock_btn}
         {del_comments_btn}
