@@ -36,8 +36,9 @@ Enable with `--registration`. Adds a full user and torrent management web interf
 - **Torrent name normalization** — configurable cleanup engine with optional upload-time normalization and manual per-torrent normalization action
 - **Metadata auto-match** — configurable IMDb/TVMaze/Steam auto-match engine with confidence thresholds, upload caps, and SRRDB IMDb fallback to pending proposals
 - **Scene verification (srrDB)** — optional SRRDB match/caching, scene release verification card, and manual per-torrent srrDB match action
+- **Release classification + faceted search** — automatic torrent classification chips (type/resolution/source/provider/genre/audio/HDR/group) with clickable chip-to-search workflows
 - **Direct messages** — threaded inbox/sent/compose/blocked flow with optional point cost and daily limits
-- **Comments and notifications** — threaded torrent/bounty comments, comment upvote/downvote controls, @mentions, bell dropdown, and full notifications page
+- **Comments and notifications** — threaded torrent/bounty comments, comment upvote/downvote controls, @mentions, bell dropdown quick mark-all-read, and full notifications page controls
 - **Torrent reporting subsystem** — in-page torrent reports with typed reasons, moderator workflow, assignment, notes, and contextual notifications
 - **Points economy** — earning, spending, transfers, streaks, and ledger-backed accounting
 - **Points top-ups** — fixed-amount purchases with provider-based checkout and order tracking

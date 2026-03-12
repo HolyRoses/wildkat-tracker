@@ -89,6 +89,7 @@ From the Dashboard you can:
 - **Copy magnet links** — click the Magnet button on any row
 - **Delete your torrents** — shown only on the torrent's detail page
 - **Filter the current page** — type in the filter box to narrow the visible list by name
+- **Use classification chips** — click chips on torrent rows to jump into Search with matching facet filters
 - **Navigate pages** — pagination controls appear when there are more torrents than fit on one page
 
 The **navigation bar** runs across the top of every page with three zones: the 🐈 WILDKAT logo on the left, center navigation buttons (🖥 Dashboard, 🔍 Search, 🎯 Bounties, 🏆 Leaderboard, 📬 Messages), and your username/badge, notification bell, and logout on the right. The Bounties, Leaderboard, and Messages buttons are hidden for Basic users.
@@ -206,6 +207,14 @@ If metadata fetch is enabled and the torrent has active metadata, the Actions ca
 - Cooldown applies for non-privileged users.
 - Admin and Super bypass metadata refresh cooldown.
 
+### Release Classification
+
+Torrent detail pages include a **Release Classification** card built from parsed name tokens and linked metadata.
+
+- Chips can include media type, resolution, source class, provider, genre, audio, HDR/DV, and release group.
+- Chips are clickable and open Search pre-filtered for that facet.
+- Classification source and confidence are displayed for operator visibility.
+
 If there are confidently linked active members in the swarm, a full-width **Members Currently Sharing This Torrent** card appears with member links and last activity times. If no linked members are active, the card is not shown.
 
 The **Delete** button appears if you own the torrent or are an Admin/Super.
@@ -321,7 +330,12 @@ When someone replies to your comment, @mentions you, votes on your comment (if y
 
 **Bell dropdown** — click the bell to see your 5 most recent unread notifications. Each item shows who acted, what they did, and which torrent or bounty it relates to. Click any item to mark it read and navigate to the relevant page.
 
-**Notifications page** (`/manage/notifications`) — shows all notifications, read and unread. Use **✓ Mark all read** to clear everything at once.
+**Bell dropdown quick action** — use **✓ Mark all read** in the dropdown header to clear unread items without leaving your current page.
+
+**Notifications page** (`/manage/notifications`) — shows all notifications, read and unread. Use:
+
+- **✓ Mark all read** to clear unread state in bulk
+- **Delete all notifications** to permanently remove all notification rows
 
 ### Bounty Notifications
 
@@ -567,6 +581,23 @@ You can also search by linked metadata IDs:
 All tokens must match (AND logic). The search is case-insensitive.
 
 Basic users see only their own torrents in search results. Standard and above see all torrents on the tracker.
+
+### Faceted Search Filters
+
+Search includes facet filters for common release attributes:
+
+- Type
+- Resolution
+- Source
+- Provider
+- Genre
+- Audio
+- HDR
+
+You can use facets in two ways:
+
+- Set filters from dropdowns and run search.
+- Click classification chips from torrent rows/detail pages to jump into Search with matching filters pre-selected.
 
 ---
 

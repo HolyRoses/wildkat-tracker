@@ -11158,6 +11158,12 @@ class RegistrationDB:
             (user_id,)
         ).fetchone()[0]
 
+    def get_notification_count(self, user_id: int) -> int:
+        return self._conn().execute(
+            'SELECT COUNT(*) FROM notifications WHERE user_id=?',
+            (user_id,)
+        ).fetchone()[0]
+
     def mark_notification_read(self, notif_id: int, user_id: int):
         self._conn().execute(
             'UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?',
@@ -11170,6 +11176,13 @@ class RegistrationDB:
             'UPDATE notifications SET is_read=1 WHERE user_id=?', (user_id,)
         )
         self._conn().commit()
+
+    def delete_all_notifications(self, user_id: int) -> int:
+        cur = self._conn().execute(
+            'DELETE FROM notifications WHERE user_id=?', (user_id,)
+        )
+        self._conn().commit()
+        return int(cur.rowcount or 0)
 
     def get_notification(self, notif_id: int, user_id: int):
         return self._conn().execute(
@@ -14611,6 +14624,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_notification_read(nid)
         elif path == '/manage/notifications/read-all':
             self._post_notification_read_all()
+        elif path == '/manage/notifications/delete-all':
+            self._post_notification_delete_all()
         elif path == '/manage/messages/typing':
             self._post_dm_typing()
         elif path == '/manage/messages/send':
@@ -16634,6 +16649,13 @@ class ManageHandler(BaseHTTPRequestHandler):
         if not user:
             return self._redirect('/manage')
         REGISTRATION_DB.mark_all_notifications_read(user['id'])
+        self._redirect('/manage/notifications')
+
+    def _post_notification_delete_all(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        REGISTRATION_DB.delete_all_notifications(user['id'])
         self._redirect('/manage/notifications')
 
     def _post_toggle_comments_lock(self, lock: bool):
@@ -19410,7 +19432,9 @@ class ManageHandler(BaseHTTPRequestHandler):
                 'ts':       (n['created_at'] or '')[:16].replace('T', ' '),
                 'url':      url,
             })
-        return self._send_json({'items': out})
+        unread_count = REGISTRATION_DB.get_unread_count(user['id']) if REGISTRATION_DB else 0
+        total_count = REGISTRATION_DB.get_notification_count(user['id']) if REGISTRATION_DB else 0
+        return self._send_json({'items': out, 'unread_count': unread_count, 'total_count': total_count})
 
     def _get_global_poll(self):
         """Lightweight background poll for nav badge counts. Called every 30s by all pages."""
@@ -20694,6 +20718,14 @@ function copyInvite(btn, path) {
     }
   }
 
+  function _setHeaderActions(unreadCount) {
+    var unread = Math.max(0, parseInt(unreadCount || 0, 10));
+    if (markAllBtn) {
+      markAllBtn.style.display = (unread > 0) ? '' : 'none';
+      markAllBtn.disabled = (unread <= 0);
+    }
+  }
+
   function readNotif(id, url) {
     fetch('/manage/notifications/read/' + id, {method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
@@ -20709,6 +20741,7 @@ function copyInvite(btn, path) {
       body:'_csrf=' + encodeURIComponent(document.cookie.match(/wkcsrf=([^;]+)/)?.[1] || '')
     }).then(function() {
       _clearUnreadUi();
+      _setHeaderActions(0, 1);
     }).catch(function() {
       if (markAllBtn) markAllBtn.disabled = false;
     });
@@ -20728,10 +20761,10 @@ function copyInvite(btn, path) {
         if (!body) return;
         if (!data || !data.items || !data.items.length) {
           body.innerHTML = '<div class="notif-empty">No unread notifications</div>';
-          if (markAllBtn) markAllBtn.disabled = true;
+          _setHeaderActions((data && data.unread_count) || 0);
           return;
         }
-        if (markAllBtn) markAllBtn.disabled = false;
+        _setHeaderActions(data.unread_count || data.items.length);
         var html = '';
         data.items.forEach(function(n){
           var tname = n.torrent.length >= 40 ? n.torrent + '...' : n.torrent;
@@ -21199,7 +21232,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
             dropdown_items = '<div class="notif-empty">No unread notifications</div>'
         mark_all_btn = (
             f'<button id="notif-mark-all" class="notif-markall-btn"'
-            + ('' if unread else ' disabled')
+            + ('' if unread else ' style="display:none" disabled')
             + '>Mark all read</button>'
         )
         bell_html = (
@@ -25892,19 +25925,31 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
     if not rows:
         rows = '<div style="text-align:center;padding:48px;color:var(--muted);font-family:var(--mono);font-size:0.85rem">No notifications yet</div>'
 
-    mark_all = ''
+    notif_actions_parts = []
     if unread_count:
-        mark_all = (
+        notif_actions_parts.append(
             '<form method="POST" action="/manage/notifications/read-all" style="display:inline">'
             '<button class="btn btn-sm">✓ Mark all read</button>'
             '</form>'
         )
+    if notifs:
+        notif_actions_parts.append(
+            '<form method="POST" action="/manage/notifications/delete-all" style="display:inline" '
+            'data-confirm="Delete all notifications? This cannot be undone.">'
+            '<button class="btn btn-sm btn-danger">Delete all notifications</button>'
+            '</form>'
+        )
+    notif_actions = (
+        '<div style="display:flex;gap:8px;justify-content:flex-end;align-items:center">'
+        + ''.join(notif_actions_parts) +
+        '</div>'
+    ) if notif_actions_parts else ''
 
     body = (
         f'<div class="page-title">Notifications</div>'
         f'<div class="page-sub" style="display:flex;justify-content:space-between;align-items:center">'
         f'<span><a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a></span>'
-        f'{mark_all}'
+        f'{notif_actions}'
         f'</div>'
         f'{rows}'
     )
