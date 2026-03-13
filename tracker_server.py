@@ -80,6 +80,16 @@ def _sanitize_log_text(value: str) -> str:
     """Make log text printable for journald/syslog while preserving content."""
     return ''.join(ch if 32 <= ord(ch) <= 126 else f'\\x{ord(ch):02x}' for ch in value)
 
+
+def _date_iso(days_offset: int = 0) -> str:
+    """Return local-date ISO string, optionally offset by N days."""
+    return (datetime.date.today() + datetime.timedelta(days=int(days_offset))).isoformat()
+
+
+def _today_iso() -> str:
+    """Return local-date ISO string for today."""
+    return _date_iso(0)
+
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     request_queue_size = 128  # default is 5; larger backlog survives SYN floods
@@ -144,6 +154,8 @@ REPORT_STATUSES = ('open', 'in_review', 'resolved', 'dismissed')
 REPORT_SUBMISSION_COOLDOWN_SECONDS = 300
 TRUSTED_PROXY_CIDRS_RAW = ''
 TRUSTED_PROXY_NETWORKS: list = []
+DAILY_ACTIVITY_TOUCH_CACHE: dict[int, str] = {}
+DAILY_ACTIVITY_TOUCH_LOCK = threading.Lock()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1048,8 +1060,8 @@ class StatsTracker:
     def apply_persistence_state(self, persisted: dict):
         if not isinstance(persisted, dict):
             return
-        today_str = datetime.date.today().isoformat()
-        yesterday_str = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        today_str = _today_iso()
+        yesterday_str = _date_iso(-1)
 
         def _to_int(v, default=0):
             try:
@@ -6325,7 +6337,7 @@ class RegistrationDB:
 
     def daily_login_check(self, user_id: int) -> int:
         """Award daily login + streak bonus points. Returns points awarded (0 if already done today)."""
-        today = datetime.date.today().isoformat()
+        today = _today_iso()
         c = self._conn()
         daily = int(self.get_setting('points_login_daily', '1'))
         s7    = int(self.get_setting('points_streak_7day',  '1'))
@@ -6340,7 +6352,7 @@ class RegistrationDB:
             if last_date == today:
                 c.execute('ROLLBACK')
                 return 0
-            yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+            yesterday = _date_iso(-1)
             current_streak = user['login_streak'] if 'login_streak' in user.keys() else 0
             new_streak = (current_streak + 1) if last_date == yesterday else 1
             longest = max(user['longest_streak'] if 'longest_streak' in user.keys() else 0, new_streak)
@@ -6379,7 +6391,7 @@ class RegistrationDB:
         """Award comment points (up to daily cap). Returns points awarded (0 if cap reached)."""
         pts_each = int(self.get_setting('points_comment', '1'))
         cap      = int(self.get_setting('points_comment_cap', '10'))
-        today    = datetime.date.today().isoformat()
+        today    = _today_iso()
         user = self.get_user_by_id(user_id)
         if not user:
             return 0
@@ -9255,7 +9267,7 @@ class RegistrationDB:
 
     def expire_bounties(self):
         """Called periodically to expire stale bounties and destroy their escrow."""
-        today = datetime.date.today().isoformat()
+        today = _today_iso()
         c = self._conn()
         expired = c.execute(
             "SELECT * FROM bounties WHERE status IN ('open','pending') AND expires_at <= ?",
@@ -13931,6 +13943,46 @@ class ManageHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _touch_daily_activity(self, path: str, method: str = 'GET', user: sqlite3.Row | None = None):
+        """Count meaningful authenticated site activity for daily streak/points.
+
+        Excludes high-frequency passive poll endpoints so idle tabs don't farm streaks.
+        """
+        if not REGISTRATION_DB:
+            return
+        p = str(path or '').rstrip('/') or '/manage'
+        m = str(method or 'GET').upper()
+        ignore_get = {
+            '/manage/poll',
+            '/manage/notifications/preview',
+            '/manage/messages/poll',
+            '/manage/help/signin',
+            '/robots.txt',
+            '/manage/logout',
+            '/manage/goodbye',
+        }
+        if m == 'GET' and p in ignore_get:
+            return
+        if user is None:
+            user = self._get_session_user()
+        if not user:
+            return
+        try:
+            uid = int(user['id'])
+        except Exception:
+            return
+        today = _today_iso()
+        with DAILY_ACTIVITY_TOUCH_LOCK:
+            if DAILY_ACTIVITY_TOUCH_CACHE.get(uid) == today:
+                return
+        try:
+            REGISTRATION_DB.daily_login_check(uid)
+        except Exception as e:
+            log.debug('daily activity touch skipped uid=%s path=%s err=%s', uid, p, e)
+            return
+        with DAILY_ACTIVITY_TOUCH_LOCK:
+            DAILY_ACTIVITY_TOUCH_CACHE[uid] = today
+
     def _get_session_token(self) -> str:
         """Return first wksession cookie value (used only for CSRF derivation)."""
         for part in self.headers.get('Cookie', '').split(';'):
@@ -14275,6 +14327,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             if user and self._session_has_active_delete_challenge():
                 return self._redirect('/manage/account/delete/confirm')
 
+        self._touch_daily_activity(path, 'GET')
+
         if path in ('/manage', ''):
             user = self._get_session_user()
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -14496,6 +14550,8 @@ class ManageHandler(BaseHTTPRequestHandler):
                 )
                 if path not in delete_allowed:
                     return self._redirect('/manage/account/delete/confirm')
+
+        self._touch_daily_activity(path, 'POST')
 
         if path == '/manage/login':
             self._post_login()
