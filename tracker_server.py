@@ -20241,6 +20241,41 @@ _MANAGE_CSS = '''
   .btn-accent-rev:hover { background: var(--accent); color: #000; border-color: var(--green); }
   .btn-blue-rev { border-color: var(--blue); color: var(--blue); }
   .btn-blue-rev:hover { background: var(--blue); color: #000; border-color: var(--blue); }
+  .facet-select {
+    width: 100%;
+    height: 32px;
+    padding: 0 30px 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background-color: var(--card2);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    letter-spacing: 0.03em;
+    outline: none;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    background-image:
+      linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+      linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+    background-position:
+      calc(100% - 15px) calc(50% - 2px),
+      calc(100% - 10px) calc(50% - 2px);
+    background-size: 5px 5px, 5px 5px;
+    background-repeat: no-repeat;
+    transition: border-color 0.15s, box-shadow 0.15s, color 0.15s;
+  }
+  .facet-select:hover { border-color: var(--accent); color: var(--accent); }
+  .facet-select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(245,166,35,0.22);
+  }
+  .facet-select option {
+    background: var(--card2);
+    color: var(--text);
+  }
   .facet-chip-link {
     display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px;
     font-family:var(--mono); font-size:0.66rem; letter-spacing:0.07em; text-transform:uppercase;
@@ -22000,7 +22035,7 @@ def _facet_controls_html(base_action: str, query: str = '',
       {q_input}
       <div class="form-group" style="margin:0;min-width:120px;max-width:140px">
         <label>Type</label>
-        <select name="fmt">
+        <select name="fmt" class="facet-select">
           <option value="" {"selected" if not fmt else ""}>Any</option>
           <option value="movie" {"selected" if fmt=="movie" else ""}>Movie</option>
           <option value="tv" {"selected" if fmt=="tv" else ""}>TV</option>
@@ -22010,7 +22045,7 @@ def _facet_controls_html(base_action: str, query: str = '',
       </div>
       <div class="form-group" style="margin:0;min-width:110px;max-width:130px">
         <label>Resolution</label>
-        <select name="fr">
+        <select name="fr" class="facet-select">
           <option value="" {"selected" if not fr else ""}>Any</option>
           <option value="2160p" {"selected" if fr=="2160p" else ""}>2160p</option>
           <option value="1080p" {"selected" if fr=="1080p" else ""}>1080p</option>
@@ -22019,7 +22054,7 @@ def _facet_controls_html(base_action: str, query: str = '',
       </div>
       <div class="form-group" style="margin:0;min-width:110px;max-width:140px">
         <label>Source</label>
-        <select name="fs">
+        <select name="fs" class="facet-select">
           <option value="" {"selected" if not fs else ""}>Any</option>
           <option value="web-dl" {"selected" if fs=="web-dl" else ""}>WEB-DL</option>
           <option value="webrip" {"selected" if fs=="webrip" else ""}>WEBRip</option>
@@ -22029,7 +22064,7 @@ def _facet_controls_html(base_action: str, query: str = '',
       </div>
       <div class="form-group" style="margin:0;min-width:105px;max-width:130px">
         <label>Provider</label>
-        <select name="fp">
+        <select name="fp" class="facet-select">
           <option value="" {"selected" if not fp else ""}>Any</option>
           <option value="amzn" {"selected" if fp=="amzn" else ""}>AMZN</option>
           <option value="nf" {"selected" if fp=="nf" else ""}>NF</option>
@@ -22040,21 +22075,21 @@ def _facet_controls_html(base_action: str, query: str = '',
       </div>
       <div class="form-group" style="margin:0;min-width:145px;max-width:210px">
         <label>Genre</label>
-        <select name="fg">
+        <select name="fg" class="facet-select">
           <option value="" {"selected" if not fg else ""}>Any</option>
           {genre_html}
         </select>
       </div>
       <div class="form-group" style="margin:0;min-width:110px;max-width:130px">
         <label>Audio</label>
-        <select name="fa">
+        <select name="fa" class="facet-select">
           <option value="" {"selected" if not fa else ""}>Any</option>
           <option value="atmos" {"selected" if fa=="atmos" else ""}>Atmos</option>
         </select>
       </div>
       <div class="form-group" style="margin:0;min-width:95px;max-width:110px">
         <label>HDR</label>
-        <select name="fh">
+        <select name="fh" class="facet-select">
           <option value="" {"selected" if not fh else ""}>Any</option>
           <option value="hdr" {"selected" if fh=="hdr" else ""}>HDR</option>
           <option value="dv" {"selected" if fh=="dv" else ""}>DV</option>
@@ -22630,7 +22665,7 @@ def _render_admin_report_detail(user, report: dict, actions: list, moderators: l
       <input type="hidden" name="_csrf" value="{_h(csrf)}">
       <div class="form-group" style="margin:0;min-width:220px">
         <label>Moderator</label>
-        <select name="assign_user_id">{assign_options}</select>
+        <select name="assign_user_id" class="facet-select">{assign_options}</select>
       </div>
       <button class="btn btn-sm btn-primary" type="submit">Set Assignment</button>
     </form>
@@ -22838,7 +22873,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           </label>
           <div class="form-group">
             <label>Ban enforcement backend</label>
-            <select name="security_ban_backend" style="max-width:220px">
+            <select name="security_ban_backend" class="facet-select" style="width:170px;max-width:170px">
               <option value="app" {'selected' if security_ban_backend == 'app' else ''}>app</option>
               <option value="system_fw" {'selected' if security_ban_backend == 'system_fw' else ''}>system fw</option>
             </select>
