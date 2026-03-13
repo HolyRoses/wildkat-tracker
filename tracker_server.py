@@ -19268,7 +19268,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ntype = n['type']
                 icons = {
                     'bounty_new':             ('📣', 'has posted a bounty for'),
-                    'mention':                ('@',  'mentioned you in bounty'),
+                    'mention':                ('🗣️',  'mentioned you in bounty'),
                     'reply':                  ('💬', 'replied to your comment on bounty'),
                     'comment_vote_up':        ('👍', 'upvoted your comment on bounty'),
                     'comment_vote_down':      ('👎', 'downvoted your comment on bounty'),
@@ -19419,7 +19419,7 @@ class ManageHandler(BaseHTTPRequestHandler):
                     label = 'uploaded a new torrent'
                     url = f'/manage/torrent/{n["info_hash"].lower()}'
                 else:
-                    icon  = '💬' if n['type'] == 'reply' else '@'
+                    icon  = '💬' if n['type'] == 'reply' else '🗣️'
                     label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
                     anchor = f'#comment-{n["comment_id"]}' if int(n['comment_id'] or 0) > 0 else ''
                     url = f'/manage/torrent/{n["info_hash"].lower()}{anchor}'
@@ -21045,7 +21045,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                 ntype = n['type']
                 icon, label = {
                     'bounty_new':              ('📣', 'has posted a bounty for'),
-                    'mention':                 ('@',  'mentioned you in bounty'),
+                    'mention':                 ('🗣️',  'mentioned you in bounty'),
                     'reply':                   ('💬', 'replied to your comment on bounty'),
                     'comment_vote_up':         ('👍', 'upvoted your comment on bounty'),
                     'comment_vote_down':       ('👎', 'downvoted your comment on bounty'),
@@ -21251,7 +21251,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
                         f'</button>'
                     )
                 else:
-                    icon = '💬' if n['type'] == 'reply' else '@'
+                    icon = '💬' if n['type'] == 'reply' else '🗣️'
                     label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
                     n_cid  = n['comment_id']
                     dropdown_items += (
@@ -21268,7 +21268,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
         mark_all_btn = (
             f'<button id="notif-mark-all" class="notif-markall-btn"'
             + ('' if unread else ' style="display:none" disabled')
-            + '>Mark all read</button>'
+            + '>✅ Mark all read</button>'
         )
         bell_html = (
             f'<div class="notif-wrap">'
@@ -25235,7 +25235,7 @@ def _render_messages_page(viewer, inbox, sent, blocklist,
     if unread_count:
         mark_all = ('<form method="POST" action="/manage/messages/mark-read" style="display:inline;margin-top:4px">'
 
-                    '<button class="btn btn-sm">&#x2713; Mark all read</button></form>')
+                    '<button class="btn btn-sm">✅ Mark all read</button></form>')
 
     body = (
         f'<div class="page-title">📬 Messages</div>'
@@ -25533,7 +25533,7 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
             ntype = n['type']
             icon, label = {
                 'bounty_new':              ('📣', 'has posted a bounty for'),
-                'mention':                 ('@',  'mentioned you in bounty'),
+                'mention':                 ('🗣️',  'mentioned you in bounty'),
                 'reply':                   ('💬', 'replied to your comment on bounty'),
                 'comment_vote_up':         ('👍', 'upvoted your comment on bounty'),
                 'comment_vote_down':       ('👎', 'downvoted your comment on bounty'),
@@ -25940,7 +25940,7 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
                     f'</div>'
                 )
             else:
-                icon  = '💬' if n['type'] == 'reply' else '@ '
+                icon  = '💬' if n['type'] == 'reply' else '🗣️'
                 label = 'replied to your comment' if n['type'] == 'reply' else 'mentioned you'
                 url   = f'/manage/torrent/{n["info_hash"].lower()}#comment-{n["comment_id"]}'
                 read_attrs = f'data-notif-id="{n_id}" data-notif-url="{_h(url)}"'
@@ -25964,7 +25964,7 @@ def _render_notifications_page(viewer, msg: str = '', msg_type: str = 'error') -
     if unread_count:
         notif_actions_parts.append(
             '<form method="POST" action="/manage/notifications/read-all" style="display:inline">'
-            '<button class="btn btn-sm">✓ Mark all read</button>'
+            '<button class="btn btn-sm">✅ Mark all read</button>'
             '</form>'
         )
     if notifs:
