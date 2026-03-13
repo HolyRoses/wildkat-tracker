@@ -8022,7 +8022,7 @@ class RegistrationDB:
                    ORDER BY id ASC''',
                 (proposal_id,)
             ).fetchall()
-            today = datetime.datetime.now().date().isoformat()
+            today = _today_iso()
             for r in rows:
                 uid = int(r['voter_user_id'] or 0)
                 if uid <= 0:
@@ -10152,7 +10152,7 @@ class RegistrationDB:
 
     def get_session_user(self, token: str) -> sqlite3.Row | None:
         """Return user row if session token is valid and not expired."""
-        now = datetime.datetime.now().isoformat(timespec='seconds')
+        now = self._ts()
         row = self._conn().execute(
             'SELECT user_id,created_at,allow_locked_passkey FROM sessions WHERE token=? AND expires_at>?',
             (token, now)
@@ -10188,7 +10188,7 @@ class RegistrationDB:
 
     def has_active_session(self, user_id: int) -> bool:
         """True when user currently has any non-expired session."""
-        now = datetime.datetime.now().isoformat(timespec='seconds')
+        now = self._ts()
         row = self._conn().execute(
             'SELECT 1 FROM sessions WHERE user_id=? AND expires_at>? LIMIT 1',
             (user_id, now)
@@ -10204,7 +10204,7 @@ class RegistrationDB:
         self._conn().commit()
 
     def session_requires_passkey_enroll(self, token: str) -> bool:
-        now = datetime.datetime.now().isoformat(timespec='seconds')
+        now = self._ts()
         row = self._conn().execute(
             'SELECT must_enroll_passkey FROM sessions WHERE token=? AND expires_at>?',
             (token, now)
@@ -10219,7 +10219,7 @@ class RegistrationDB:
         self._conn().commit()
 
     def session_requires_tfa_enroll(self, token: str) -> bool:
-        now = datetime.datetime.now().isoformat(timespec='seconds')
+        now = self._ts()
         row = self._conn().execute(
             'SELECT must_enroll_tfa FROM sessions WHERE token=? AND expires_at>?',
             (token, now)
@@ -10262,7 +10262,7 @@ class RegistrationDB:
         self._conn().commit()
 
     def session_primary_auth_ok(self, token: str) -> bool:
-        now = datetime.datetime.now().isoformat(timespec='seconds')
+        now = self._ts()
         row = self._conn().execute(
             'SELECT primary_auth_ok FROM sessions WHERE token=? AND expires_at>?',
             (token, now)
@@ -10280,7 +10280,7 @@ class RegistrationDB:
         self._conn().commit()
 
     def purge_expired_sessions(self):
-        now = datetime.datetime.now().isoformat(timespec='seconds')
+        now = self._ts()
         self._conn().execute('DELETE FROM sessions WHERE expires_at<=?', (now,))
         self._conn().commit()
 
