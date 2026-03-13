@@ -6357,7 +6357,7 @@ class RegistrationDB:
             new_streak = (current_streak + 1) if last_date == yesterday else 1
             longest = max(user['longest_streak'] if 'longest_streak' in user.keys() else 0, new_streak)
             total = daily
-            parts = ['daily login']
+            parts = ['daily activity']
             if new_streak % 7 == 0:
                 total += s7
                 parts.append(f'7-day streak (day {new_streak})')
@@ -23454,7 +23454,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <div class="card-title">Points Earning</div>
         <form method="POST" action="/manage/admin/save-settings">
           <input type="hidden" name="form_id" value="points_earn">
-          <div class="form-group"><label>Login (daily)</label>
+          <div class="form-group"><label>Activity (daily)</label>
             <input type="number" name="points_login_daily" value="{_eset('points_login_daily','1')}" min="0" max="999" style="width:80px"></div>
           <div class="form-group"><label>7-day streak bonus</label>
             <input type="number" name="points_streak_7day" value="{_eset('points_streak_7day','1')}" min="0" max="999" style="width:80px"></div>
@@ -29115,8 +29115,8 @@ def _render_leaderboard(viewer, data: dict, top_n: int) -> str:
                            "Most torrents registered on the tracker.")
     card_hunters   = _card("Bounty Hunters",   "🎯", data["bounty_hunters"], cols_hunters,
                            "Most bounties successfully fulfilled.")
-    card_streaks   = _card("Login Streaks",    "🔥", data["streaks"],        cols_streaks,
-                           "Longest consecutive daily login streak.")
+    card_streaks   = _card("Activity Streaks",    "🔥", data["streaks"],        cols_streaks,
+                           "Longest consecutive daily activity streak.")
     card_chatty    = _card("Most Chatty",      "💬", data["chatty"],         cols_chatty,
                            "Most comments posted — the voices of the community.")
     card_popular   = _card("Most Followed",    "👥", data["popular"],        cols_popular,
