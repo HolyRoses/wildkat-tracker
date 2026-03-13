@@ -136,6 +136,10 @@ MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS = 300
 MAGNET_JOB_DEFAULT_USER_MAX_ACTIVE = 2
 MAGNET_JOB_DEFAULT_GLOBAL_MAX_ACTIVE = 10
 MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY = 2
+WILD_INTAKE_DEFAULT_WORKER_CONCURRENCY = 5
+WILD_INTAKE_DEFAULT_MAX_QUEUE = 20
+WILD_INTAKE_DEFAULT_RETRY_BASE_SECONDS = 15 * 60
+WILD_INTAKE_DEFAULT_RETRY_MAX_SECONDS = 7 * 24 * 60 * 60
 ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES = 5
 WEBAUTHN_CHALLENGE_TTL_SECONDS = 300
 TFA_CHALLENGE_TTL_SECONDS = 300
@@ -1720,16 +1724,20 @@ def _parse_release_facets(raw_name: str) -> dict[str, Any]:
     cleaned = _normalize_torrent_display_name(
         raw_name, [], strip_www_prefix=True, strip_extensions=True
     )
-    upper = str(cleaned or '').upper().strip()
-    if not upper:
+    upper_raw = str(cleaned or '').upper().strip()
+    if not upper_raw:
         return {}
+    # Canonical scan text for token matching. This lets bracket/paren wrapped
+    # tokens (e.g. `[1080p]`, `(WEBRip)`) behave like normal separators.
+    upper = re.sub(r'[\[\]\(\)\{\}]', '.', upper_raw)
+    upper = re.sub(r'\.+', '.', upper)
 
     facets: dict[str, Any] = {}
 
     # Optional scene/p2p group suffix at end of release name.
     # Keep this strict so we don't accidentally capture source/codec tails
     # like "WEB-DL.DDP5.1.ATMOS.H.264-SCOPE" as one giant group.
-    gm = re.search(r'(?i)-([A-Z0-9][A-Z0-9_]{1,63})$', upper)
+    gm = re.search(r'(?i)-([A-Z0-9][A-Z0-9_]{1,63})$', upper_raw)
     if gm:
         grp = str(gm.group(1) or '').strip('.-_ ').lower()
         if grp:
@@ -1977,25 +1985,32 @@ def _parse_release_for_auto_match(raw_name: str, cleanup_tags: list[str] | None 
             year = int(my.group(1))
         except Exception:
             year = None
-    tokens = [t for t in re.split(r'[.\-]+', norm) if t]
+    # Treat wrapper punctuation as separators so `[1080p]` / `(2026)` do not
+    # leak into title query tokens.
+    token_src = re.sub(r'[\[\]\(\)\{\}]', '.', norm)
+    tokens = [t for t in re.split(r'[.\-]+', token_src) if t]
     title_parts: list[str] = []
     for tok in tokens:
-        low = tok.lower()
-        if re.fullmatch(r'(?i)s\d{1,2}e\d{1,2}', tok):
+        bare = re.sub(r"^[^A-Za-z0-9']+|[^A-Za-z0-9']+$", '', tok)
+        low = bare.lower()
+        alnum = re.sub(r'[^a-z0-9]+', '', low)
+        if not bare:
+            continue
+        if re.fullmatch(r'(?i)s\d{1,2}e\d{1,2}', bare):
             break
-        if re.fullmatch(r'(?i)\d{1,2}x\d{1,2}', tok):
+        if re.fullmatch(r'(?i)\d{1,2}x\d{1,2}', bare):
             break
-        if re.fullmatch(r'(?i)s\d{1,2}', tok):
+        if re.fullmatch(r'(?i)s\d{1,2}', bare):
             break
         if low == 'season':
             break
-        if re.fullmatch(r'(19\d{2}|20\d{2})', tok):
+        if re.fullmatch(r'(19\d{2}|20\d{2})', alnum):
             break
-        if low in _TITLE_STOP_TOKENS:
+        if low in _TITLE_STOP_TOKENS or alnum in _TITLE_STOP_TOKENS:
             break
-        if low.isdigit() and len(low) >= 3:
+        if alnum.isdigit() and len(alnum) >= 3:
             break
-        title_parts.append(tok)
+        title_parts.append(bare)
     title_query = ' '.join(title_parts).strip()
     if not title_query:
         # Fallback: keep early alpha tokens only.
@@ -2523,7 +2538,10 @@ class RegistrationDB:
                 release_group       TEXT    NOT NULL DEFAULT '',
                 content_genres      TEXT    NOT NULL DEFAULT '',
                 classification_source TEXT  NOT NULL DEFAULT '',
-                classification_confidence INTEGER NOT NULL DEFAULT 0
+                classification_confidence INTEGER NOT NULL DEFAULT 0,
+                ingestion_source    TEXT    NOT NULL DEFAULT 'upload',
+                ingested_by_id      INTEGER,
+                ingested_by_username TEXT   NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS magnet_trackers (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2542,6 +2560,9 @@ class RegistrationDB:
                 submitted_magnet_raw   TEXT    NOT NULL,
                 info_hash              TEXT    NOT NULL,
                 mode                   TEXT    NOT NULL DEFAULT 'direct',
+                submission_source      TEXT    NOT NULL DEFAULT 'user',
+                requested_by_type      TEXT    NOT NULL DEFAULT 'user',
+                requested_by_value     TEXT    NOT NULL DEFAULT '',
                 status                 TEXT    NOT NULL DEFAULT 'queued',
                 created_at             TEXT    NOT NULL,
                 started_at             TEXT,
@@ -2565,6 +2586,59 @@ class RegistrationDB:
               ON magnet_jobs(info_hash, status, id DESC);
             CREATE INDEX IF NOT EXISTS idx_magnet_jobs_created
               ON magnet_jobs(created_at DESC);
+            CREATE TABLE IF NOT EXISTS wild_intake_hash_state (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash             TEXT    NOT NULL UNIQUE,
+                status                TEXT    NOT NULL DEFAULT 'allowed',
+                attempts              INTEGER NOT NULL DEFAULT 0,
+                first_seen_at         TEXT    NOT NULL,
+                last_seen_at          TEXT    NOT NULL,
+                last_attempt_at       TEXT,
+                next_retry_at         TEXT,
+                last_error_code       TEXT    NOT NULL DEFAULT '',
+                last_error_detail     TEXT    NOT NULL DEFAULT '',
+                added_at              TEXT,
+                added_name            TEXT    NOT NULL DEFAULT '',
+                added_by_user_id      INTEGER,
+                added_by_username     TEXT    NOT NULL DEFAULT '',
+                suppressed_at         TEXT,
+                suppressed_by_user_id INTEGER,
+                suppressed_by_username TEXT   NOT NULL DEFAULT '',
+                suppress_reason       TEXT    NOT NULL DEFAULT '',
+                updated_at            TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_wild_state_status_updated
+              ON wild_intake_hash_state(status, updated_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_wild_state_next_retry
+              ON wild_intake_hash_state(status, next_retry_at, id);
+            CREATE TABLE IF NOT EXISTS wild_intake_actions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                wild_state_id     INTEGER NOT NULL,
+                info_hash         TEXT    NOT NULL,
+                action            TEXT    NOT NULL,
+                actor_user_id     INTEGER,
+                actor_username    TEXT    NOT NULL DEFAULT '',
+                note              TEXT    NOT NULL DEFAULT '',
+                created_at        TEXT    NOT NULL,
+                FOREIGN KEY (wild_state_id) REFERENCES wild_intake_hash_state(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_wild_actions_state_id
+              ON wild_intake_actions(wild_state_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_wild_actions_hash_id
+              ON wild_intake_actions(info_hash, id DESC);
+            CREATE TABLE IF NOT EXISTS user_uploader_blocks (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                blocker_user_id  INTEGER NOT NULL,
+                blocked_user_id  INTEGER NOT NULL,
+                created_at       TEXT    NOT NULL,
+                UNIQUE(blocker_user_id, blocked_user_id),
+                FOREIGN KEY (blocker_user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (blocked_user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_uploader_blocks_blocker
+              ON user_uploader_blocks(blocker_user_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_uploader_blocks_blocked
+              ON user_uploader_blocks(blocked_user_id, blocker_user_id);
             CREATE TABLE IF NOT EXISTS sessions (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id     INTEGER NOT NULL,
@@ -3523,6 +3597,85 @@ class RegistrationDB:
         if 'blocked_until' not in tfa_ch_cols:
             c.execute('ALTER TABLE tfa_challenges ADD COLUMN blocked_until TEXT')
             c.commit()
+        # Wild intake + ingestion provenance columns (migration-safe)
+        tcols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
+        if 'ingestion_source' not in tcols:
+            c.execute("ALTER TABLE torrents ADD COLUMN ingestion_source TEXT NOT NULL DEFAULT 'upload'")
+            c.commit()
+        if 'ingested_by_id' not in tcols:
+            c.execute('ALTER TABLE torrents ADD COLUMN ingested_by_id INTEGER')
+            c.commit()
+        if 'ingested_by_username' not in tcols:
+            c.execute("ALTER TABLE torrents ADD COLUMN ingested_by_username TEXT NOT NULL DEFAULT ''")
+            c.commit()
+        mcols = [r[1] for r in c.execute('PRAGMA table_info(magnet_jobs)').fetchall()]
+        if 'submission_source' not in mcols:
+            c.execute("ALTER TABLE magnet_jobs ADD COLUMN submission_source TEXT NOT NULL DEFAULT 'user'")
+            c.commit()
+        if 'requested_by_type' not in mcols:
+            c.execute("ALTER TABLE magnet_jobs ADD COLUMN requested_by_type TEXT NOT NULL DEFAULT 'user'")
+            c.commit()
+        if 'requested_by_value' not in mcols:
+            c.execute("ALTER TABLE magnet_jobs ADD COLUMN requested_by_value TEXT NOT NULL DEFAULT ''")
+            c.commit()
+        c.execute('CREATE INDEX IF NOT EXISTS idx_magnet_jobs_source_status ON magnet_jobs(submission_source, status, id DESC)')
+        c.commit()
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS wild_intake_hash_state (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash             TEXT    NOT NULL UNIQUE,
+                status                TEXT    NOT NULL DEFAULT 'allowed',
+                attempts              INTEGER NOT NULL DEFAULT 0,
+                first_seen_at         TEXT    NOT NULL,
+                last_seen_at          TEXT    NOT NULL,
+                last_attempt_at       TEXT,
+                next_retry_at         TEXT,
+                last_error_code       TEXT    NOT NULL DEFAULT '',
+                last_error_detail     TEXT    NOT NULL DEFAULT '',
+                added_at              TEXT,
+                added_name            TEXT    NOT NULL DEFAULT '',
+                added_by_user_id      INTEGER,
+                added_by_username     TEXT    NOT NULL DEFAULT '',
+                suppressed_at         TEXT,
+                suppressed_by_user_id INTEGER,
+                suppressed_by_username TEXT   NOT NULL DEFAULT '',
+                suppress_reason       TEXT    NOT NULL DEFAULT '',
+                updated_at            TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_wild_state_status_updated
+              ON wild_intake_hash_state(status, updated_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_wild_state_next_retry
+              ON wild_intake_hash_state(status, next_retry_at, id);
+            CREATE TABLE IF NOT EXISTS wild_intake_actions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                wild_state_id     INTEGER NOT NULL,
+                info_hash         TEXT    NOT NULL,
+                action            TEXT    NOT NULL,
+                actor_user_id     INTEGER,
+                actor_username    TEXT    NOT NULL DEFAULT '',
+                note              TEXT    NOT NULL DEFAULT '',
+                created_at        TEXT    NOT NULL,
+                FOREIGN KEY (wild_state_id) REFERENCES wild_intake_hash_state(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_wild_actions_state_id
+              ON wild_intake_actions(wild_state_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_wild_actions_hash_id
+              ON wild_intake_actions(info_hash, id DESC);
+            CREATE TABLE IF NOT EXISTS user_uploader_blocks (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                blocker_user_id  INTEGER NOT NULL,
+                blocked_user_id  INTEGER NOT NULL,
+                created_at       TEXT    NOT NULL,
+                UNIQUE(blocker_user_id, blocked_user_id),
+                FOREIGN KEY (blocker_user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (blocked_user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_uploader_blocks_blocker
+              ON user_uploader_blocks(blocker_user_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_uploader_blocks_blocked
+              ON user_uploader_blocks(blocked_user_id, blocker_user_id);
+        ''')
+        c.commit()
 
     def _init_defaults(self, announce_urls: list):
         """Seed magnet_trackers and settings if not already present."""
@@ -3668,6 +3821,12 @@ class RegistrationDB:
             'magnet_submission_max_global_running':   str(MAGNET_JOB_DEFAULT_GLOBAL_MAX_ACTIVE),
             'magnet_submission_worker_concurrency':   str(MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY),
             'magnet_submission_job_timeout_sec':      str(MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS),
+            'wild_intake_enabled':                    '0',
+            'wild_intake_owner_user':                 'wildkat-bot',
+            'wild_intake_worker_concurrency':         str(WILD_INTAKE_DEFAULT_WORKER_CONCURRENCY),
+            'wild_intake_max_queue':                  str(WILD_INTAKE_DEFAULT_MAX_QUEUE),
+            'wild_intake_retry_base_sec':             str(WILD_INTAKE_DEFAULT_RETRY_BASE_SECONDS),
+            'wild_intake_retry_max_sec':              str(WILD_INTAKE_DEFAULT_RETRY_MAX_SECONDS),
             'stats_persist_enabled':        '0',
             'stats_persist_interval_sec':   '300',
             'security_auto_ban_enabled':    '1',
@@ -5246,6 +5405,161 @@ class RegistrationDB:
         ).fetchall()
         return [str(r['url'] or '').strip() for r in rows if str(r['url'] or '').strip()]
 
+    def get_wild_intake_hash_state(self, info_hash: str):
+        ih = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return None
+        return self._conn().execute(
+            'SELECT * FROM wild_intake_hash_state WHERE info_hash=?',
+            (ih,)
+        ).fetchone()
+
+    def _wild_intake_record_action(self, info_hash: str, action: str, actor_user_id: int | None,
+                                   actor_username: str, note: str = '') -> None:
+        ih = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return
+        row = self.get_wild_intake_hash_state(ih)
+        if not row:
+            return
+        self._conn().execute(
+            '''INSERT INTO wild_intake_actions
+               (wild_state_id, info_hash, action, actor_user_id, actor_username, note, created_at)
+               VALUES (?,?,?,?,?,?,?)''',
+            (int(row['id']), ih, str(action or '')[:40], actor_user_id,
+             str(actor_username or '')[:64], str(note or '')[:500], self._ts())
+        )
+        self._conn().commit()
+
+    def _wild_intake_next_retry_at(self, attempts: int, cfg: dict) -> str:
+        base_sec = max(60, int(cfg.get('retry_base_sec') or WILD_INTAKE_DEFAULT_RETRY_BASE_SECONDS))
+        max_sec = max(base_sec, int(cfg.get('retry_max_sec') or WILD_INTAKE_DEFAULT_RETRY_MAX_SECONDS))
+        if attempts <= 0:
+            delay = base_sec
+        else:
+            delay = base_sec
+            for _ in range(max(0, int(attempts) - 1)):
+                if delay < 24 * 60 * 60:
+                    delay = min(max_sec, delay * 2)
+                else:
+                    delay = min(max_sec, delay + 24 * 60 * 60)
+        return (datetime.datetime.now() + datetime.timedelta(seconds=delay)).isoformat(timespec='seconds')
+
+    def is_info_hash_suppressed(self, info_hash: str) -> bool:
+        row = self.get_wild_intake_hash_state(info_hash)
+        return bool(row and str(row['status'] or '') == 'suppressed')
+
+    def _validate_wild_intake_owner(self, cfg: dict):
+        owner_name = str(cfg.get('owner_user') or '').strip()
+        if not owner_name:
+            return None, 'wild intake owner account is not configured'
+        owner = self.get_user(owner_name)
+        if not owner or int(owner['is_disabled'] or 0) == 1:
+            return None, f'wild intake owner account is invalid: {owner_name}'
+        return owner, ''
+
+    def submit_wild_intake_job(self, info_hash: str,
+                               requested_by_type: str = 'announce',
+                               requested_by_value: str = '') -> tuple[bool, str]:
+        cfg = self.get_wild_intake_config()
+        if not REGISTRATION_MODE:
+            return False, 'registration mode is disabled'
+        if not cfg.get('enabled', False):
+            return False, 'wild intake is disabled'
+        mag_cfg = self.get_magnet_submission_config()
+        if not mag_cfg.get('enabled', False):
+            return False, 'magnet submission engine is disabled'
+        owner, owner_err = self._validate_wild_intake_owner(cfg)
+        if not owner:
+            return False, owner_err
+        ih = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return False, 'invalid info hash'
+        now = self._ts()
+        rbt = str(requested_by_type or 'announce').strip().lower()
+        if rbt not in ('announce', 'manual', 'report'):
+            rbt = 'announce'
+        rbv = str(requested_by_value or '')[:255]
+        for attempt in range(8):
+            try:
+                c = self._conn()
+                c.execute('BEGIN IMMEDIATE')
+                state = c.execute(
+                    'SELECT * FROM wild_intake_hash_state WHERE info_hash=?',
+                    (ih,)
+                ).fetchone()
+                if state:
+                    c.execute(
+                        'UPDATE wild_intake_hash_state SET last_seen_at=?, updated_at=? WHERE info_hash=?',
+                        (now, now, ih)
+                    )
+                else:
+                    c.execute(
+                        '''INSERT INTO wild_intake_hash_state
+                           (info_hash,status,attempts,first_seen_at,last_seen_at,updated_at)
+                           VALUES (?,?,?,?,?,?)''',
+                        (ih, 'allowed', 0, now, now, now)
+                    )
+                state = c.execute(
+                    'SELECT * FROM wild_intake_hash_state WHERE info_hash=?',
+                    (ih,)
+                ).fetchone()
+                if state and str(state['status'] or '') == 'suppressed':
+                    c.execute('COMMIT')
+                    return False, 'suppressed'
+                if c.execute('SELECT 1 FROM torrents WHERE info_hash=? LIMIT 1', (ih,)).fetchone():
+                    c.execute('COMMIT')
+                    return False, 'already registered'
+                if c.execute(
+                    "SELECT 1 FROM magnet_jobs WHERE info_hash=? AND status IN ('queued','running') LIMIT 1",
+                    (ih,)
+                ).fetchone():
+                    c.execute('COMMIT')
+                    return False, 'already queued'
+                next_retry_at = str(state['next_retry_at'] or '').strip() if state else ''
+                if next_retry_at:
+                    next_dt = _parse_iso_ts(next_retry_at)
+                    if next_dt and next_dt > datetime.datetime.now():
+                        c.execute('COMMIT')
+                        return False, 'cooldown'
+                active = c.execute(
+                    "SELECT COUNT(*) AS n FROM magnet_jobs WHERE status IN ('queued','running')"
+                ).fetchone()
+                if int((active['n'] if active else 0) or 0) >= int(cfg.get('max_queue') or WILD_INTAKE_DEFAULT_MAX_QUEUE):
+                    c.execute('COMMIT')
+                    return False, 'queue full'
+                attempts_n = int(state['attempts'] or 0) + 1 if state else 1
+                retry_at = self._wild_intake_next_retry_at(attempts_n, cfg)
+                c.execute(
+                    '''UPDATE wild_intake_hash_state
+                       SET attempts=?, last_attempt_at=?, next_retry_at=?, updated_at=?
+                       WHERE info_hash=?''',
+                    (attempts_n, now, retry_at, now, ih)
+                )
+                mode = str(mag_cfg.get('mode') or 'direct')
+                timeout_sec = int(mag_cfg.get('job_timeout_sec') or MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS)
+                c.execute(
+                    '''INSERT INTO magnet_jobs (
+                           submitted_by_user_id, submitted_by_username, submitted_magnet_raw,
+                           info_hash, mode, submission_source, requested_by_type, requested_by_value,
+                           status, created_at, updated_at, timeout_sec
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (int(owner['id']), str(owner['username']), ih,
+                     ih, mode, 'wild_intake', rbt, rbv,
+                     'queued', now, now, timeout_sec)
+                )
+                c.execute('COMMIT')
+                self._wild_intake_record_action(ih, 'queued', int(owner['id']), str(owner['username']),
+                                                f'requested_by={rbt}:{rbv}')
+                return True, 'queued'
+            except sqlite3.OperationalError as e:
+                self._rollback_quiet()
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.12 * (attempt + 1))
+                    continue
+                return False, f'db busy: {e}'
+        return False, 'db busy'
+
     def _count_magnet_jobs(self, status_filter: tuple[str, ...], user_id: int | None = None) -> int:
         c = self._conn()
         placeholders = ','.join('?' for _ in status_filter)
@@ -5258,18 +5572,27 @@ class RegistrationDB:
         return int(row['n'] or 0) if row else 0
 
     def submit_magnet_job(self, actor_user_id: int, actor_username: str,
-                          magnet_uri: str) -> tuple[bool, str, int, str]:
+                          magnet_uri: str, submission_source: str = 'user',
+                          requested_by_type: str = 'user',
+                          requested_by_value: str = '') -> tuple[bool, str, int, str]:
         cfg = self.get_magnet_submission_config()
         if not cfg.get('enabled'):
             return False, 'Magnet submission engine is disabled.', 0, ''
         ok_m, info_hash, parse_err = _parse_magnet_uri(magnet_uri)
         if not ok_m:
             return False, parse_err, 0, ''
+        if self.is_info_hash_suppressed(info_hash):
+            return False, 'This info hash is suppressed and cannot be submitted.', 0, info_hash
         if self.get_torrent(info_hash):
             return False, 'Torrent already registered (duplicate info hash).', 0, info_hash
         now = self._ts()
         uid = int(actor_user_id or 0)
         uname = str(actor_username or '')[:64]
+        source = str(submission_source or 'user').strip().lower()
+        if source not in ('user', 'wild_intake'):
+            source = 'user'
+        req_type = str(requested_by_type or 'user').strip().lower()[:32]
+        req_value = str(requested_by_value or '')[:255]
         if uid <= 0 or not uname:
             return False, 'Invalid submitter.', 0, info_hash
         for attempt in range(8):
@@ -5304,10 +5627,12 @@ class RegistrationDB:
                 c.execute(
                     '''INSERT INTO magnet_jobs (
                            submitted_by_user_id, submitted_by_username, submitted_magnet_raw,
-                           info_hash, mode, status, created_at, updated_at, timeout_sec
-                       ) VALUES (?,?,?,?,?,?,?,?,?)''',
+                           info_hash, mode, submission_source, requested_by_type, requested_by_value,
+                           status, created_at, updated_at, timeout_sec
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (uid, uname, str(magnet_uri or '')[:8192],
-                     info_hash, str(cfg['mode']), 'queued', now, now, int(cfg['job_timeout_sec']))
+                     info_hash, str(cfg['mode']), source, req_type, req_value,
+                     'queued', now, now, int(cfg['job_timeout_sec']))
                 )
                 job_id = int(c.execute('SELECT last_insert_rowid()').fetchone()[0])
                 c.execute('COMMIT')
@@ -5408,6 +5733,283 @@ class RegistrationDB:
         c.commit()
         self._log(actor_username or 'system', f'magnet_job_{st}',
                   str(result_info_hash or ''), f'job_id={int(job_id)} {error_code} {error_detail[:120]}')
+
+    def handle_wild_intake_job_result(self, job_id: int, success: bool,
+                                      info_hash: str = '', torrent_name: str = '',
+                                      error_code: str = '', error_detail: str = '') -> None:
+        row = self.get_magnet_job(int(job_id))
+        if not row:
+            return
+        if str(row['submission_source'] or '').strip().lower() != 'wild_intake':
+            return
+        ih = (str(info_hash or '') or str(row['info_hash'] or '')).strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return
+        now = self._ts()
+        c = self._conn()
+        state = c.execute('SELECT * FROM wild_intake_hash_state WHERE info_hash=?', (ih,)).fetchone()
+        if not state:
+            c.execute(
+                '''INSERT INTO wild_intake_hash_state
+                   (info_hash,status,attempts,first_seen_at,last_seen_at,updated_at)
+                   VALUES (?,?,?,?,?,?)''',
+                (ih, 'allowed', 0, now, now, now)
+            )
+            state = c.execute('SELECT * FROM wild_intake_hash_state WHERE info_hash=?', (ih,)).fetchone()
+        actor_uid = int(row['submitted_by_user_id'] or 0)
+        actor_uname = str(row['submitted_by_username'] or 'system')[:64]
+        if success:
+            c.execute(
+                '''UPDATE wild_intake_hash_state
+                   SET status='allowed',
+                       attempts=0,
+                       last_attempt_at=NULL,
+                       next_retry_at=NULL,
+                       added_at=COALESCE(added_at, ?),
+                       added_name=?,
+                       added_by_user_id=?,
+                       added_by_username=?,
+                       last_error_code='',
+                       last_error_detail='',
+                       updated_at=?
+                   WHERE info_hash=?''',
+                (now, str(torrent_name or '')[:500], actor_uid if actor_uid > 0 else None,
+                 actor_uname, now, ih)
+            )
+            c.commit()
+            self._wild_intake_record_action(ih, 'registered', actor_uid, actor_uname, str(torrent_name or '')[:200])
+            return
+        cfg = self.get_wild_intake_config()
+        retry_max_sec = max(3600, int(cfg.get('retry_max_sec') or WILD_INTAKE_DEFAULT_RETRY_MAX_SECONDS))
+        suppress = False
+        delay_sec = 0
+        try:
+            la = _parse_iso_ts(str(state['last_attempt_at'] or ''))
+            nr = _parse_iso_ts(str(state['next_retry_at'] or ''))
+            if la and nr:
+                delay_sec = max(0, int((nr - la).total_seconds()))
+                suppress = delay_sec >= retry_max_sec
+        except Exception:
+            suppress = False
+        if suppress:
+            c.execute(
+                '''UPDATE wild_intake_hash_state
+                   SET status='suppressed',
+                       suppressed_at=?,
+                       suppressed_by_user_id=?,
+                       suppressed_by_username=?,
+                       suppress_reason='unobtainable',
+                       last_error_code=?,
+                       last_error_detail=?,
+                       updated_at=?
+                   WHERE info_hash=?''',
+                (now, actor_uid if actor_uid > 0 else None, actor_uname,
+                 str(error_code or '')[:64], str(error_detail or '')[:500], now, ih)
+            )
+            c.commit()
+            self._wild_intake_record_action(
+                ih, 'auto_suppressed', actor_uid, actor_uname,
+                f'unobtainable after backoff max ({delay_sec}s); {str(error_code or "")[:24]}'
+            )
+            return
+        c.execute(
+            '''UPDATE wild_intake_hash_state
+               SET last_error_code=?, last_error_detail=?, updated_at=?
+               WHERE info_hash=?''',
+            (str(error_code or '')[:64], str(error_detail or '')[:500], now, ih)
+        )
+        c.commit()
+        self._wild_intake_record_action(ih, 'failed', actor_uid, actor_uname, str(error_code or '')[:64])
+
+    def _wild_intake_state_upsert(self, c, info_hash: str, actor_uid: int, actor_username: str) -> dict | None:
+        ih = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return None
+        now = self._ts()
+        state = c.execute(
+            'SELECT * FROM wild_intake_hash_state WHERE info_hash=?',
+            (ih,)
+        ).fetchone()
+        if state:
+            return dict(state)
+        t = c.execute(
+            'SELECT name,registered_at FROM torrents WHERE info_hash=?',
+            (ih,)
+        ).fetchone()
+        added_name = str(t['name'] or '')[:500] if t else ''
+        added_at = str(t['registered_at'] or now) if t else now
+        c.execute(
+            '''INSERT INTO wild_intake_hash_state
+               (info_hash,status,attempts,first_seen_at,last_seen_at,updated_at,
+                added_at,added_name,added_by_user_id,added_by_username)
+               VALUES (?,?,?,?,?,?,?,?,?,?)''',
+            (ih, 'allowed', 0, now, now, now, added_at, added_name,
+             actor_uid if actor_uid > 0 else None, str(actor_username or '')[:64])
+        )
+        row = c.execute('SELECT * FROM wild_intake_hash_state WHERE info_hash=?', (ih,)).fetchone()
+        return dict(row) if row else None
+
+    def list_wild_intake_reports(self, limit: int = 50, offset: int = 0,
+                                 q_status: str = '', q_search: str = '') -> tuple[list, int]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        status = (q_status or '').strip().lower()
+        if status in ('suppressed', 'allowed'):
+            clauses.append('s.status=?')
+            params.append(status)
+        q = (q_search or '').strip()
+        if q:
+            q_like = f'%{q}%'
+            q_ih = f'%{q.upper()}%'
+            clauses.append(
+                "(s.info_hash LIKE ? OR s.added_name LIKE ? OR COALESCE(t.name,'') LIKE ? OR COALESCE(s.suppress_reason,'') LIKE ?)"
+            )
+            params.extend([q_ih, q_like, q_like, q_like])
+        where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        rows = self._conn().execute(
+            '''SELECT s.*,
+                      t.name AS torrent_name,
+                      t.ingestion_source AS torrent_ingestion_source
+               FROM wild_intake_hash_state s
+               LEFT JOIN torrents t ON t.info_hash=s.info_hash
+               ''' + where + '''
+               ORDER BY COALESCE(s.added_at, s.updated_at, s.first_seen_at) DESC, s.id DESC
+               LIMIT ? OFFSET ?''',
+            params + [int(limit), int(offset)]
+        ).fetchall()
+        total = self._conn().execute(
+            '''SELECT COUNT(*)
+               FROM wild_intake_hash_state s
+               LEFT JOIN torrents t ON t.info_hash=s.info_hash
+            ''' + where,
+            params
+        ).fetchone()[0]
+        return [dict(r) for r in rows], int(total)
+
+    def get_wild_intake_report(self, info_hash: str):
+        ih = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return None
+        row = self._conn().execute(
+            '''SELECT s.*,
+                      t.name AS torrent_name,
+                      t.registered_at AS torrent_registered_at,
+                      t.ingestion_source AS torrent_ingestion_source,
+                      t.uploaded_by_id AS torrent_owner_user_id,
+                      t.uploaded_by_username AS torrent_owner_username
+               FROM wild_intake_hash_state s
+               LEFT JOIN torrents t ON t.info_hash=s.info_hash
+               WHERE s.info_hash=?''',
+            (ih,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_wild_intake_actions(self, info_hash: str, limit: int = 300) -> list:
+        ih = (info_hash or '').strip().upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return []
+        rows = self._conn().execute(
+            '''SELECT a.*, u.username AS actor_username_current
+               FROM wild_intake_actions a
+               LEFT JOIN users u ON u.id=a.actor_user_id
+               WHERE a.info_hash=?
+               ORDER BY a.id DESC LIMIT ?''',
+            (ih, int(limit))
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def apply_wild_intake_action(self, info_hash: str, actor_user_id: int,
+                                 actor_username: str, action: str,
+                                 note: str = '', reason: str = '') -> tuple[bool, str]:
+        ih = (info_hash or '').strip().upper()
+        uid = int(actor_user_id or 0)
+        actor = str(actor_username or '')[:64]
+        act = (action or '').strip().lower()
+        # Legacy compatibility: plain suppress now means delete+suppress.
+        if act == 'suppress':
+            act = 'delete_suppress'
+        clean_note = (note or '').strip()[:500]
+        clean_reason = (reason or '').strip()[:240]
+        if uid <= 0:
+            return False, 'Invalid actor.'
+        if not re.fullmatch(r'[A-F0-9]{40}', ih):
+            return False, 'Invalid info hash.'
+        if act not in ('allow', 'note', 'delete_suppress'):
+            return False, 'Invalid action.'
+        c = self._conn()
+        now = self._ts()
+        for attempt in range(8):
+            try:
+                c.execute('BEGIN IMMEDIATE')
+                state = self._wild_intake_state_upsert(c, ih, uid, actor)
+                if not state:
+                    c.execute('ROLLBACK')
+                    return False, 'Wild intake state not found.'
+                old_status = str(state.get('status') or 'allowed')
+                new_status = old_status
+                action_note = clean_note
+                action_type = act
+                if act == 'note':
+                    if not clean_note:
+                        c.execute('ROLLBACK')
+                        return False, 'Note is required.'
+                    c.execute('UPDATE wild_intake_hash_state SET updated_at=? WHERE info_hash=?', (now, ih))
+                elif act == 'delete_suppress':
+                    new_status = 'suppressed'
+                    c.execute('DELETE FROM comments WHERE info_hash=?', (ih,))
+                    c.execute('DELETE FROM notifications WHERE info_hash=?', (ih,))
+                    c.execute('DELETE FROM torrent_votes WHERE info_hash=?', (ih,))
+                    c.execute('DELETE FROM torrent_report_actions WHERE report_id IN (SELECT id FROM torrent_reports WHERE info_hash=?)', (ih,))
+                    c.execute('DELETE FROM torrent_reports WHERE info_hash=?', (ih,))
+                    c.execute('DELETE FROM torrents WHERE info_hash=?', (ih,))
+                    action_type = 'delete_suppress'
+                    c.execute(
+                        '''UPDATE wild_intake_hash_state
+                           SET status='suppressed',
+                               suppressed_at=COALESCE(suppressed_at, ?),
+                               suppressed_by_user_id=?,
+                               suppressed_by_username=?,
+                               suppress_reason=CASE WHEN ?<>'' THEN ? ELSE suppress_reason END,
+                               updated_at=?
+                           WHERE info_hash=?''',
+                        (now, uid, actor, clean_reason, clean_reason, now, ih)
+                    )
+                    if clean_reason:
+                        action_note = clean_reason
+                elif act == 'allow':
+                    new_status = 'allowed'
+                    c.execute(
+                        '''UPDATE wild_intake_hash_state
+                           SET status='allowed', updated_at=?
+                           WHERE info_hash=?''',
+                        (now, ih)
+                    )
+                    if clean_reason:
+                        action_note = clean_reason
+                # history
+                state_after = c.execute('SELECT id FROM wild_intake_hash_state WHERE info_hash=?', (ih,)).fetchone()
+                state_id = int(state_after['id']) if state_after else int(state.get('id') or 0)
+                c.execute(
+                    '''INSERT INTO wild_intake_actions
+                       (wild_state_id, info_hash, action, actor_user_id, actor_username, note, created_at)
+                       VALUES (?,?,?,?,?,?,?)''',
+                    (state_id, ih, action_type[:40], uid, actor, action_note[:500], now)
+                )
+                c.execute(
+                    'INSERT INTO events (timestamp,actor,action,target,detail) VALUES (?,?,?,?,?)',
+                    (now, actor, 'wild_intake_action', ih, f'action={action_type} from={old_status} to={new_status} reason={clean_reason[:120]}')
+                )
+                c.execute('COMMIT')
+                return True, 'Wild intake updated.'
+            except sqlite3.OperationalError as e:
+                self._rollback_quiet()
+                if 'locked' in str(e).lower() and attempt < 7:
+                    time.sleep(0.08 * (attempt + 1))
+                    continue
+                if 'locked' in str(e).lower():
+                    return False, 'Database is busy, please retry this action.'
+                raise
+        return False, 'Database is busy, please retry this action.'
 
     def list_stale_magnet_jobs(self, statuses: tuple[str, ...], older_than_sec: int) -> list:
         if not statuses:
@@ -5904,6 +6506,56 @@ class RegistrationDB:
             return True, 'Unfollowed.'
         return False, 'Not currently following.'
 
+    def is_uploader_blocked(self, blocker_user_id: int, blocked_user_id: int) -> bool:
+        if blocker_user_id == blocked_user_id:
+            return False
+        row = self._conn().execute(
+            'SELECT 1 FROM user_uploader_blocks WHERE blocker_user_id=? AND blocked_user_id=?',
+            (int(blocker_user_id), int(blocked_user_id))
+        ).fetchone()
+        return row is not None
+
+    def block_uploader(self, blocker_user_id: int, blocked_user_id: int) -> tuple[bool, str]:
+        if blocker_user_id == blocked_user_id:
+            return False, 'You cannot block yourself.'
+        c = self._conn()
+        blocker = c.execute('SELECT id FROM users WHERE id=?', (int(blocker_user_id),)).fetchone()
+        blocked = c.execute('SELECT id,is_disabled FROM users WHERE id=?', (int(blocked_user_id),)).fetchone()
+        if not blocker or not blocked:
+            return False, 'User not found.'
+        if int(blocked['is_disabled'] or 0) == 1:
+            return False, 'Cannot block a disabled account.'
+        try:
+            c.execute(
+                'INSERT INTO user_uploader_blocks (blocker_user_id, blocked_user_id, created_at) VALUES (?,?,?)',
+                (int(blocker_user_id), int(blocked_user_id), self._ts())
+            )
+            c.commit()
+            return True, 'Uploader blocked.'
+        except sqlite3.IntegrityError:
+            self._rollback_quiet(c)
+            return False, 'Uploader already blocked.'
+
+    def unblock_uploader(self, blocker_user_id: int, blocked_user_id: int) -> tuple[bool, str]:
+        c = self._conn()
+        cur = c.execute(
+            'DELETE FROM user_uploader_blocks WHERE blocker_user_id=? AND blocked_user_id=?',
+            (int(blocker_user_id), int(blocked_user_id))
+        )
+        c.commit()
+        if int(cur.rowcount or 0) > 0:
+            return True, 'Uploader unblocked.'
+        return False, 'Uploader was not blocked.'
+
+    def list_blocked_uploaders(self, blocker_user_id: int, limit: int = 500) -> list:
+        return self._conn().execute(
+            'SELECT u.id,u.username,u.is_admin,u.is_standard,u.is_disabled,b.created_at AS blocked_at '
+            'FROM user_uploader_blocks b JOIN users u ON u.id=b.blocked_user_id '
+            'WHERE b.blocker_user_id=? '
+            'ORDER BY b.id DESC LIMIT ?',
+            (int(blocker_user_id), int(limit))
+        ).fetchall()
+
     def count_followers(self, user_id: int) -> int:
         return int(self._conn().execute(
             'SELECT COUNT(*) FROM user_follows WHERE followed_user_id=?',
@@ -5960,6 +6612,11 @@ class RegistrationDB:
             ' OR followed_user_id IN (SELECT id FROM users WHERE username != ?)',
             (except_username, except_username)
         )
+        self._conn().execute(
+            'DELETE FROM user_uploader_blocks WHERE blocker_user_id IN (SELECT id FROM users WHERE username != ?)'
+            ' OR blocked_user_id IN (SELECT id FROM users WHERE username != ?)',
+            (except_username, except_username)
+        )
         self._conn().execute('DELETE FROM users WHERE username != ?', (except_username,))
         self._conn().commit()
         self._log(actor, 'delete_all_users', 'ALL',
@@ -5977,6 +6634,11 @@ class RegistrationDB:
             ' OR followed_user_id IN (SELECT id FROM users WHERE username=?)',
             (username, username)
         )
+        self._conn().execute(
+            'DELETE FROM user_uploader_blocks WHERE blocker_user_id IN (SELECT id FROM users WHERE username=?)'
+            ' OR blocked_user_id IN (SELECT id FROM users WHERE username=?)',
+            (username, username)
+        )
         self._conn().execute('DELETE FROM users WHERE username=?', (username,))
         self._conn().commit()
         self._log(actor, 'delete_user', username)
@@ -5984,20 +6646,30 @@ class RegistrationDB:
     # ── Torrents ───────────────────────────────────────────────
 
     def register_torrent(self, ih: str, name: str, total_size: int,
-                         user_id: int, username: str, meta: dict | None = None) -> bool:
+                         user_id: int, username: str, meta: dict | None = None,
+                         ingestion_source: str = 'upload',
+                         ingested_by_user_id: int | None = None,
+                         ingested_by_username: str = '') -> bool:
         meta = meta or {}
+        source = str(ingestion_source or 'upload').strip().lower()
+        if source not in ('upload', 'magnet_user', 'wild_intake'):
+            source = 'upload'
+        iby_uid = int(ingested_by_user_id) if ingested_by_user_id is not None else int(user_id or 0)
+        iby_uname = (str(ingested_by_username or '') or str(username or '')).strip()[:64]
         for attempt in range(10):
             try:
                 self._conn().execute(
                     'INSERT INTO torrents '
                     '(info_hash,name,total_size,uploaded_by_id,uploaded_by_username,registered_at,'
-                    'piece_count,piece_length,is_private,is_multifile,files_json) '
-                    'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                    'piece_count,piece_length,is_private,is_multifile,files_json,'
+                    'ingestion_source,ingested_by_id,ingested_by_username) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (ih.upper(), name, total_size, user_id, username, self._ts(),
                      meta.get('piece_count', 0), meta.get('piece_length', 0),
                      1 if meta.get('private') else 0,
                      1 if meta.get('is_multifile') else 0,
-                     meta.get('files', '[]'))
+                     meta.get('files', '[]'),
+                     source, iby_uid if iby_uid > 0 else None, iby_uname)
                 )
                 self._conn().commit()
                 try:
@@ -6649,6 +7321,29 @@ class RegistrationDB:
                                           MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY, 1, 50),
             'job_timeout_sec': _to_int('magnet_submission_job_timeout_sec',
                                        MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS, 30, 1800),
+        }
+
+    def get_wild_intake_config(self) -> dict:
+        settings = self.get_all_settings()
+
+        def _to_int(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                return max(lo, min(hi, int(settings.get(key, str(default)) or default)))
+            except Exception:
+                return default
+
+        owner_user = (settings.get('wild_intake_owner_user', 'wildkat-bot') or 'wildkat-bot').strip()
+        return {
+            'enabled': settings.get('wild_intake_enabled', '0') == '1',
+            'owner_user': owner_user[:64],
+            'worker_concurrency': _to_int('wild_intake_worker_concurrency',
+                                          WILD_INTAKE_DEFAULT_WORKER_CONCURRENCY, 1, 50),
+            'max_queue': _to_int('wild_intake_max_queue',
+                                 WILD_INTAKE_DEFAULT_MAX_QUEUE, 1, 500),
+            'retry_base_sec': _to_int('wild_intake_retry_base_sec',
+                                      WILD_INTAKE_DEFAULT_RETRY_BASE_SECONDS, 60, 86400),
+            'retry_max_sec': _to_int('wild_intake_retry_max_sec',
+                                     WILD_INTAKE_DEFAULT_RETRY_MAX_SECONDS, 3600, 1209600),
         }
 
     def get_torrent_srrdb_cache(self, info_hash: str):
@@ -8662,6 +9357,7 @@ class RegistrationDB:
                       ru.username AS reporter_username,
                       au.username AS assigned_username,
                       t.name AS torrent_name,
+                      t.ingestion_source AS torrent_ingestion_source,
                       t.uploaded_by_id AS owner_user_id,
                       t.uploaded_by_username AS owner_username
                FROM torrent_reports r
@@ -9542,17 +10238,36 @@ class RegistrationDB:
             return '', []
         return ' AND '.join(clauses), params
 
+    @staticmethod
+    def _exclude_uploader_clause(exclude_uploader_ids: list[int] | None,
+                                 column_expr: str = 'uploaded_by_id') -> tuple[str, list[int]]:
+        ids: list[int] = []
+        for raw in (exclude_uploader_ids or []):
+            try:
+                v = int(raw)
+            except Exception:
+                continue
+            if v > 0 and v not in ids:
+                ids.append(v)
+        if not ids:
+            return '', []
+        placeholders = ','.join('?' for _ in ids)
+        return f' AND COALESCE({column_expr},0) NOT IN ({placeholders})', ids
+
     def search_torrents(self, query: str, user_id: int | None = None,
                         page: int = 1, per_page: int = 50,
-                        facets: dict[str, str] | None = None) -> list:
+                        facets: dict[str, str] | None = None,
+                        exclude_uploader_ids: list[int] | None = None) -> list:
         mode, value = self._parse_special_torrent_search(query)
         where, params = self._build_search_clauses(query)
         facet_sql, facet_params = self._facet_clauses(facets, table_alias='t')
         facet_sql_plain, facet_params_plain = self._facet_clauses(facets, table_alias='')
+        exclude_t_sql, exclude_t_params = self._exclude_uploader_clause(exclude_uploader_ids, 't.uploaded_by_id')
+        exclude_plain_sql, exclude_plain_params = self._exclude_uploader_clause(exclude_uploader_ids, 'uploaded_by_id')
         offset = (max(1, page) - 1) * per_page
         if mode == 'imdb':
             if user_id is None:
-                tail = (f' AND {facet_sql}' if facet_sql else '')
+                tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
                 return self._conn().execute(
                     '''SELECT t.* FROM torrents t
                        JOIN torrent_metadata_links l
@@ -9560,7 +10275,7 @@ class RegistrationDB:
                       WHERE l.status='active' AND l.provider='imdb' AND LOWER(l.external_id)=?
                       ''' + tail + '''
                       ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                    (value, *facet_params, per_page, offset)
+                    (value, *facet_params, *exclude_t_params, per_page, offset)
                 ).fetchall()
             tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
@@ -9575,7 +10290,7 @@ class RegistrationDB:
             ).fetchall()
         if mode == 'tvmaze':
             if user_id is None:
-                tail = (f' AND {facet_sql}' if facet_sql else '')
+                tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
                 return self._conn().execute(
                     '''SELECT t.* FROM torrents t
                        JOIN torrent_metadata_links l
@@ -9583,7 +10298,7 @@ class RegistrationDB:
                       WHERE l.status='active' AND l.provider='tvmaze' AND l.external_id=?
                       ''' + tail + '''
                       ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                    (value, *facet_params, per_page, offset)
+                    (value, *facet_params, *exclude_t_params, per_page, offset)
                 ).fetchall()
             tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
@@ -9598,7 +10313,7 @@ class RegistrationDB:
             ).fetchall()
         if mode == 'steam':
             if user_id is None:
-                tail = (f' AND {facet_sql}' if facet_sql else '')
+                tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
                 return self._conn().execute(
                     '''SELECT t.* FROM torrents t
                        JOIN torrent_metadata_links l
@@ -9606,7 +10321,7 @@ class RegistrationDB:
                       WHERE l.status='active' AND l.provider='steam' AND l.external_id=?
                       ''' + tail + '''
                       ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                    (value, *facet_params, per_page, offset)
+                    (value, *facet_params, *exclude_t_params, per_page, offset)
                 ).fetchall()
             tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
@@ -9620,12 +10335,12 @@ class RegistrationDB:
                 (user_id, value, *facet_params, per_page, offset)
             ).fetchall()
         if user_id is None:
-            facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
+            facet_tail = (f' AND ({facet_sql_plain})' if facet_sql_plain else '') + exclude_plain_sql
             return self._conn().execute(
                 f'SELECT * FROM torrents WHERE {where} '
                 f'{facet_tail} '
                 'ORDER BY registered_at DESC LIMIT ? OFFSET ?',
-                (*params, *facet_params_plain, per_page, offset)
+                (*params, *facet_params_plain, *exclude_plain_params, per_page, offset)
             ).fetchall()
         facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
         return self._conn().execute(
@@ -9636,20 +10351,23 @@ class RegistrationDB:
         ).fetchall()
 
     def count_search_torrents(self, query: str, user_id: int | None = None,
-                              facets: dict[str, str] | None = None) -> int:
+                              facets: dict[str, str] | None = None,
+                              exclude_uploader_ids: list[int] | None = None) -> int:
         mode, value = self._parse_special_torrent_search(query)
         where, params = self._build_search_clauses(query)
         facet_sql, facet_params = self._facet_clauses(facets, table_alias='t')
         facet_sql_plain, facet_params_plain = self._facet_clauses(facets, table_alias='')
+        exclude_t_sql, exclude_t_params = self._exclude_uploader_clause(exclude_uploader_ids, 't.uploaded_by_id')
+        exclude_plain_sql, exclude_plain_params = self._exclude_uploader_clause(exclude_uploader_ids, 'uploaded_by_id')
         if mode == 'imdb':
             if user_id is None:
-                tail = (f' AND {facet_sql}' if facet_sql else '')
+                tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
                 return self._conn().execute(
                     '''SELECT COUNT(*) FROM torrents t
                        JOIN torrent_metadata_links l
                          ON l.info_hash=t.info_hash
                       WHERE l.status='active' AND l.provider='imdb' AND LOWER(l.external_id)=?''' + tail,
-                    (value, *facet_params)
+                    (value, *facet_params, *exclude_t_params)
                 ).fetchone()[0]
             tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
@@ -9662,13 +10380,13 @@ class RegistrationDB:
             ).fetchone()[0]
         if mode == 'tvmaze':
             if user_id is None:
-                tail = (f' AND {facet_sql}' if facet_sql else '')
+                tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
                 return self._conn().execute(
                     '''SELECT COUNT(*) FROM torrents t
                        JOIN torrent_metadata_links l
                          ON l.info_hash=t.info_hash
                       WHERE l.status='active' AND l.provider='tvmaze' AND l.external_id=?''' + tail,
-                    (value, *facet_params)
+                    (value, *facet_params, *exclude_t_params)
                 ).fetchone()[0]
             tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
@@ -9681,13 +10399,13 @@ class RegistrationDB:
             ).fetchone()[0]
         if mode == 'steam':
             if user_id is None:
-                tail = (f' AND {facet_sql}' if facet_sql else '')
+                tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
                 return self._conn().execute(
                     '''SELECT COUNT(*) FROM torrents t
                        JOIN torrent_metadata_links l
                          ON l.info_hash=t.info_hash
                       WHERE l.status='active' AND l.provider='steam' AND l.external_id=?''' + tail,
-                    (value, *facet_params)
+                    (value, *facet_params, *exclude_t_params)
                 ).fetchone()[0]
             tail = (f' AND {facet_sql}' if facet_sql else '')
             return self._conn().execute(
@@ -9699,10 +10417,10 @@ class RegistrationDB:
                 (user_id, value, *facet_params)
             ).fetchone()[0]
         if user_id is None:
-            facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
+            facet_tail = (f' AND ({facet_sql_plain})' if facet_sql_plain else '') + exclude_plain_sql
             return self._conn().execute(
                 f'SELECT COUNT(*) FROM torrents WHERE {where}{facet_tail}',
-                (*params, *facet_params_plain)
+                (*params, *facet_params_plain, *exclude_plain_params)
             ).fetchone()[0]
         facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
         return self._conn().execute(
@@ -9711,13 +10429,21 @@ class RegistrationDB:
         ).fetchone()[0]
 
     def count_torrents(self, user_id: int | None = None,
-                       facets: dict[str, str] | None = None) -> int:
+                       facets: dict[str, str] | None = None,
+                       exclude_uploader_ids: list[int] | None = None) -> int:
         facet_sql, facet_params = self._facet_clauses(facets, table_alias='')
+        exclude_sql, exclude_params = self._exclude_uploader_clause(exclude_uploader_ids, 'uploaded_by_id')
         if user_id is None:
+            where_parts: list[str] = []
             if facet_sql:
+                where_parts.append(f'({facet_sql})')
+            if exclude_sql:
+                where_parts.append(exclude_sql[5:])  # strip leading " AND "
+            if where_parts:
+                where = ' WHERE ' + ' AND '.join(where_parts)
                 return self._conn().execute(
-                    f'SELECT COUNT(*) FROM torrents WHERE {facet_sql}',
-                    facet_params
+                    f'SELECT COUNT(*) FROM torrents{where}',
+                    (*facet_params, *exclude_params)
                 ).fetchone()[0]
             return self._conn().execute('SELECT COUNT(*) FROM torrents').fetchone()[0]
         if facet_sql:
@@ -9731,15 +10457,23 @@ class RegistrationDB:
 
     def list_torrents(self, user_id: int | None = None,
                       page: int = 1, per_page: int = 0,
-                      facets: dict[str, str] | None = None) -> list:
+                      facets: dict[str, str] | None = None,
+                      exclude_uploader_ids: list[int] | None = None) -> list:
         """Return torrents. per_page=0 means no pagination (all rows)."""
         facet_sql, facet_params = self._facet_clauses(facets, table_alias='')
+        exclude_sql, exclude_params = self._exclude_uploader_clause(exclude_uploader_ids, 'uploaded_by_id')
         if per_page <= 0:
             if user_id is None:
-                if facet_sql:
+                if facet_sql or exclude_sql:
+                    where_parts: list[str] = []
+                    if facet_sql:
+                        where_parts.append(f'({facet_sql})')
+                    if exclude_sql:
+                        where_parts.append(exclude_sql[5:])  # strip leading " AND "
+                    where = ' AND '.join(where_parts)
                     return self._conn().execute(
-                        f'SELECT * FROM torrents WHERE {facet_sql} ORDER BY registered_at DESC',
-                        facet_params
+                        f'SELECT * FROM torrents WHERE {where} ORDER BY registered_at DESC',
+                        (*facet_params, *exclude_params)
                     ).fetchall()
                 return self._conn().execute(
                     'SELECT * FROM torrents ORDER BY registered_at DESC'
@@ -9755,10 +10489,16 @@ class RegistrationDB:
             ).fetchall()
         offset = (max(1, page) - 1) * per_page
         if user_id is None:
-            if facet_sql:
+            if facet_sql or exclude_sql:
+                where_parts: list[str] = []
+                if facet_sql:
+                    where_parts.append(f'({facet_sql})')
+                if exclude_sql:
+                    where_parts.append(exclude_sql[5:])  # strip leading " AND "
+                where = ' AND '.join(where_parts)
                 return self._conn().execute(
-                    f'SELECT * FROM torrents WHERE {facet_sql} ORDER BY registered_at DESC LIMIT ? OFFSET ?',
-                    (*facet_params, per_page, offset)
+                    f'SELECT * FROM torrents WHERE {where} ORDER BY registered_at DESC LIMIT ? OFFSET ?',
+                    (*facet_params, *exclude_params, per_page, offset)
                 ).fetchall()
             return self._conn().execute(
                 'SELECT * FROM torrents ORDER BY registered_at DESC LIMIT ? OFFSET ?',
@@ -11729,8 +12469,19 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
             self._send_bencode(200, {b'failure reason': b'missing or invalid info_hash'})
             return
         if REGISTRATION_MODE and REGISTRATION_DB is not None:
-            if not OPEN_TRACKER and \
-                    not REGISTRATION_DB.is_registered(raw_ih.hex().upper()):
+            ih_hex = raw_ih.hex().upper()
+            is_reg = REGISTRATION_DB.is_registered(ih_hex)
+            if not is_reg:
+                try:
+                    REGISTRATION_DB.submit_wild_intake_job(
+                        ih_hex,
+                        requested_by_type='announce',
+                        requested_by_value=str(self.client_address[0] if self.client_address else '')
+                    )
+                    _start_magnet_workers()
+                except Exception as e:
+                    log.debug('wild intake enqueue skipped (non-fatal): ih=%s err=%s', ih_hex, e)
+            if not OPEN_TRACKER and not is_reg:
                 self._send_bencode(200, {b'failure reason': b'torrent not registered'})
                 return
 
@@ -12078,8 +12829,18 @@ def _handle_udp_packet(sock: socket.socket, data: bytes, addr):
             ih_hex = ih_bytes.hex().upper()
 
             if REGISTRATION_MODE and REGISTRATION_DB is not None:
-                if not OPEN_TRACKER and \
-                        not REGISTRATION_DB.is_registered(ih_hex):
+                is_reg = REGISTRATION_DB.is_registered(ih_hex)
+                if not is_reg:
+                    try:
+                        REGISTRATION_DB.submit_wild_intake_job(
+                            ih_hex,
+                            requested_by_type='announce',
+                            requested_by_value=str(client_ip or '')
+                        )
+                        _start_magnet_workers()
+                    except Exception as e:
+                        log.debug('wild intake enqueue skipped (non-fatal): ih=%s err=%s', ih_hex, e)
+                if not OPEN_TRACKER and not is_reg:
                     _udp_send_error(sock, addr, transaction_id, b'torrent not registered')
                     return
 
@@ -13603,10 +14364,18 @@ def _register_single_torrent_blob_from_magnet(job: dict, torrent_blob: bytes) ->
         normalized_name = (name or '').strip()
     actor_uid = int(job.get('submitted_by_user_id') or 0)
     actor_name = str(job.get('submitted_by_username') or 'system')
+    source = str(job.get('submission_source') or 'user').strip().lower()
+    if source == 'wild_intake':
+        ingestion_source = 'wild_intake'
+    else:
+        ingestion_source = 'magnet_user'
     if REGISTRATION_DB.get_torrent(ih):
         return False, 'Torrent already registered (duplicate info hash).', ih, normalized_name
     ok_reg = REGISTRATION_DB.register_torrent(
-        ih, normalized_name, total_size, actor_uid, actor_name, meta=meta
+        ih, normalized_name, total_size, actor_uid, actor_name, meta=meta,
+        ingestion_source=ingestion_source,
+        ingested_by_user_id=actor_uid,
+        ingested_by_username=actor_name
     )
     if not ok_reg:
         return False, 'Torrent already registered (duplicate info hash).', ih, normalized_name
@@ -13785,6 +14554,7 @@ def _magnet_worker():
             job_id = int(job.get('id') or 0)
             actor_uid = int(job.get('submitted_by_user_id') or 0)
             actor_name = str(job.get('submitted_by_username') or 'system')
+            submission_source = str(job.get('submission_source') or 'user').strip().lower()
             ok, result = _run_magnet_job(job)
             work_dir = str(result.get('work_dir') or job.get('working_dir') or '')
             cleanup_ok = _cleanup_magnet_job_dir(work_dir)
@@ -13799,7 +14569,10 @@ def _magnet_worker():
                     result_torrent_url=turl,
                     cleanup_done=cleanup_ok
                 )
-                if actor_uid > 0:
+                REGISTRATION_DB.handle_wild_intake_job_result(
+                    job_id, True, info_hash=ih, torrent_name=tname
+                )
+                if actor_uid > 0 and submission_source != 'wild_intake':
                     REGISTRATION_DB.notify_magnet_job_success(actor_uid, 'system', ih, tname, job_id)
             else:
                 code = str(result.get('error_code') or 'failed')
@@ -13811,7 +14584,11 @@ def _magnet_worker():
                     error_detail=detail,
                     cleanup_done=cleanup_ok
                 )
-                if actor_uid > 0:
+                REGISTRATION_DB.handle_wild_intake_job_result(
+                    job_id, False, info_hash=str(job.get('info_hash') or ''),
+                    error_code=code, error_detail=detail
+                )
+                if actor_uid > 0 and submission_source != 'wild_intake':
                     REGISTRATION_DB.notify_magnet_job_failure(
                         actor_uid, 'system', job_id, detail, str(job.get('info_hash') or '')
                     )
@@ -13826,7 +14603,10 @@ def _start_magnet_workers():
         return
     with MAGNET_WORKERS_LOCK:
         cfg = REGISTRATION_DB.get_magnet_submission_config()
-        target_workers = max(1, int(cfg.get('worker_concurrency') or MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY))
+        wild_cfg = REGISTRATION_DB.get_wild_intake_config()
+        magnet_workers = int(cfg.get('worker_concurrency') or MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY)
+        wild_workers = int(wild_cfg.get('worker_concurrency') or WILD_INTAKE_DEFAULT_WORKER_CONCURRENCY) if wild_cfg.get('enabled') else 0
+        target_workers = max(1, magnet_workers, wild_workers)
         current_workers = len(MAGNET_WORKER_THREADS)
         if MAGNET_WORKERS_STARTED and current_workers >= target_workers:
             return
@@ -14351,12 +15131,16 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._get_dashboard()
         elif path == '/manage/admin':
             self._get_admin()
+        elif path == '/manage/admin/wild-intake':
+            self._redirect('/manage/admin?tab=wild-intake')
         elif path.startswith('/manage/admin/event/'):
             self._get_admin_event_detail(path[len('/manage/admin/event/'):])
         elif path.startswith('/manage/admin/security/event/'):
             self._get_admin_security_event_detail(path[len('/manage/admin/security/event/'):])
         elif path.startswith('/manage/admin/report/'):
             self._get_admin_report_detail(path[len('/manage/admin/report/'):])
+        elif path.startswith('/manage/admin/wild-intake/'):
+            self._get_admin_wild_intake_detail(path[len('/manage/admin/wild-intake/'):])
         elif path == '/manage/password':
             self._get_password_page()
         elif path.startswith('/manage/admin/set-password/'):
@@ -14665,6 +15449,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_admin_security_action()
         elif path == '/manage/admin/report/action':
             self._post_admin_report_action()
+        elif path == '/manage/admin/wild-intake/action':
+            self._post_admin_wild_intake_action()
         elif path == '/manage/admin/save-settings':
             self._post_save_settings()
         elif path == '/manage/comment/post':
@@ -14745,6 +15531,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             self._post_follow()
         elif path == '/manage/unfollow':
             self._post_unfollow()
+        elif path == '/manage/block-uploader':
+            self._post_block_uploader()
+        elif path == '/manage/unblock-uploader':
+            self._post_unblock_uploader()
         elif path == '/manage/topup/create':
             self._post_topup_create()
         elif path == '/manage/admin/topup/reconcile':
@@ -14782,8 +15572,18 @@ class ManageHandler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         facets = _parse_torrent_facets_from_qs(qs)
         uid      = None if role in ('super', 'admin', 'editor', 'standard') else user['id']
-        total    = REGISTRATION_DB.count_torrents(user_id=uid, facets=facets)
-        torrents = REGISTRATION_DB.list_torrents(user_id=uid, page=page, per_page=per_page, facets=facets)
+        blocked_ids: list[int] = []
+        if role not in ('super', 'admin'):
+            blocked_rows = REGISTRATION_DB.list_blocked_uploaders(int(user['id']), limit=1000)
+            blocked_ids = [int(r['id']) for r in blocked_rows if int(r['id'] or 0) > 0]
+        total = REGISTRATION_DB.count_torrents(
+            user_id=uid, facets=facets,
+            exclude_uploader_ids=blocked_ids if uid is None else None
+        )
+        torrents = REGISTRATION_DB.list_torrents(
+            user_id=uid, page=page, per_page=per_page, facets=facets,
+            exclude_uploader_ids=blocked_ids if uid is None else None
+        )
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
         msg = urllib.parse.unquote(qs.get('msg', [''])[0])
@@ -14920,6 +15720,26 @@ class ManageHandler(BaseHTTPRequestHandler):
                 q_info_hash=r_info_hash,
                 q_owner=r_owner,
             )
+        # wild intake reports pagination + search
+        wpage = _get_named_page_param(self.path, 'wpage')
+        wild_pp = 50
+        w_status = qs.get('wstatus', [''])[0].strip().lower()
+        w_query = qs.get('wq', [''])[0].strip()
+        wild_reports, wild_total = REGISTRATION_DB.list_wild_intake_reports(
+            limit=wild_pp,
+            offset=(wpage - 1) * wild_pp,
+            q_status=w_status,
+            q_search=w_query,
+        )
+        wild_total_pages = max(1, (wild_total + wild_pp - 1) // wild_pp)
+        if wpage > wild_total_pages:
+            wpage = wild_total_pages
+            wild_reports, wild_total = REGISTRATION_DB.list_wild_intake_reports(
+                limit=wild_pp,
+                offset=(wpage - 1) * wild_pp,
+                q_status=w_status,
+                q_search=w_query,
+            )
         trackers     = REGISTRATION_DB.list_magnet_trackers()
         settings     = REGISTRATION_DB.get_all_settings()
         msg      = urllib.parse.unquote(qs.get('msg',      [''])[0])
@@ -14936,6 +15756,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             elif (qs.get('rstatus', [''])[0] or qs.get('rseverity', [''])[0] or qs.get('rreason', [''])[0]
                   or qs.get('rreporter', [''])[0] or qs.get('rih', [''])[0] or qs.get('rowner', [''])[0]):
                 tab = 'reports'
+            elif qs.get('wstatus', [''])[0] or qs.get('wq', [''])[0]:
+                tab = 'wild-intake'
         self._send_html(_render_admin(user, all_torrents, all_users, events, trackers, settings,
                                       page=page, total_pages=total_pages, total=total,
                                       upage=upage, utotal_pages=utotal_pages, utotal=utotal,
@@ -14967,7 +15789,14 @@ class ManageHandler(BaseHTTPRequestHandler):
                                       rreason=r_reason,
                                       rreporter=r_reporter,
                                       rih=r_info_hash,
-                                      rowner=r_owner))
+                                      rowner=r_owner,
+                                      wild_reports=wild_reports,
+                                      wpage=wpage,
+                                      wild_total_pages=wild_total_pages,
+                                      wild_total=wild_total,
+                                      wild_pp=wild_pp,
+                                      wstatus=w_status,
+                                      wq=w_query))
 
     def _get_admin_event_detail(self, event_id_raw: str):
         user = self._get_session_user()
@@ -15058,6 +15887,32 @@ class ManageHandler(BaseHTTPRequestHandler):
         self._send_html(_render_admin_report_detail(
             user, report, actions, moderators, back_url=back, msg=msg, msg_type=msg_type,
             csrf_token=active_csrf
+        ))
+
+    def _get_admin_wild_intake_detail(self, info_hash_raw: str):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        role = _user_role(user)
+        if role not in ('super', 'admin'):
+            return self._redirect('/manage/dashboard')
+        info_hash = (info_hash_raw or '').strip('/').upper()
+        if not re.fullmatch(r'[A-F0-9]{40}', info_hash):
+            return self._redirect('/manage/admin?tab=wild-intake&msg=Invalid+info+hash.&msg_type=error')
+        report = REGISTRATION_DB.get_wild_intake_report(info_hash)
+        if not report:
+            return self._redirect('/manage/admin?tab=wild-intake&msg=Wild+intake+record+not+found.&msg_type=error')
+        actions = REGISTRATION_DB.list_wild_intake_actions(info_hash, limit=400)
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        back = urllib.parse.unquote(qs.get('back', [''])[0]).strip()
+        if not back.startswith('/manage/admin'):
+            back = '/manage/admin?tab=wild-intake'
+        msg = urllib.parse.unquote(qs.get('msg', [''])[0])
+        msg_type = qs.get('msg_type', ['error'])[0]
+        active_token = self._current_valid_session_token()
+        active_csrf = _csrf_token(active_token) if active_token else ''
+        self._send_html(_render_admin_wild_intake_detail(
+            user, report, actions, back_url=back, msg=msg, msg_type=msg_type, csrf_token=active_csrf
         ))
 
     def _post_admin_security_action(self):
@@ -15201,6 +16056,37 @@ class ManageHandler(BaseHTTPRequestHandler):
                     raise
         q = urllib.parse.quote_plus(msg)
         return self._redirect(f'/manage/admin/report/{report_id}?msg={q}&msg_type={"success" if ok else "error"}')
+
+    def _post_admin_wild_intake_action(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        role = _user_role(user)
+        if role not in ('super', 'admin'):
+            return self._redirect('/manage/dashboard')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        info_hash = (fields.get('info_hash', '') or '').strip().upper()
+        action = (fields.get('action', '') or '').strip().lower()
+        note = (fields.get('note', '') or '').strip()
+        reason = (fields.get('reason', '') or '').strip()
+        from_report_id = (fields.get('from_report_id', '') or '').strip()
+        back = urllib.parse.unquote((fields.get('back', '') or '').strip())
+        ok, msg = REGISTRATION_DB.apply_wild_intake_action(
+            info_hash, int(user['id']), user['username'],
+            action, note=note, reason=reason
+        )
+        q = urllib.parse.quote_plus(msg)
+        if from_report_id.isdigit():
+            return self._redirect(
+                f'/manage/admin/report/{int(from_report_id)}?msg={q}&msg_type={"success" if ok else "error"}'
+            )
+        if back.startswith('/manage/admin'):
+            sep = '&' if '?' in back else '?'
+            return self._redirect(f'{back}{sep}msg={q}&msg_type={"success" if ok else "error"}')
+        if re.fullmatch(r'[A-F0-9]{40}', info_hash):
+            return self._redirect(f'/manage/admin/wild-intake/{info_hash}?msg={q}&msg_type={"success" if ok else "error"}')
+        return self._redirect(f'/manage/admin?tab=wild-intake&msg={q}&msg_type={"success" if ok else "error"}')
 
     def _get_password_page(self):
         user = self._get_session_user()
@@ -16088,6 +16974,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         skipped_duplicate = 0
         skipped_too_large = 0
         skipped_invalid   = 0
+        skipped_suppressed = 0
         skipped_over_max_files = 0
         skipped_db_locked = 0
         normalized_names = 0
@@ -16113,6 +17000,9 @@ class ManageHandler(BaseHTTPRequestHandler):
                 ih, name, total_size, meta = parse_torrent(file_data)
             except Exception:
                 skipped_invalid += 1
+                continue
+            if REGISTRATION_DB.is_info_hash_suppressed(ih):
+                skipped_suppressed += 1
                 continue
             if cleanup_enabled and cleanup_on_upload:
                 normalized_name = _normalize_torrent_display_name(
@@ -16225,6 +17115,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             parts.append(f'{skipped_too_large} skipped (file > {max_file_mb} MB)')
         if skipped_invalid:
             parts.append(f'{skipped_invalid} invalid torrent files skipped')
+        if skipped_suppressed:
+            parts.append(f'{skipped_suppressed} suppressed hashes skipped')
         if skipped_over_max_files:
             parts.append(f'{skipped_over_max_files} skipped (max files per upload is {max_files})')
         if skipped_db_locked:
@@ -17711,12 +18603,28 @@ class ManageHandler(BaseHTTPRequestHandler):
         per_page = int(REGISTRATION_DB.get_setting('torrents_per_page', '50'))
         role   = _user_role(user)
         uid    = None if role in ('super', 'admin', 'editor', 'standard') else user['id']
+        blocked_ids: list[int] = []
+        if role not in ('super', 'admin'):
+            blocked_rows = REGISTRATION_DB.list_blocked_uploaders(int(user['id']), limit=1000)
+            blocked_ids = [int(r['id']) for r in blocked_rows if int(r['id'] or 0) > 0]
         if query:
-            total    = REGISTRATION_DB.count_search_torrents(query, user_id=uid, facets=facets)
-            torrents = REGISTRATION_DB.search_torrents(query, user_id=uid, page=page, per_page=per_page, facets=facets)
+            total = REGISTRATION_DB.count_search_torrents(
+                query, user_id=uid, facets=facets,
+                exclude_uploader_ids=blocked_ids if uid is None else None
+            )
+            torrents = REGISTRATION_DB.search_torrents(
+                query, user_id=uid, page=page, per_page=per_page, facets=facets,
+                exclude_uploader_ids=blocked_ids if uid is None else None
+            )
         else:
-            total    = REGISTRATION_DB.count_torrents(user_id=uid, facets=facets)
-            torrents = REGISTRATION_DB.list_torrents(user_id=uid, page=page, per_page=per_page, facets=facets)
+            total = REGISTRATION_DB.count_torrents(
+                user_id=uid, facets=facets,
+                exclude_uploader_ids=blocked_ids if uid is None else None
+            )
+            torrents = REGISTRATION_DB.list_torrents(
+                user_id=uid, page=page, per_page=per_page, facets=facets,
+                exclude_uploader_ids=blocked_ids if uid is None else None
+            )
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
         self._send_html(_render_search(user, torrents, query, page, total_pages, total, facets=facets))
@@ -17893,7 +18801,9 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage')
         followers = REGISTRATION_DB.list_followers(user['id'], limit=500)
         following = REGISTRATION_DB.list_following(user['id'], limit=500)
+        blocked = REGISTRATION_DB.list_blocked_uploaders(user['id'], limit=500)
         viewer_following_ids = set(int(r['id']) for r in following)
+        viewer_blocked_ids = set(int(r['id']) for r in blocked)
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg = urllib.parse.unquote(qs.get('msg', [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
@@ -17901,6 +18811,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             user, user, followers, following,
             base_path='/manage/following',
             viewer_following_ids=viewer_following_ids,
+            viewer_blocked_ids=viewer_blocked_ids,
+            blocked=blocked,
             msg=msg, msg_type=msg_type
         ))
 
@@ -17919,7 +18831,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         followers = REGISTRATION_DB.list_followers(target['id'], limit=500)
         following = REGISTRATION_DB.list_following(target['id'], limit=500)
         viewer_following = REGISTRATION_DB.list_following(viewer['id'], limit=500)
+        viewer_blocked = REGISTRATION_DB.list_blocked_uploaders(viewer['id'], limit=500)
         viewer_following_ids = set(int(r['id']) for r in viewer_following)
+        viewer_blocked_ids = set(int(r['id']) for r in viewer_blocked)
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         msg = urllib.parse.unquote(qs.get('msg', [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
@@ -17928,6 +18842,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             viewer, target, followers, following,
             base_path=base_path,
             viewer_following_ids=viewer_following_ids,
+            viewer_blocked_ids=viewer_blocked_ids,
+            blocked=viewer_blocked,
             msg=msg, msg_type=msg_type
         ))
 
@@ -18342,6 +19258,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             max_global_running = _safe_int('magnet_submission_max_global_running', MAGNET_JOB_DEFAULT_GLOBAL_MAX_ACTIVE, 1, 500)
             worker_concurrency = _safe_int('magnet_submission_worker_concurrency', MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY, 1, 50)
             timeout_sec = _safe_int('magnet_submission_job_timeout_sec', MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS, 30, 1800)
+            if enabled != '1' and REGISTRATION_DB.get_setting('wild_intake_enabled', '0') == '1':
+                return self._redirect('/manage/admin?tab=trackers&msg=Disable+wild+intake+before+disabling+magnet+submission.&msg_type=error')
             if enabled == '1':
                 if not aria2_path:
                     return self._redirect('/manage/admin?tab=trackers&msg=aria2c+path+is+required+before+enabling+magnet+submission.&msg_type=error')
@@ -18381,6 +19299,38 @@ class ManageHandler(BaseHTTPRequestHandler):
             if enabled == '1':
                 _start_magnet_workers()
             return self._redirect('/manage/admin?tab=trackers&msg=Magnet+submission+settings+saved&msg_type=success')
+        elif form_id == 'wild_intake_settings':
+            enabled = '1' if fields.get('wild_intake_enabled') == '1' else '0'
+            owner_user = (fields.get('wild_intake_owner_user', 'wildkat-bot') or 'wildkat-bot').strip()
+            if owner_user and not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', owner_user):
+                return self._redirect('/manage/admin?tab=trackers&msg=Invalid+wild+intake+owner+username.&msg_type=error')
+            def _safe_int(key: str, default: int, lo: int, hi: int) -> str:
+                try:
+                    return str(max(lo, min(hi, int(fields.get(key, str(default)) or default))))
+                except Exception:
+                    return str(default)
+            workers = _safe_int('wild_intake_worker_concurrency', WILD_INTAKE_DEFAULT_WORKER_CONCURRENCY, 1, 50)
+            max_queue = _safe_int('wild_intake_max_queue', WILD_INTAKE_DEFAULT_MAX_QUEUE, 1, 500)
+            retry_base = _safe_int('wild_intake_retry_base_sec', WILD_INTAKE_DEFAULT_RETRY_BASE_SECONDS, 60, 86400)
+            retry_max = _safe_int('wild_intake_retry_max_sec', WILD_INTAKE_DEFAULT_RETRY_MAX_SECONDS, 3600, 1209600)
+            if enabled == '1':
+                if not REGISTRATION_MODE:
+                    return self._redirect('/manage/admin?tab=trackers&msg=Wild+intake+requires+registration+mode.&msg_type=error')
+                mag_cfg = REGISTRATION_DB.get_magnet_submission_config()
+                if not mag_cfg.get('enabled', False):
+                    return self._redirect('/manage/admin?tab=trackers&msg=Enable+magnet+submission+engine+before+wild+intake.&msg_type=error')
+                owner = REGISTRATION_DB.get_user(owner_user)
+                if not owner or int(owner['is_disabled'] or 0) == 1:
+                    return self._redirect('/manage/admin?tab=trackers&msg=Wild+intake+owner+account+must+exist+and+be+active.&msg_type=error')
+            REGISTRATION_DB.set_setting('wild_intake_enabled', enabled, user['username'])
+            REGISTRATION_DB.set_setting('wild_intake_owner_user', owner_user[:64], user['username'])
+            REGISTRATION_DB.set_setting('wild_intake_worker_concurrency', workers, user['username'])
+            REGISTRATION_DB.set_setting('wild_intake_max_queue', max_queue, user['username'])
+            REGISTRATION_DB.set_setting('wild_intake_retry_base_sec', retry_base, user['username'])
+            REGISTRATION_DB.set_setting('wild_intake_retry_max_sec', retry_max, user['username'])
+            if enabled == '1':
+                _start_magnet_workers()
+            return self._redirect('/manage/admin?tab=trackers&msg=Wild+intake+settings+saved&msg_type=success')
         elif form_id == 'auto_promote':
             val = '1' if fields.get('auto_promote_enabled') == '1' else '0'
             REGISTRATION_DB.set_setting('auto_promote_enabled', val, user['username'])
@@ -18953,6 +19903,42 @@ class ManageHandler(BaseHTTPRequestHandler):
         ok, msg = REGISTRATION_DB.unfollow_user(user['id'], target['id'])
         if ok:
             REGISTRATION_DB._log(user['username'], 'unfollow_user', target['username'])
+        dest = referer if referer.startswith('/manage/') else '/manage/following'
+        glue = '&' if '?' in dest else '?'
+        self._redirect(f'{dest}{glue}msg={urllib.parse.quote(msg)}&msg_type={"success" if ok else "error"}')
+
+    def _post_block_uploader(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target_username = fields.get('username', '').strip()
+        referer = fields.get('referer', '').strip()
+        target = REGISTRATION_DB.get_user(target_username) if target_username else None
+        if not target:
+            return self._redirect('/manage/following?msg=User+not+found.&msg_type=error')
+        ok, msg = REGISTRATION_DB.block_uploader(int(user['id']), int(target['id']))
+        if ok:
+            REGISTRATION_DB._log(user['username'], 'block_uploader', target['username'])
+        dest = referer if referer.startswith('/manage/') else '/manage/following'
+        glue = '&' if '?' in dest else '?'
+        self._redirect(f'{dest}{glue}msg={urllib.parse.quote(msg)}&msg_type={"success" if ok else "error"}')
+
+    def _post_unblock_uploader(self):
+        user = self._get_session_user()
+        if not user:
+            return self._redirect('/manage')
+        body = self._read_body()
+        fields, _ = _parse_multipart(self.headers, body)
+        target_username = fields.get('username', '').strip()
+        referer = fields.get('referer', '').strip()
+        target = REGISTRATION_DB.get_user(target_username) if target_username else None
+        if not target:
+            return self._redirect('/manage/following?msg=User+not+found.&msg_type=error')
+        ok, msg = REGISTRATION_DB.unblock_uploader(int(user['id']), int(target['id']))
+        if ok:
+            REGISTRATION_DB._log(user['username'], 'unblock_uploader', target['username'])
         dest = referer if referer.startswith('/manage/') else '/manage/following'
         glue = '&' if '?' in dest else '?'
         self._redirect(f'{dest}{glue}msg={urllib.parse.quote(msg)}&msg_type={"success" if ok else "error"}')
@@ -20285,6 +21271,14 @@ _MANAGE_CSS = '''
   .btn-danger { border-color: var(--red); color: var(--red); }
   .btn-danger:hover { background: var(--red); color: #fff; }
   .btn-sm { padding: 4px 12px; font-size: 0.72rem; }
+  .btn-social-fixed {
+    min-width: 120px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    line-height: 1;
+  }
   .btn-id-copy { margin-left:6px; padding:2px 8px; border:1px solid var(--border);
                  border-radius:999px; background:transparent; color:var(--muted);
                  font-family:var(--mono); font-size:0.68rem; cursor:pointer; transition:all 0.15s ease; }
@@ -20374,6 +21368,35 @@ _MANAGE_CSS = '''
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
   .torrent-table { table-layout: fixed; min-width: 700px; }
+  .wild-intake-table { table-layout: fixed; width: 100%; }
+  .wild-intake-table td:nth-child(2) a {
+    display: inline-block;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .wild-intake-table td:nth-child(8) .actions {
+    justify-content: flex-end;
+    gap: 6px;
+  }
+  .wild-intake-table td:nth-child(8) .btn.btn-sm {
+    padding: 4px 10px;
+    font-size: 0.74rem;
+    letter-spacing: 0.06em;
+  }
+  .wild-intake-table td:nth-child(1) {
+    white-space: nowrap;
+  }
+  .wild-intake-table td:nth-child(3) {
+    word-break: break-all;
+    font-size: 0.70rem;
+  }
+  .wild-intake-table td:nth-child(5),
+  .wild-intake-table td:nth-child(7) {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
   th { font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.15em; text-transform: uppercase;
        color: var(--muted); padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
   td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
@@ -20399,6 +21422,12 @@ _MANAGE_CSS = '''
          padding: 6px 14px; border-radius: 7px; border: none; background: transparent;
          color: var(--muted); cursor: pointer; transition: color 0.15s; }
   .tabs .tab { flex: 0 0 auto; }
+  .tabs.tabs-admin { gap: 3px; padding: 3px; }
+  .tabs.tabs-admin .tab {
+    font-size: 0.70rem;
+    letter-spacing: 0.075em;
+    padding: 6px 12px;
+  }
   .tab:hover { color: var(--accent); background: rgba(245,166,35,0.08); }
   .tab.tab-danger { color: var(--accent2); }
   .tab.tab-danger:hover { color: #ff7a55; background: rgba(224,91,48,0.12); }
@@ -22644,6 +23673,7 @@ def _render_admin_report_detail(user, report: dict, actions: list, moderators: l
                      if reporter_username and reporter_username != '--' else '--')
     assigned_uid = int(report.get('assigned_user_id') or 0)
     assigned_username = _h(str(report.get('assigned_username') or '--'))
+    torrent_ingestion_source = str(report.get('torrent_ingestion_source') or '').strip().lower()
     csrf = csrf_token or ''
     status_rows = ''
     for target in ('open', 'in_review', 'resolved', 'dismissed'):
@@ -22680,6 +23710,25 @@ def _render_admin_report_detail(user, report: dict, actions: list, moderators: l
         )
     if not action_rows:
         action_rows = '<tr><td colspan="5" class="empty">No actions recorded</td></tr>'
+    wild_toggle = ''
+    if torrent_ingestion_source == 'wild_intake' and re.fullmatch(r'[A-F0-9]{40}', str(report.get('info_hash') or '')):
+        wild_state = REGISTRATION_DB.get_wild_intake_report(str(report.get('info_hash') or ''))
+        is_suppressed = bool(wild_state and str(wild_state.get('status') or '') == 'suppressed')
+        wild_action = 'allow' if is_suppressed else 'delete_suppress'
+        wild_label = 'Allow Wild Intake' if is_suppressed else 'Delete + Suppress'
+        wild_class = 'btn btn-sm btn-green' if is_suppressed else 'btn btn-sm btn-danger'
+        wild_toggle = (
+            '<form method="POST" action="/manage/admin/wild-intake/action" style="display:inline">'
+            f'<input type="hidden" name="info_hash" value="{info_hash}">'
+            f'<input type="hidden" name="action" value="{wild_action}">'
+            f'<input type="hidden" name="reason" value="from_torrent_report">'
+            f'<input type="hidden" name="from_report_id" value="{report_id}">'
+            f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
+            f'<button class="{wild_class} btn-sm" type="submit" '
+            'style="min-height:28px;display:inline-flex;align-items:center;justify-content:center;line-height:1">'
+            f'{wild_label}</button>'
+            '</form>'
+        )
     body = f'''
   <div class="page-title">Torrent Report Detail</div>
   <div class="page-sub">
@@ -22691,6 +23740,7 @@ def _render_admin_report_detail(user, report: dict, actions: list, moderators: l
       <div class="card-title" style="margin:0;border:0;padding:0">Report #{report_id}</div>
       <div class="actions">
         <button class="btn btn-sm btn-green" onclick="copyInvite(this,{repr(f'/manage/admin/report/{report_id}')})">&#128279; Copy URL</button>
+        {wild_toggle}
         <a class="btn btn-sm" href="{_h(safe_back)}">&#10094; Back</a>
       </div>
     </div>
@@ -22749,6 +23799,112 @@ def _render_admin_report_detail(user, report: dict, actions: list, moderators: l
     return _manage_page(f'Report #{report_id}', body, user=user, msg=msg, msg_type=msg_type)
 
 
+def _render_admin_wild_intake_detail(user, report: dict, actions: list,
+                                     back_url: str = '/manage/admin?tab=wild-intake',
+                                     msg: str = '', msg_type: str = 'error',
+                                     csrf_token: str = '') -> str:
+    info_hash = _h(str(report.get('info_hash') or ''))
+    safe_back = back_url if (back_url or '').startswith('/manage/admin') else '/manage/admin?tab=wild-intake'
+    status = str(report.get('status') or 'allowed').strip().lower()
+    status_label = _h(status.upper())
+    status_color = 'var(--danger)' if status == 'suppressed' else 'var(--green)'
+    added_name = _h(str(report.get('torrent_name') or report.get('added_name') or '(unknown torrent)'))
+    suppress_reason = _h(str(report.get('suppress_reason') or '--'))
+    added_at = _h(str(report.get('added_at') or report.get('first_seen_at') or '')[:19].replace('T', ' '))
+    suppressed_at = _h(str(report.get('suppressed_at') or '--')[:19].replace('T', ' '))
+    actor = _h(str(report.get('suppressed_by_username') or report.get('added_by_username') or '--'))
+    attempts = int(report.get('attempts') or 0)
+    next_retry = _h(str(report.get('next_retry_at') or '--')[:19].replace('T', ' '))
+    csrf = csrf_token or ''
+    has_live_torrent = bool((report.get('torrent_name') or '').strip())
+    torrent_value = (
+        f'<a href="/manage/torrent/{info_hash.lower()}" class="user-link">{added_name}</a>'
+        if has_live_torrent else
+        f'<span class="hash">{added_name}</span>'
+    )
+    toggle_action = 'allow' if status == 'suppressed' else 'delete_suppress'
+    toggle_label = 'Allow Wild Intake' if status == 'suppressed' else 'Delete + Suppress'
+    toggle_class = 'btn btn-sm btn-green' if status == 'suppressed' else 'btn btn-sm btn-danger'
+    action_rows = ''
+    for a in actions:
+        when = _h(str(a.get('created_at') or '')[:19].replace('T', ' '))
+        actor_name = _h(str(a.get('actor_username') or a.get('actor_username_current') or '--'))
+        action_name = _h(str(a.get('action') or ''))
+        note = _h(str(a.get('note') or ''))
+        action_rows += (
+            '<tr>'
+            f'<td class="hash" style="white-space:nowrap">{when}</td>'
+            f'<td>{actor_name}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem">{action_name}</td>'
+            f'<td style="word-break:break-word">{note}</td>'
+            '</tr>'
+        )
+    if not action_rows:
+        action_rows = '<tr><td colspan="4" class="empty">No actions recorded</td></tr>'
+    body = f'''
+  <div class="page-title">Wild Intake Report Detail</div>
+  <div class="page-sub">
+    Wild intake moderation workflow &nbsp;·&nbsp;
+    <a href="{_h(safe_back)}" style="color:var(--muted);text-decoration:none;font-size:0.85rem">&#10094; Back to Wild Intake Reports</a>
+  </div>
+  <div class="card" style="margin-bottom:14px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+      <div class="card-title" style="margin:0;border:0;padding:0">{added_name}</div>
+      <div class="actions">
+        <a class="btn btn-sm" href="{_h(safe_back)}">&#10094; Back</a>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div style="display:grid;grid-template-columns:minmax(170px,230px) 1fr;gap:10px 14px;align-items:start">
+      <div class="hash">Info Hash</div><div class="hash">{info_hash}</div>
+      <div class="hash">Status</div><div style="font-family:var(--mono);font-size:0.76rem;color:{status_color};text-transform:uppercase">{status_label}</div>
+      <div class="hash">Added</div><div>{added_at}</div>
+      <div class="hash">Suppressed At</div><div>{suppressed_at}</div>
+      <div class="hash">Actor</div><div>{actor}</div>
+      <div class="hash">Reason</div><div style="white-space:pre-wrap">{suppress_reason}</div>
+      <div class="hash">Attempts</div><div>{attempts}</div>
+      <div class="hash">Next Retry</div><div>{next_retry}</div>
+      <div class="hash">Torrent</div><div>{torrent_value}</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Status Action</div>
+    <form method="POST" action="/manage/admin/wild-intake/action"
+          style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <input type="hidden" name="info_hash" value="{info_hash}">
+      <input type="hidden" name="action" value="{toggle_action}">
+      <input type="hidden" name="back" value="{_h(safe_back)}">
+      <input type="hidden" name="_csrf" value="{_h(csrf)}">
+      <button class="{toggle_class}" type="submit">{toggle_label}</button>
+      <input type="text" name="reason" maxlength="240" placeholder="optional reason (e.g. porn/adult)"
+             style="padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem;min-width:280px;flex:1">
+    </form>
+  </div>
+  <div class="card">
+    <div class="card-title">Add Note</div>
+    <form method="POST" action="/manage/admin/wild-intake/action" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+      <input type="hidden" name="info_hash" value="{info_hash}">
+      <input type="hidden" name="action" value="note">
+      <input type="hidden" name="back" value="{_h(safe_back)}">
+      <input type="hidden" name="_csrf" value="{_h(csrf)}">
+      <div class="form-group" style="margin:0;min-width:320px;flex:1">
+        <label>Moderator note</label>
+        <input type="text" name="note" maxlength="500" placeholder="Wild intake moderation update">
+      </div>
+      <button class="btn btn-sm" type="submit">Add Note</button>
+    </form>
+  </div>
+  <div class="card">
+    <div class="card-title">Action Timeline</div>
+    <div class="table-wrap"><table>
+      <tr><th scope="col">Time</th><th scope="col">Actor</th><th scope="col">Action</th><th scope="col">Note</th></tr>
+      {action_rows}
+    </table></div>
+  </div>'''
+    return _manage_page(f'Wild Intake {info_hash[:12]}…', body, user=user, msg=msg, msg_type=msg_type)
+
+
 def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   trackers: list, settings: dict,
                   msg: str = '', msg_type: str = 'error',
@@ -22765,11 +23921,15 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                   reports: list | None = None, rpage: int = 1, reports_total_pages: int = 1,
                   reports_total: int = 0, reports_pp: int = 50, rstatus: str = '',
                   rseverity: str = '', rreason: str = '', rreporter: str = '',
-                  rih: str = '', rowner: str = '') -> str:
+                  rih: str = '', rowner: str = '',
+                  wild_reports: list | None = None, wpage: int = 1,
+                  wild_total_pages: int = 1, wild_total: int = 0,
+                  wild_pp: int = 50, wstatus: str = '', wq: str = '') -> str:
     is_super = user['username'] == SUPER_USER
     security_events = security_events or []
     security_bans = security_bans or []
     reports = reports or []
+    wild_reports = wild_reports or []
     sview = sview if sview in ('events', 'bans') else 'events'
 
     # ── Tracker rows ─────────────────────────────────────────────
@@ -24142,6 +25302,14 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     report_page_base = '/manage/admin?' + urllib.parse.urlencode(report_page_params)
     report_back_url = report_page_base + (f'&rpage={int(rpage)}' if int(rpage) > 1 else '')
     report_back_enc = urllib.parse.quote(report_back_url, safe='')
+    wild_page_params = [('tab', 'wild-intake')]
+    if wstatus:
+        wild_page_params.append(('wstatus', wstatus))
+    if wq:
+        wild_page_params.append(('wq', wq))
+    wild_page_base = '/manage/admin?' + urllib.parse.urlencode(wild_page_params)
+    wild_back_url = wild_page_base + (f'&wpage={int(wpage)}' if int(wpage) > 1 else '')
+    wild_back_enc = urllib.parse.quote(wild_back_url, safe='')
     sec_rows = ''
     for se in security_events:
         sev = _h(se.get('severity', ''))
@@ -24260,6 +25428,54 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         )
     if not report_rows:
         report_rows = '<tr><td colspan="9" class="empty">No reports found</td></tr>'
+    wild_range_start = ((wpage - 1) * wild_pp + 1) if wild_total > 0 else 0
+    wild_range_end = min(wpage * wild_pp, wild_total) if wild_total > 0 else 0
+    wild_range_label = (f'{wild_range_start}-{wild_range_end}'
+                        if wild_total > 0 else '0-0')
+    wild_rows = ''
+    for wr in wild_reports:
+        ih = _h(str(wr.get('info_hash') or ''))
+        added = _h(str(wr.get('added_at') or wr.get('first_seen_at') or wr.get('updated_at') or '')[:19].replace('T', ' '))
+        status = str(wr.get('status') or 'allowed').strip().lower()
+        status_label = _h(status.upper())
+        status_color = 'var(--danger)' if status == 'suppressed' else 'var(--green)'
+        name = _h(str(wr.get('torrent_name') or wr.get('added_name') or '(unknown torrent)')[:120])
+        suppress_reason = _h(str(wr.get('suppress_reason') or '--'))
+        actor = _h(str(wr.get('suppressed_by_username') or wr.get('added_by_username') or '--'))
+        suppressed_at = _h(str(wr.get('suppressed_at') or '--')[:19].replace('T', ' '))
+        detail_link = f'/manage/admin/wild-intake/{ih}?back={wild_back_enc}'
+        torrent_link = f'/manage/torrent/{str(wr.get("info_hash") or "").lower()}'
+        has_live_torrent = bool((wr.get('torrent_name') or '').strip())
+        torrent_cell = (
+            f'<a href="{torrent_link}" class="user-link">{name}</a>'
+            if has_live_torrent else
+            f'<span class="user-link" style="text-decoration:none;cursor:default">{name}</span>'
+        )
+        can_toggle_to = 'allow' if status == 'suppressed' else 'delete_suppress'
+        toggle_label = 'Allow' if status == 'suppressed' else 'Delete + Suppress'
+        toggle_class = 'btn btn-sm btn-green' if status == 'suppressed' else 'btn btn-sm btn-danger'
+        wild_rows += (
+            '<tr>'
+            f'<td class="hash" style="white-space:nowrap">{added}</td>'
+            f'<td>{torrent_cell}</td>'
+            f'<td class="hash">{ih}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem;color:{status_color};text-transform:uppercase">{status_label}</td>'
+            f'<td class="hash">{suppressed_at}</td>'
+            f'<td>{actor}</td>'
+            f'<td style="font-family:var(--mono);font-size:0.74rem">{suppress_reason}</td>'
+            f'<td><div class="actions">'
+            f'<form method="POST" action="/manage/admin/wild-intake/action" style="display:inline">'
+            f'<input type="hidden" name="info_hash" value="{ih}">'
+            f'<input type="hidden" name="action" value="{can_toggle_to}">'
+            f'<input type="hidden" name="back" value="{_h(wild_page_base)}">'
+            f'<button class="{toggle_class}" type="submit">{toggle_label}</button>'
+            f'</form>'
+            f'<a href="{detail_link}" class="btn btn-sm">View &#8594;</a>'
+            '</div></td>'
+            '</tr>'
+        )
+    if not wild_rows:
+        wild_rows = '<tr><td colspan="8" class="empty">No wild intake records found</td></tr>'
 
     _tab_settings  = ('<button class="tab" onclick="showTab(\'settings\',this)">Settings</button>'
                       if is_super else '')
@@ -24274,7 +25490,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _tab_danger    = ('<button class="tab tab-danger" onclick="showTab(\'danger\',this)"'
                       '>Danger</button>'
                       if is_super else '')
-    _tab_names = ['torrents','users','adduser','trackers','settings','database','economy','topups','invites','danger','events','security','reports']
+    _tab_names = ['torrents','users','adduser','trackers','settings','database','economy','topups','invites','danger','events','security','reports','wild-intake']
     if tab and tab in _tab_names:
         _safe_tab = tab.replace("'", '')
         _autotab_js = (
@@ -24302,6 +25518,13 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
                        'for(var i=0;i<els.length;i++){'
                        'var oc=els[i].getAttribute("onclick")||"";'
                        'if(oc.indexOf("showTab(\'reports\'")!==-1){els[i].click();break;}'
+                       '}})</script>')
+    elif wpage > 1:
+        _autotab_js = ('<script>window.addEventListener("DOMContentLoaded",function(){'
+                       'var els=document.querySelectorAll(".tab");'
+                       'for(var i=0;i<els.length;i++){'
+                       'var oc=els[i].getAttribute("onclick")||"";'
+                       'if(oc.indexOf("showTab(\'wild-intake\'")!==-1){els[i].click();break;}'
                        '}})</script>')
     else:
         _autotab_js = ''
@@ -24341,6 +25564,12 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     _mag_global_max = _h(settings.get('magnet_submission_max_global_running', str(MAGNET_JOB_DEFAULT_GLOBAL_MAX_ACTIVE)))
     _mag_workers = _h(settings.get('magnet_submission_worker_concurrency', str(MAGNET_JOB_DEFAULT_WORKER_CONCURRENCY)))
     _mag_timeout = _h(settings.get('magnet_submission_job_timeout_sec', str(MAGNET_JOB_DEFAULT_TIMEOUT_SECONDS)))
+    _wild_enabled = settings.get('wild_intake_enabled', '0') == '1'
+    _wild_owner_user = _h(settings.get('wild_intake_owner_user', 'wildkat-bot'))
+    _wild_workers = _h(settings.get('wild_intake_worker_concurrency', str(WILD_INTAKE_DEFAULT_WORKER_CONCURRENCY)))
+    _wild_max_queue = _h(settings.get('wild_intake_max_queue', str(WILD_INTAKE_DEFAULT_MAX_QUEUE)))
+    _wild_retry_base = _h(settings.get('wild_intake_retry_base_sec', str(WILD_INTAKE_DEFAULT_RETRY_BASE_SECONDS)))
+    _wild_retry_max = _h(settings.get('wild_intake_retry_max_sec', str(WILD_INTAKE_DEFAULT_RETRY_MAX_SECONDS)))
     _peer_disabled_attr = '' if is_super else 'disabled'
     _peer_save_cta = ('<button type="submit" class="btn btn-primary">Save Peer Query Settings</button>'
                       if is_super else
@@ -24584,12 +25813,54 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         {('<button type="submit" class="btn btn-primary">Save Magnet Settings</button>' if is_super else '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')}
       </form>
     </div>'''
+    wild_intake_card = f'''
+    <div class="card">
+      <div class="card-title">Wild Intake</div>
+      <p style="font-size:0.88rem;color:var(--muted);margin-bottom:16px">
+        Optional auto-ingest for unknown announce info hashes. Requires registration mode and
+        magnet submission engine. Unknown hashes are queued under a bot account and retried with cooldown/backoff.
+      </p>
+      <form method="POST" action="/manage/admin/save-settings">
+        <input type="hidden" name="form_id" value="wild_intake_settings">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:10px">
+          <input type="checkbox" name="wild_intake_enabled" value="1" {'checked' if _wild_enabled else ''} {_peer_disabled_attr}>
+          Enable wild intake engine
+        </label>
+        <div class="form-group">
+          <label>Owner account (bot user)</label>
+          <input type="text" name="wild_intake_owner_user" value="{_wild_owner_user}" placeholder="wildkat-bot" {_peer_disabled_attr}>
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <div class="form-group" style="min-width:170px">
+            <label>Worker concurrency</label>
+            <input type="number" name="wild_intake_worker_concurrency" value="{_wild_workers}" min="1" max="50" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:170px">
+            <label>Max active queue</label>
+            <input type="number" name="wild_intake_max_queue" value="{_wild_max_queue}" min="1" max="500" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:170px">
+            <label>Retry base (sec)</label>
+            <input type="number" name="wild_intake_retry_base_sec" value="{_wild_retry_base}" min="60" max="86400" {_peer_disabled_attr}>
+          </div>
+          <div class="form-group" style="min-width:170px">
+            <label>Retry max (sec)</label>
+            <input type="number" name="wild_intake_retry_max_sec" value="{_wild_retry_max}" min="3600" max="1209600" {_peer_disabled_attr}>
+          </div>
+        </div>
+        <div style="font-size:0.8rem;color:var(--muted);margin:6px 0 14px 0">
+          Backoff doubles until one day, then increases by one day up to max.
+          At max tier, repeated failures are auto-suppressed as unobtainable.
+        </div>
+        {('<button type="submit" class="btn btn-primary">Save Wild Intake Settings</button>' if is_super else '<div style="font-size:0.82rem;color:var(--muted)">Only superuser can change these settings.</div>')}
+      </form>
+    </div>'''
 
     body = f'''
   <div class="page-title">Admin Panel</div>
   <div class="page-sub">Manage torrents and users &nbsp;·&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none;font-size:0.85rem">&#10094; Dashboard</a></div>
   {_autotab_js}
-  <div class="tabs">
+  <div class="tabs tabs-admin">
     <button class="tab active" onclick="showTab('torrents',this)">Torrents</button>
     <button class="tab" onclick="showTab('users',this)">Users</button>
     <button class="tab" onclick="showTab('adduser',this)">Add User</button>
@@ -24603,6 +25874,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     <button class="tab" onclick="showTab('events',this)">Event Log</button>
     <button class="tab" onclick="showTab('security',this)">Security</button>
     <button class="tab" onclick="showTab('reports',this)">Reports</button>
+    <button class="tab" onclick="showTab('wild-intake',this)">Wild Intake</button>
   </div>
 
   <div class="panel visible" id="panel-torrents">
@@ -24693,6 +25965,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
     {torrent_name_cleanup_card}
     {srrdb_card}
     {magnet_submission_card}
+    {wild_intake_card}
   </div>
 
   {'<div class="panel" id="panel-settings">' + settings_html + '</div>' if is_super else ''}
@@ -24862,6 +26135,50 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <tbody>{report_rows}</tbody>
       </table></div>
       {_pagination_html(rpage, reports_total_pages, report_page_base, page_param='rpage')}
+    </div>
+  </div>
+
+  <div class="panel" id="panel-wild-intake">
+    <div class="card">
+      <div class="card-title">Wild Intake Reports
+        <span style="color:var(--muted);font-size:0.78rem;font-weight:400;margin-left:8px">
+          {wild_total} matching · showing {wild_range_label} · page {wpage}/{wild_total_pages}
+        </span>
+      </div>
+      <form method="GET" action="/manage/admin" style="margin-bottom:16px">
+        <input type="hidden" name="tab" value="wild-intake">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <div class="form-group" style="margin:0;min-width:150px">
+            <label style="font-size:0.75rem">Status</label>
+            <select name="wstatus" class="facet-select" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+              <option value=""{' selected' if not wstatus else ''}>all</option>
+              <option value="suppressed"{' selected' if wstatus == 'suppressed' else ''}>suppressed</option>
+              <option value="allowed"{' selected' if wstatus == 'allowed' else ''}>allowed</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0;min-width:260px;flex:1">
+            <label style="font-size:0.75rem">Search (name or info hash)</label>
+            <input type="text" name="wq" value="{_h(wq)}" placeholder="title, reason, or A1B2..."
+                   style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+          </div>
+          <button type="submit" class="btn btn-primary" style="white-space:nowrap">🔍 Search</button>
+          <a href="/manage/admin?tab=wild-intake" class="btn" style="white-space:nowrap">✕ Clear</a>
+        </div>
+      </form>
+      <div class="table-wrap"><table class="wild-intake-table">
+        <thead><tr>
+          <th scope="col" style="white-space:nowrap;width:176px">Added</th>
+          <th scope="col" style="width:29%">Torrent</th>
+          <th scope="col" style="width:190px">Info Hash</th>
+          <th scope="col" style="width:88px">Status</th>
+          <th scope="col" style="width:116px">Suppressed</th>
+          <th scope="col" style="width:96px">Actor</th>
+          <th scope="col" style="width:120px">Reason</th>
+          <th scope="col" style="width:126px">Actions</th>
+        </tr></thead>
+        <tbody>{wild_rows}</tbody>
+      </table></div>
+      {_pagination_html(wpage, wild_total_pages, wild_page_base, page_param='wpage')}
     </div>
   </div>'''
     return _manage_page('Admin Panel', body, user=user, msg=msg, msg_type=msg_type)
@@ -27036,6 +28353,8 @@ def _render_public_profile(viewer, target_user, torrents: list,
     followers_count, following_count = REGISTRATION_DB.get_follow_counts(target_user['id']) if REGISTRATION_DB else (0, 0)
     is_following = (REGISTRATION_DB.is_following(viewer['id'], target_user['id'])
                     if (REGISTRATION_DB and not is_own) else False)
+    is_blocked = (REGISTRATION_DB.is_uploader_blocked(viewer['id'], target_user['id'])
+                  if (REGISTRATION_DB and not is_own) else False)
     can_view_follow_lists = _can_view_follow_visibility(viewer, target_user)
     follow_lists_url = (f'/manage/user/{urllib.parse.quote(uname)}/following'
                         if not is_own else '/manage/following')
@@ -27065,13 +28384,14 @@ def _render_public_profile(viewer, target_user, torrents: list,
 
     avatar_html = _avatar_html(target_user, 34)
     follow_btn = ''
+    block_btn = ''
     if not is_own:
         if is_following:
             follow_btn = (
                 '<form method="POST" action="/manage/unfollow" style="display:inline">'
                 f'<input type="hidden" name="username" value="{uname_h}">'
                 f'<input type="hidden" name="referer" value="/manage/user/{uname_h}">'
-                '<button class="btn btn-sm" onmouseover="this.textContent=\'❌ Unfollow\'" '
+                '<button class="btn btn-sm btn-social-fixed" onmouseover="this.textContent=\'❌ Unfollow\'" '
                 'onmouseout="this.textContent=\'✅ Following\'">✅ Following</button>'
                 '</form>'
             )
@@ -27080,7 +28400,24 @@ def _render_public_profile(viewer, target_user, torrents: list,
                 '<form method="POST" action="/manage/follow" style="display:inline">'
                 f'<input type="hidden" name="username" value="{uname_h}">'
                 f'<input type="hidden" name="referer" value="/manage/user/{uname_h}">'
-                '<button class="btn btn-sm btn-green">Follow</button>'
+                '<button class="btn btn-sm btn-green btn-social-fixed">Follow</button>'
+                '</form>'
+            )
+        if is_blocked:
+            block_btn = (
+                '<form method="POST" action="/manage/unblock-uploader" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname_h}">'
+                f'<input type="hidden" name="referer" value="/manage/user/{uname_h}">'
+                '<button class="btn btn-sm btn-social-fixed" onmouseover="this.textContent=\'❌ Unblock\'" '
+                'onmouseout="this.textContent=\'✅ Blocked\'">✅ Blocked</button>'
+                '</form>'
+            )
+        else:
+            block_btn = (
+                '<form method="POST" action="/manage/block-uploader" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname_h}">'
+                f'<input type="hidden" name="referer" value="/manage/user/{uname_h}">'
+                '<button class="btn btn-sm btn-danger btn-social-fixed">❌ Block</button>'
                 '</form>'
             )
     body = f'''
@@ -27093,8 +28430,9 @@ def _render_public_profile(viewer, target_user, torrents: list,
     Public profile
     &nbsp;&#183;&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
     {admin_link}
-    {'&nbsp;&#183;&nbsp; <a href="/manage/messages?to=' + uname_h + '" class="btn btn-sm">📬 Send DM</a>' if (not is_own and vrole != 'basic' and REGISTRATION_DB and REGISTRATION_DB.get_setting('dm_enabled','1') == '1' and not target_user['is_disabled']) else ''}
+    {'&nbsp;&#183;&nbsp; <a href="/manage/messages?to=' + uname_h + '" class="btn btn-sm btn-social-fixed">📬 Send DM</a>' if (not is_own and vrole != 'basic' and REGISTRATION_DB and REGISTRATION_DB.get_setting('dm_enabled','1') == '1' and not target_user['is_disabled']) else ''}
     {'&nbsp;&#183;&nbsp; ' + follow_btn if follow_btn else ''}
+    {'&nbsp;&#183;&nbsp; ' + block_btn if block_btn else ''}
   </div>
 
   <div class="card" style="max-width:400px">
@@ -27191,6 +28529,8 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     followers_count, following_count = REGISTRATION_DB.get_follow_counts(target_user['id']) if REGISTRATION_DB else (0, 0)
     is_following = (REGISTRATION_DB.is_following(viewer['id'], target_user['id'])
                     if (REGISTRATION_DB and not is_own_profile) else False)
+    is_blocked = (REGISTRATION_DB.is_uploader_blocked(viewer['id'], target_user['id'])
+                  if (REGISTRATION_DB and not is_own_profile) else False)
     can_view_follow_lists = _can_view_follow_visibility(viewer, target_user)
     follow_lists_url = (f'/manage/user/{urllib.parse.quote(uname)}/following'
                         if not is_own_profile else '/manage/following')
@@ -27832,15 +29172,16 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             and _user_role(viewer) not in ('basic',)
             and not target_user['is_disabled']):
         dm_btn = (f' &nbsp;&#183;&nbsp; <a href="/manage/messages?tab=compose&to={uname_h}" '
-                  f'class="btn btn-sm">📬 Send DM</a>')
+                  f'class="btn btn-sm btn-social-fixed">📬 Send DM</a>')
     follow_btn = ''
+    block_btn = ''
     if not is_own_profile:
         if is_following:
             follow_btn = (
                 f' &nbsp;&#183;&nbsp; <form method="POST" action="/manage/unfollow" style="display:inline">'
                 f'<input type="hidden" name="username" value="{uname_h}">'
                 f'<input type="hidden" name="referer" value="/manage/admin/user/{uname_h}">'
-                f'<button class="btn btn-sm" onmouseover="this.textContent=\'❌ Unfollow\'" '
+                f'<button class="btn btn-sm btn-social-fixed" onmouseover="this.textContent=\'❌ Unfollow\'" '
                 f'onmouseout="this.textContent=\'✅ Following\'">✅ Following</button></form>'
             )
         else:
@@ -27848,7 +29189,22 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                 f' &nbsp;&#183;&nbsp; <form method="POST" action="/manage/follow" style="display:inline">'
                 f'<input type="hidden" name="username" value="{uname_h}">'
                 f'<input type="hidden" name="referer" value="/manage/admin/user/{uname_h}">'
-                f'<button class="btn btn-sm btn-green">Follow</button></form>'
+                f'<button class="btn btn-sm btn-green btn-social-fixed">Follow</button></form>'
+            )
+        if is_blocked:
+            block_btn = (
+                f' &nbsp;&#183;&nbsp; <form method="POST" action="/manage/unblock-uploader" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname_h}">'
+                f'<input type="hidden" name="referer" value="/manage/admin/user/{uname_h}">'
+                f'<button class="btn btn-sm btn-social-fixed" onmouseover="this.textContent=\'❌ Unblock\'" '
+                f'onmouseout="this.textContent=\'✅ Blocked\'">✅ Blocked</button></form>'
+            )
+        else:
+            block_btn = (
+                f' &nbsp;&#183;&nbsp; <form method="POST" action="/manage/block-uploader" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname_h}">'
+                f'<input type="hidden" name="referer" value="/manage/admin/user/{uname_h}">'
+                f'<button class="btn btn-sm btn-danger btn-social-fixed">❌ Block</button></form>'
             )
 
     avatar_html = _avatar_html(target_user, 34)
@@ -27873,7 +29229,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + '<div class="page-sub" style="margin-bottom:20px">'
         + ('Your profile' if is_own_profile else 'User profile')
         + nav_links
-        + dm_btn + follow_btn + '</div>'
+        + dm_btn + follow_btn + block_btn + '</div>'
         + '<div style="display:flex;flex-direction:column;gap:24px">'
         + '<div class="two-col">'
         + '<div class="card"><div class="card-title">Account Details</div>'
@@ -27956,11 +29312,18 @@ def _render_topup_history_section(user, orders: list, force_show: bool = False,
 def _render_following_page(viewer, target_user, followers: list, following: list,
                            base_path: str = '/manage/following',
                            viewer_following_ids=None,
+                           viewer_blocked_ids=None,
+                           blocked: list | None = None,
                            msg: str = '', msg_type: str = 'error') -> str:
     if viewer_following_ids is None:
         viewer_following_ids = set(int(r['id']) for r in following)
     else:
         viewer_following_ids = set(int(i) for i in viewer_following_ids)
+    if viewer_blocked_ids is None:
+        viewer_blocked_ids = set()
+    else:
+        viewer_blocked_ids = set(int(i) for i in viewer_blocked_ids)
+    blocked = blocked or []
     is_own = int(viewer['id']) == int(target_user['id'])
     target_uname = _h(target_user['username'])
     viewer_id = int(viewer['id'])
@@ -27975,7 +29338,7 @@ def _render_following_page(viewer, target_user, followers: list, following: list
                 '<form method="POST" action="/manage/unfollow" style="display:inline">'
                 f'<input type="hidden" name="username" value="{uname}">'
                 f'<input type="hidden" name="referer" value="{_h(base_path)}">'
-                '<button class="btn btn-sm" onmouseover="this.textContent=\'❌ Unfollow\'" '
+                '<button class="btn btn-sm btn-social-fixed" onmouseover="this.textContent=\'❌ Unfollow\'" '
                 'onmouseout="this.textContent=\'✅ Following\'">✅ Following</button>'
                 '</form>'
             )
@@ -27984,7 +29347,29 @@ def _render_following_page(viewer, target_user, followers: list, following: list
             '<form method="POST" action="/manage/follow" style="display:inline">'
             f'<input type="hidden" name="username" value="{uname}">'
             f'<input type="hidden" name="referer" value="{_h(base_path)}">'
-            f'<button class="btn btn-sm btn-green">{follow_label}</button>'
+            f'<button class="btn btn-sm btn-green btn-social-fixed">{follow_label}</button>'
+            '</form>'
+        )
+
+    def _block_action(r) -> str:
+        rid = int(r['id'])
+        uname = _h(r['username'])
+        if rid == viewer_id:
+            return '<span class="hash" style="font-size:0.78rem">--</span>'
+        if rid in viewer_blocked_ids:
+            return (
+                '<form method="POST" action="/manage/unblock-uploader" style="display:inline">'
+                f'<input type="hidden" name="username" value="{uname}">'
+                f'<input type="hidden" name="referer" value="{_h(base_path)}">'
+                '<button class="btn btn-sm btn-social-fixed" onmouseover="this.textContent=\'❌ Unblock\'" '
+                'onmouseout="this.textContent=\'✅ Blocked\'">✅ Blocked</button>'
+                '</form>'
+            )
+        return (
+            '<form method="POST" action="/manage/block-uploader" style="display:inline">'
+            f'<input type="hidden" name="username" value="{uname}">'
+            f'<input type="hidden" name="referer" value="{_h(base_path)}">'
+            '<button class="btn btn-sm btn-danger btn-social-fixed">❌ Block</button>'
             '</form>'
         )
 
@@ -28010,7 +29395,7 @@ def _render_following_page(viewer, target_user, followers: list, following: list
                 f'<td><a href="/manage/user/{uname}" class="user-link">{uname}</a></td>'
                 f'<td>{urole}</td>'
                 f'<td class="hash">{since}</td>'
-                f'<td>{action}</td>'
+                f'<td><div class="actions">{action}{_block_action(r)}</div></td>'
                 '</tr>'
             )
         if not out:
@@ -28029,11 +29414,31 @@ def _render_following_page(viewer, target_user, followers: list, following: list
                 f'<td><a href="/manage/user/{uname}" class="user-link">{uname}</a></td>'
                 f'<td>{urole}</td>'
                 f'<td class="hash">{since}</td>'
-                f'<td>{action}</td>'
+                f'<td><div class="actions">{action}{_block_action(r)}</div></td>'
                 '</tr>'
             )
         if not out:
             out = '<tr><td colspan="4" class="empty">You are not following anyone yet</td></tr>'
+        return out
+
+    def _blocked_rows() -> str:
+        out = ''
+        for r in blocked:
+            uname = _h(r['username'])
+            urole = _role_badge_row(r)
+            blocked_at = (r['blocked_at'] if 'blocked_at' in r.keys() else '') or ''
+            since = _h(str(blocked_at)[:16].replace('T', ' '))
+            action = _block_action(r)
+            out += (
+                '<tr>'
+                f'<td><a href="/manage/user/{uname}" class="user-link">{uname}</a></td>'
+                f'<td>{urole}</td>'
+                f'<td class="hash">{since}</td>'
+                f'<td>{action}</td>'
+                '</tr>'
+            )
+        if not out:
+            out = '<tr><td colspan="4" class="empty">No blocked uploaders</td></tr>'
         return out
 
     page_title = 'Followers' if is_own else f'{target_uname} Followers'
@@ -28054,6 +29459,12 @@ def _render_following_page(viewer, target_user, followers: list, following: list
         '<div class="table-wrap"><table>'
         '<tr><th scope="col">Member</th><th scope="col">Role</th><th scope="col">Since</th><th scope="col">Action</th></tr>'
         + _following_rows() +
+        '</table></div></div>'
+        '<div class="card">'
+        f'<div class="card-title">Blocked Uploaders ({len(blocked)})</div>'
+        '<div class="table-wrap"><table>'
+        '<tr><th scope="col">Member</th><th scope="col">Role</th><th scope="col">Since</th><th scope="col">Action</th></tr>'
+        + _blocked_rows() +
         '</table></div></div>'
         '</div>'
     )
