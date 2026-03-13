@@ -27138,12 +27138,23 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     can_view_follow_lists = _can_view_follow_visibility(viewer, target_user)
     follow_lists_url = (f'/manage/user/{urllib.parse.quote(uname)}/following'
                         if not is_own_profile else '/manage/following')
-    raw_cb = target_user['created_by'] or '--'
+    raw_cb = str(target_user['created_by'] or '--')
+
+    def _profile_user_link(username: str) -> str:
+        u = str(username or '').strip()
+        if not u:
+            return ''
+        if not REGISTRATION_DB or not REGISTRATION_DB.get_user(u):
+            return _h(u)
+        return f'<a href="/manage/user/{urllib.parse.quote(u)}" class="user-link">{_h(u)}</a>'
+
     if raw_cb.startswith('invite:'):
-        inviter = _h(raw_cb[7:])
-        created_by_display = f'Invited by <strong>{inviter}</strong>'
+        inviter_username = raw_cb[7:].strip()
+        inviter_html = _profile_user_link(inviter_username) if inviter_username else '--'
+        created_by_display = f'Invited by <strong>{inviter_html}</strong>'
     else:
-        created_by_display = _h(raw_cb)
+        created_by_display = (f'<strong>{_profile_user_link(raw_cb)}</strong>'
+                              if raw_cb not in ('--', 'system') else _h(raw_cb))
     pts_color = 'var(--danger)' if pts_val < 0 else 'var(--accent)'
     info_rows = (
         row('Created',          (target_user['created_at'] or '')[:16] or '--')
