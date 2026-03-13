@@ -20243,7 +20243,7 @@ _MANAGE_CSS = '''
   .btn-blue-rev:hover { background: var(--blue); color: #000; border-color: var(--blue); }
   .facet-select {
     width: 100%;
-    height: 32px;
+    min-height: 32px;
     padding: 0 30px 0 10px;
     border: 1px solid var(--border);
     border-radius: 7px;
@@ -20259,12 +20259,12 @@ _MANAGE_CSS = '''
     -moz-appearance: none;
     background-image:
       linear-gradient(45deg, transparent 50%, var(--muted) 50%),
-      linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+      linear-gradient(135deg, var(--muted) 50%, transparent 50%) !important;
     background-position:
       calc(100% - 15px) calc(50% - 2px),
-      calc(100% - 10px) calc(50% - 2px);
-    background-size: 5px 5px, 5px 5px;
-    background-repeat: no-repeat;
+      calc(100% - 10px) calc(50% - 2px) !important;
+    background-size: 5px 5px, 5px 5px !important;
+    background-repeat: no-repeat !important;
     transition: border-color 0.15s, box-shadow 0.15s, color 0.15s;
   }
   .facet-select:hover { border-color: var(--accent); color: var(--accent); }
@@ -23607,13 +23607,13 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             </label>
           </div>
           <div class="form-group"><label>Rollout mode</label>
-            <select name="topup_rollout_mode" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
+            <select name="topup_rollout_mode" class="facet-select" style="width:280px;max-width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
               <option value="admin_only" {'selected' if _topup_cfg.get('rollout_mode') == 'admin_only' else ''}>Admin only (staging)</option>
               <option value="all_users" {'selected' if _topup_cfg.get('rollout_mode') == 'all_users' else ''}>All users</option>
             </select>
           </div>
           <div class="form-group"><label>Default Processor</label>
-            <select name="topup_provider" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
+            <select name="topup_provider" class="facet-select" style="width:280px;max-width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
               <option value="coinbase" {'selected' if _topup_cfg.get('provider','coinbase') == 'coinbase' else ''}>coinbase</option>
               <option value="paypal" {'selected' if _topup_cfg.get('provider','coinbase') == 'paypal' else ''}>paypal</option>
             </select></div>
@@ -23629,7 +23629,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             </div>
           </div>
           <div class="form-group"><label>Coinbase environment</label>
-            <select name="topup_coinbase_env" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
+            <select name="topup_coinbase_env" class="facet-select" style="width:220px;max-width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
               <option value="sandbox" {'selected' if _topup_cfg.get('coinbase_env') == 'sandbox' else ''}>sandbox</option>
               <option value="live" {'selected' if _topup_cfg.get('coinbase_env') == 'live' else ''}>live</option>
             </select></div>
@@ -23671,7 +23671,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
             </div>
           </div>
           <div class="form-group"><label>PayPal environment</label>
-            <select name="topup_paypal_env" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
+            <select name="topup_paypal_env" class="facet-select" style="width:220px;max-width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">
               <option value="sandbox" {'selected' if _topup_cfg.get('paypal_env') == 'sandbox' else ''}>sandbox</option>
               <option value="live" {'selected' if _topup_cfg.get('paypal_env') == 'live' else ''}>live</option>
             </select></div>
@@ -24493,7 +24493,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <div style="display:flex;gap:12px;flex-wrap:wrap">
           <div class="form-group" style="min-width:180px">
             <label>Mode</label>
-            <select name="magnet_submission_mode" {_peer_disabled_attr}>
+            <select name="magnet_submission_mode" class="facet-select" {_peer_disabled_attr}>
               <option value="direct" {'selected' if _mag_mode == 'direct' else ''}>direct</option>
               <option value="proxy" {'selected' if _mag_mode == 'proxy' else ''}>proxy</option>
             </select>
@@ -24600,7 +24600,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         {"" if not is_super else """
         <div class="form-group">
           <label>Role</label>
-          <select name="role" style="width:100%;padding:10px 14px;background:var(--card2);
+          <select name="role" class="facet-select" style="width:100%;padding:10px 14px;background:var(--card2);
                   border:1px solid var(--border);border-radius:6px;color:var(--text);
                   font-family:var(--mono);font-size:0.88rem">
             <option value="basic">Basic</option>
@@ -24744,7 +24744,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
           <div class="form-group" style="margin:0;min-width:120px">
             <label style="font-size:0.75rem">Status</label>
-            <select name="rstatus" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+            <select name="rstatus" class="facet-select" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
               <option value=""{' selected' if not rstatus else ''}>all</option>
               <option value="open"{' selected' if rstatus == 'open' else ''}>open</option>
               <option value="in_review"{' selected' if rstatus == 'in_review' else ''}>in_review</option>
@@ -24754,7 +24754,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           </div>
           <div class="form-group" style="margin:0;min-width:120px">
             <label style="font-size:0.75rem">Severity</label>
-            <select name="rseverity" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+            <select name="rseverity" class="facet-select" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
               <option value=""{' selected' if not rseverity else ''}>all</option>
               <option value="high"{' selected' if rseverity == 'high' else ''}>high</option>
               <option value="normal"{' selected' if rseverity == 'normal' else ''}>normal</option>
@@ -24762,7 +24762,7 @@ def _render_admin(user, all_torrents: list, all_users: list, events: list,
           </div>
           <div class="form-group" style="margin:0;min-width:120px">
             <label style="font-size:0.75rem">Reason</label>
-            <select name="rreason" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
+            <select name="rreason" class="facet-select" style="width:100%;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">
               <option value=""{' selected' if not rreason else ''}>all</option>
               <option value="bad_metadata"{' selected' if rreason == 'bad_metadata' else ''}>bad_metadata</option>
               <option value="copyright"{' selected' if rreason == 'copyright' else ''}>copyright</option>
@@ -26277,7 +26277,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
         f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
         f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
         '<label style="font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">Reason'
-        '<select name="reason" required style="width:100%;padding:8px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">'
+        '<select name="reason" required class="facet-select" style="width:100%;padding:8px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.82rem">'
         '<option value="bad_metadata">Bad metadata</option>'
         '<option value="copyright">Copyright</option>'
         '<option value="spam">Spam</option>'
@@ -26593,7 +26593,7 @@ def _render_torrent_detail(viewer, t, back_url: str = '/manage/dashboard', msg: 
                 f'<input type="hidden" name="info_hash" value="{_h(ih)}">'
                 f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
                 '<label style="display:flex;flex-direction:column;gap:4px;font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">Provider'
-                '<select name="provider" onchange="toggleMetadataProviderFields(this)" style="min-width:110px;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
+                '<select name="provider" class="facet-select" onchange="toggleMetadataProviderFields(this)" style="min-width:110px;padding:7px 10px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:0.8rem">'
                 f'<option value="imdb"{" selected" if default_provider == "imdb" else ""}>IMDb</option>'
                 f'<option value="tvmaze"{" selected" if default_provider == "tvmaze" else ""}>TVMaze</option>'
                 '<option value="steam">Steam</option>'
@@ -28012,7 +28012,7 @@ def _render_topups_page(user, orders: list, cfg: dict, msg: str = '', msg_type: 
         provider_control_html = (
             '<div class="form-group" style="margin:0">'
             '<label>Payment Processor</label>'
-            '<select name="provider" id="topup-provider" style="padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">'
+            '<select name="provider" id="topup-provider" class="facet-select" style="width:220px;max-width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:6px;color:var(--text)">'
             + ''.join(
                 f'<option value="{_h(p)}" {"selected" if p == default_provider else ""}>{_h(p.upper())}</option>'
                 for p in provider_options
