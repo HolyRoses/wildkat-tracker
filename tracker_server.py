@@ -15528,7 +15528,7 @@ class ManageHandler(BaseHTTPRequestHandler):
         # Browsers can hold multiple wksession cookies (stale + current); we try
         # all candidates so the valid one matches regardless of order.
         _no_csrf = ('/manage/login', '/manage/signup', '/manage',
-                    '/manage/messages/typing', '/coinbase/webhook', '/paypal/webhook',
+                    '/coinbase/webhook', '/paypal/webhook',
                     '/manage/webauthn/auth/start', '/manage/webauthn/auth/finish')
         if path not in _no_csrf:
             raw_cookie = self.headers.get('Cookie', '')
@@ -18806,6 +18806,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
+        if not self._check_csrf(fields):
+            return self._redirect('/manage/dashboard?msg=Invalid+CSRF+token&msg_type=error')
         target_uid = int(fields.get('user_id', 0))
         ips = fields.get('selected_ips', '').split(',')
         for ip in ips:
@@ -18826,6 +18828,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
+        if not self._check_csrf(fields):
+            return self._redirect('/manage/dashboard?msg=Invalid+CSRF+token&msg_type=error')
         entry_id   = int(fields.get('entry_id', 0))
         target_username = fields.get('target_username', '')
         if entry_id:
@@ -18840,6 +18844,8 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
+        if not self._check_csrf(fields):
+            return self._redirect('/manage/dashboard?msg=Invalid+CSRF+token&msg_type=error')
         target_uid      = int(fields.get('user_id', 0))
         target_username = fields.get('target_username', '')
         if target_uid:
@@ -27063,9 +27069,13 @@ def _render_message_thread(viewer, thread, focus_id, msg='', msg_type='info'):
   }}
 
   function sendTyping(){{
-    var fd = new FormData();
-    fd.append('other', otherUser);
-    fetch('/manage/messages/typing', {{method:'POST', body: new URLSearchParams({{other: otherUser}})}});
+    var m = document.cookie.match(/(?:^|;[ \\t]*)wkcsrf=([^;]+)/);
+    var csrf = m ? m[1] : '';
+    fetch('/manage/messages/typing', {{
+      method:'POST',
+      headers:{{'X-CSRF-Token': csrf}},
+      body: new URLSearchParams({{other: otherUser}})
+    }});
     isTyping = false;
   }}
 
