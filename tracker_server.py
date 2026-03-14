@@ -21646,6 +21646,29 @@ _MANAGE_CSS = '''
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
   .torrent-table { table-layout: fixed; min-width: 700px; }
+  .follow-table { table-layout: fixed; width: 100%; min-width: 560px; }
+  .follow-table col.col-role { width: 112px; }
+  .follow-table col.col-since { width: 148px; }
+  .follow-table col.col-action { width: 152px; }
+  .follow-table th:nth-child(2),
+  .follow-table td:nth-child(2) { width: 112px; white-space: nowrap; }
+  .follow-table th:nth-child(3),
+  .follow-table td:nth-child(3) { width: 148px; white-space: nowrap; }
+  .follow-table th:nth-child(4),
+  .follow-table td:nth-child(4) { width: 152px; white-space: nowrap; }
+  .follow-table th:nth-child(1),
+  .follow-table td:nth-child(1) { width: auto; }
+  .follow-table td:nth-child(1) a {
+    display: inline-block;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .follow-table td:nth-child(4) .actions {
+    justify-content: flex-start;
+    gap: 8px;
+    max-width: 152px;
+  }
   .wild-intake-table { table-layout: fixed; width: 100%; }
   .wild-intake-table td:nth-child(2) a {
     display: inline-block;
@@ -22661,7 +22684,7 @@ def _manage_page(title: str, body: str, user=None, msg: str = '', msg_type: str 
         center_nav = (
             '<a href="/manage/dashboard" class="nav-btn">🖥 Dashboard</a>'
             '<a href="/manage/search" class="nav-btn">🔍 Search</a>'
-            '<a href="/manage/following" class="nav-btn">👥 Following</a>'
+            '<a href="/manage/following" class="nav-btn">💃🕺 Connections</a>'
             + ('' if role == 'basic' else
                '<a href="/manage/bounty" class="nav-btn">🎯 Bounties</a>'
                '<a href="/manage/leaderboard" class="nav-btn">🏆 Leaderboard</a>')
@@ -28641,11 +28664,22 @@ def _render_public_profile(viewer, target_user, torrents: list,
     follow_lists_url = (f'/manage/user/{urllib.parse.quote(uname)}/following'
                         if not is_own else '/manage/following')
     if is_own or can_view_follow_lists:
-        followers_value = f'<a href="{follow_lists_url}" class="user-link">{followers_count}</a>'
-        following_value = f'<a href="{follow_lists_url}" class="user-link">{following_count}</a>'
+        followers_value = (
+            f'<a href="{follow_lists_url}" class="user-link" '
+            f'title="Open connections (followers/following)">{followers_count}</a>'
+        )
+        following_value = (
+            f'<a href="{follow_lists_url}" class="user-link" '
+            f'title="Open connections (followers/following)">{following_count}</a>'
+        )
     else:
         followers_value = '<span class="hash" title="This member has hidden follower visibility">Private</span>'
         following_value = '<span class="hash" title="This member has hidden follower visibility">Private</span>'
+    connections_btn = (
+        f' &nbsp;&#183;&nbsp; <a href="{follow_lists_url}" class="btn btn-sm btn-social-fixed" '
+        f'title="View followers and following lists">💃🕺 Connections</a>'
+        if (is_own or can_view_follow_lists) else ''
+    )
 
     def _pub_row(label, value):
         return (f'<tr>'
@@ -28708,11 +28742,12 @@ def _render_public_profile(viewer, target_user, torrents: list,
     <div class="page-title">{uname_h}</div>
     {role_badge}
   </div>
-  <div class="page-sub" style="margin-bottom:20px">
+    <div class="page-sub" style="margin-bottom:20px">
     Public profile
     &nbsp;&#183;&nbsp; <a href="/manage/dashboard" style="color:var(--muted);text-decoration:none">&#10094; Dashboard</a>
     {admin_link}
     {'&nbsp;&#183;&nbsp; <a href="/manage/messages?to=' + uname_h + '" class="btn btn-sm btn-social-fixed">📬 Send DM</a>' if (not is_own and vrole != 'basic' and REGISTRATION_DB and REGISTRATION_DB.get_setting('dm_enabled','1') == '1' and not target_user['is_disabled']) else ''}
+    {connections_btn}
     {'&nbsp;&#183;&nbsp; ' + follow_btn if follow_btn else ''}
     {'&nbsp;&#183;&nbsp; ' + block_btn if block_btn else ''}
   </div>
@@ -28848,10 +28883,10 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + row('Points',         f'<span style="color:{pts_color};font-weight:bold">{pts_val}</span>'
                                 + (f' <span style="color:var(--muted);font-size:0.8rem">(🔥 {streak_val}-day streak)</span>'
                                    if streak_val > 1 else ''))
-        + row('Followers',      (f'<a href="{follow_lists_url}" class="user-link">{followers_count}</a>'
+        + row('Followers',      (f'<a href="{follow_lists_url}" class="user-link" title="Open connections (followers/following)">{followers_count}</a>'
                                  if (is_own_profile or can_view_follow_lists)
                                  else '<span class="hash" title="This member has hidden follower visibility">Private</span>'))
-        + row('Following',      (f'<a href="{follow_lists_url}" class="user-link">{following_count}</a>'
+        + row('Following',      (f'<a href="{follow_lists_url}" class="user-link" title="Open connections (followers/following)">{following_count}</a>'
                                  if (is_own_profile or can_view_follow_lists)
                                  else '<span class="hash" title="This member has hidden follower visibility">Private</span>'))
     )
@@ -29255,7 +29290,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<div style="display:flex;flex-direction:column;gap:14px">'
             '<div style="display:flex;gap:8px;align-items:stretch;flex-wrap:wrap">'
             '<a href="/manage/password" class="btn btn-primary" style="display:inline-flex;align-items:center;min-height:34px">Change Password</a>'
-            '<a href="/manage/following" class="btn btn-sm btn-green" style="display:inline-flex;align-items:center;min-height:34px">Followers</a>'
+            '<a href="/manage/following" class="btn btn-sm btn-green" style="display:inline-flex;align-items:center;min-height:34px">Connections</a>'
             '</div>'
             '</div>'
             '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
@@ -29499,6 +29534,11 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                   f'class="btn btn-sm btn-social-fixed">📬 Send DM</a>')
     follow_btn = ''
     block_btn = ''
+    connections_btn = (
+        f' &nbsp;&#183;&nbsp; <a href="{follow_lists_url}" class="btn btn-sm btn-social-fixed" '
+        f'title="View followers and following lists">💃🕺 Connections</a>'
+        if (is_own_profile or can_view_follow_lists) else ''
+    )
     if not is_own_profile:
         if is_following:
             follow_btn = (
@@ -29553,7 +29593,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
         + '<div class="page-sub" style="margin-bottom:20px">'
         + ('Your profile' if is_own_profile else 'User profile')
         + nav_links
-        + dm_btn + follow_btn + block_btn + '</div>'
+        + dm_btn + connections_btn + follow_btn + block_btn + '</div>'
         + '<div style="display:flex;flex-direction:column;gap:24px">'
         + '<div class="two-col">'
         + '<div class="card"><div class="card-title">Account Details</div>'
@@ -29765,7 +29805,8 @@ def _render_following_page(viewer, target_user, followers: list, following: list
             out = '<tr><td colspan="4" class="empty">No blocked uploaders</td></tr>'
         return out
 
-    page_title = 'Followers' if is_own else f'{target_uname} Followers'
+    possessive = f"{target_uname}'" if str(target_uname).endswith('s') else f"{target_uname}'s"
+    page_title = 'Connections' if is_own else f'{possessive} Connections'
     back_url = '/manage/profile' if is_own else f'/manage/user/{urllib.parse.quote(target_user["username"])}'
     back_label = 'Profile' if is_own else f'{target_uname} profile'
     body = (
@@ -29774,19 +29815,22 @@ def _render_following_page(viewer, target_user, followers: list, following: list
         '<div class="two-col">'
         '<div class="card">'
         f'<div class="card-title">Followers ({len(followers)})</div>'
-        '<div class="table-wrap"><table>'
+        '<div class="table-wrap"><table class="follow-table">'
+        '<colgroup><col class="col-member"><col class="col-role"><col class="col-since"><col class="col-action"></colgroup>'
         '<tr><th scope="col">Member</th><th scope="col">Role</th><th scope="col">Since</th><th scope="col">Action</th></tr>'
         + _followers_rows() +
         '</table></div></div>'
         '<div class="card">'
         f'<div class="card-title">Following ({len(following)})</div>'
-        '<div class="table-wrap"><table>'
+        '<div class="table-wrap"><table class="follow-table">'
+        '<colgroup><col class="col-member"><col class="col-role"><col class="col-since"><col class="col-action"></colgroup>'
         '<tr><th scope="col">Member</th><th scope="col">Role</th><th scope="col">Since</th><th scope="col">Action</th></tr>'
         + _following_rows() +
         '</table></div></div>'
         '<div class="card">'
         f'<div class="card-title">Blocked Uploaders ({len(blocked)})</div>'
-        '<div class="table-wrap"><table>'
+        '<div class="table-wrap"><table class="follow-table">'
+        '<colgroup><col class="col-member"><col class="col-role"><col class="col-since"><col class="col-action"></colgroup>'
         '<tr><th scope="col">Member</th><th scope="col">Role</th><th scope="col">Since</th><th scope="col">Action</th></tr>'
         + _blocked_rows() +
         '</table></div></div>'
