@@ -2590,6 +2590,13 @@ class RegistrationDB:
                 logged_in_at TEXT   NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS user_activity_ip_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                ip_address  TEXT    NOT NULL,
+                seen_at     TEXT    NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS torrents (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 info_hash           TEXT    NOT NULL UNIQUE,
@@ -3032,6 +3039,10 @@ class RegistrationDB:
             c.execute('ALTER TABLE users ADD COLUMN locked_at TEXT')
             # Existing locked accounts get a baseline lock timestamp from migration time.
             c.execute("UPDATE users SET locked_at=? WHERE is_locked=1 AND (locked_at IS NULL OR locked_at='')", (self._ts(),))
+        if 'last_activity_ip' not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN last_activity_ip TEXT NOT NULL DEFAULT ''")
+        if 'last_activity_ip_at' not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN last_activity_ip_at TEXT NOT NULL DEFAULT ''")
         # comments_locked column (may not exist on older installs)
         tcols = [r[1] for r in c.execute('PRAGMA table_info(torrents)').fetchall()]
         if 'comments_locked' not in tcols:
@@ -3041,6 +3052,10 @@ class RegistrationDB:
         c.execute('CREATE INDEX IF NOT EXISTS idx_torrents_release_source_class ON torrents(release_source_class)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_torrents_release_provider ON torrents(release_provider)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_torrents_media_res_source ON torrents(media_type, release_resolution, release_source_class)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_login_history_user_logged ON login_history(user_id, logged_in_at DESC)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_login_history_ip_logged ON login_history(ip_address, logged_in_at DESC)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_activity_ip_history_user_seen ON user_activity_ip_history(user_id, seen_at DESC)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_activity_ip_history_ip_seen ON user_activity_ip_history(ip_address, seen_at DESC)')
         c.commit()
         try:
             self.backfill_torrent_classifications(limit=500)
@@ -6330,24 +6345,89 @@ class RegistrationDB:
         return len(rows)
 
     def record_login_ip(self, user_id: int, ip: str):
+        self._record_user_ip_history(
+            user_id=user_id,
+            ip=ip,
+            table='login_history',
+            time_col='logged_in_at',
+            cap=20,
+        )
+
+    def _record_user_ip_history(self, user_id: int, ip: str, table: str, time_col: str, cap: int = 20) -> None:
         ts = self._ts()
-        self._conn().execute(
-            'INSERT INTO login_history (user_id,ip_address,logged_in_at) VALUES (?,?,?)',
-            (user_id, ip, ts)
+        c = self._conn()
+        c.execute(
+            f'INSERT INTO {table} (user_id,ip_address,{time_col}) VALUES (?,?,?)',
+            (int(user_id), str(ip or ''), ts)
         )
-        # Keep only last 20 per user
-        self._conn().execute(
-            'DELETE FROM login_history WHERE user_id=? AND id NOT IN '
-            '(SELECT id FROM login_history WHERE user_id=? ORDER BY id DESC LIMIT 20)',
-            (user_id, user_id)
+        # Keep only newest N rows per user.
+        c.execute(
+            f'DELETE FROM {table} WHERE user_id=? AND id NOT IN '
+            f'(SELECT id FROM {table} WHERE user_id=? ORDER BY id DESC LIMIT ?)',
+            (int(user_id), int(user_id), max(1, int(cap)))
         )
-        self._conn().commit()
+        c.commit()
+
+    def record_activity_ip(self, user_id: int, ip: str, heartbeat_minutes: int = 15) -> bool:
+        """Record activity IP when changed or heartbeat window elapsed.
+
+        Returns True when a write happened, False when skipped.
+        """
+        txt_ip = str(ip or '').strip()
+        if not txt_ip:
+            return False
+        try:
+            txt_ip = str(ipaddress.ip_address(txt_ip))
+        except Exception:
+            return False
+        c = self._conn()
+        row = c.execute(
+            'SELECT last_activity_ip,last_activity_ip_at FROM users WHERE id=?',
+            (int(user_id),)
+        ).fetchone()
+        if not row:
+            return False
+        last_ip = str(row['last_activity_ip'] or '').strip()
+        last_at = str(row['last_activity_ip_at'] or '').strip()
+        should_write = (txt_ip != last_ip)
+        if not should_write:
+            last_dt = _parse_iso_ts(last_at)
+            if not last_dt:
+                should_write = True
+            else:
+                delta = datetime.datetime.now() - last_dt
+                should_write = delta >= datetime.timedelta(minutes=max(1, int(heartbeat_minutes)))
+        if not should_write:
+            return False
+        ts = self._ts()
+        c.execute(
+            'UPDATE users SET last_activity_ip=?, last_activity_ip_at=? WHERE id=?',
+            (txt_ip, ts, int(user_id))
+        )
+        c.execute(
+            'INSERT INTO user_activity_ip_history (user_id,ip_address,seen_at) VALUES (?,?,?)',
+            (int(user_id), txt_ip, ts)
+        )
+        c.execute(
+            'DELETE FROM user_activity_ip_history WHERE user_id=? AND id NOT IN '
+            '(SELECT id FROM user_activity_ip_history WHERE user_id=? ORDER BY id DESC LIMIT 20)',
+            (int(user_id), int(user_id))
+        )
+        c.commit()
+        return True
 
     def get_login_history(self, user_id: int, limit: int = 5) -> list:
         return self._conn().execute(
             'SELECT ip_address, logged_in_at FROM login_history '
             'WHERE user_id=? ORDER BY id DESC LIMIT ?',
             (user_id, limit)
+        ).fetchall()
+
+    def get_activity_history(self, user_id: int, limit: int = 20) -> list:
+        return self._conn().execute(
+            'SELECT ip_address, seen_at FROM user_activity_ip_history '
+            'WHERE user_id=? ORDER BY id DESC LIMIT ?',
+            (int(user_id), max(1, int(limit)))
         ).fetchall()
 
     def get_unique_recent_user_for_ip(self, ip: str, max_age_days: int):
@@ -6357,12 +6437,14 @@ class RegistrationDB:
         rows = self._conn().execute(
             '''SELECT DISTINCT u.id, u.username
                FROM users u
-               JOIN login_history lh ON lh.user_id=u.id
-               WHERE lh.ip_address=?
-                 AND lh.logged_in_at>=?
-                 AND u.is_disabled=0
+               JOIN (
+                    SELECT user_id FROM login_history WHERE ip_address=? AND logged_in_at>=?
+                    UNION
+                    SELECT user_id FROM user_activity_ip_history WHERE ip_address=? AND seen_at>=?
+               ) src ON src.user_id=u.id
+               WHERE u.is_disabled=0
                  AND COALESCE(u.link_torrent_activity, 1)=1''',
-            (ip, cutoff)
+            (ip, cutoff, ip, cutoff)
         ).fetchall()
         if len(rows) != 1:
             return None
@@ -6373,15 +6455,18 @@ class RegistrationDB:
         days = max(1, min(365, int(max_age_days)))
         cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat(timespec='seconds')
         rows = self._conn().execute(
-            '''SELECT lh.ip_address AS ip, MIN(u.username) AS username
-               FROM login_history lh
-               JOIN users u ON u.id=lh.user_id
-               WHERE lh.logged_in_at>=?
-                 AND u.is_disabled=0
+            '''SELECT src.ip AS ip, MIN(u.username) AS username
+               FROM (
+                    SELECT user_id, ip_address AS ip FROM login_history WHERE logged_in_at>=?
+                    UNION ALL
+                    SELECT user_id, ip_address AS ip FROM user_activity_ip_history WHERE seen_at>=?
+               ) src
+               JOIN users u ON u.id=src.user_id
+               WHERE u.is_disabled=0
                  AND COALESCE(u.link_torrent_activity, 1)=1
-               GROUP BY lh.ip_address
+               GROUP BY src.ip
                HAVING COUNT(DISTINCT u.id)=1''',
-            (cutoff,)
+            (cutoff, cutoff)
         ).fetchall()
         return {r['ip']: r['username'] for r in rows}
 
@@ -12163,26 +12248,37 @@ class RegistrationDB:
             'SELECT user_id,MAX(logged_in_at) AS last_seen FROM login_history WHERE ip_address=? GROUP BY user_id ORDER BY last_seen DESC LIMIT 3',
             (ip,)
         ).fetchall()
+        activity_rows = c.execute(
+            'SELECT user_id,MAX(seen_at) AS last_seen FROM user_activity_ip_history WHERE ip_address=? GROUP BY user_id ORDER BY last_seen DESC LIMIT 3',
+            (ip,)
+        ).fetchall()
         allow_rows = c.execute(
             'SELECT DISTINCT user_id FROM ip_allowlist WHERE ip_address=? ORDER BY user_id ASC LIMIT 3',
             (ip,)
         ).fetchall()
         login_ids = [int(r['user_id']) for r in login_rows if r['user_id'] is not None]
+        activity_ids = [int(r['user_id']) for r in activity_rows if r['user_id'] is not None]
         allow_ids = [int(r['user_id']) for r in allow_rows if r['user_id'] is not None]
-        if not login_ids and not allow_ids:
+        observed_ids = set(login_ids).union(set(activity_ids))
+        if not observed_ids and not allow_ids:
             return None, 'none', ''
-        common = set(login_ids).intersection(set(allow_ids))
+        common = observed_ids.intersection(set(allow_ids))
         if len(common) == 1:
             uid = list(common)[0]
-            return uid, 'strong', f'ip matched login_history and ip_allowlist for user_id={uid}'
-        if len(login_ids) == 1 and not allow_ids:
+            return uid, 'strong', f'ip matched observed_history(login/activity) and ip_allowlist for user_id={uid}'
+        if len(observed_ids) == 1 and not allow_ids:
+            uid = list(observed_ids)[0]
+            if uid in login_ids and uid in activity_ids:
+                return uid, 'possible', f'ip matched login_history and activity_history for user_id={uid}'
+            if uid in activity_ids:
+                return uid, 'possible', f'ip matched activity_history for user_id={uid}'
             uid = login_ids[0]
             return uid, 'possible', f'ip matched login_history for user_id={uid}'
-        if len(allow_ids) == 1 and not login_ids:
+        if len(allow_ids) == 1 and not observed_ids:
             uid = allow_ids[0]
             return uid, 'possible', f'ip matched ip_allowlist for user_id={uid}'
         # ambiguous multi-user mapping
-        return None, 'none', f'ip mapping ambiguous login_ids={login_ids} allow_ids={allow_ids}'
+        return None, 'none', f'ip mapping ambiguous login_ids={login_ids} activity_ids={activity_ids} allow_ids={allow_ids}'
 
     def security_create_event(self, *, source_ip: str, source_origin: str,
                               trigger_type: str, severity: str, confidence: float,
@@ -14856,6 +14952,13 @@ class ManageHandler(BaseHTTPRequestHandler):
             uid = int(user['id'])
         except Exception:
             return
+        # Activity IP attribution: update on IP change or 15-minute heartbeat.
+        try:
+            ip, _ = self._client_ip_info()
+            if ip:
+                REGISTRATION_DB.record_activity_ip(uid, ip, heartbeat_minutes=15)
+        except Exception as e:
+            log.debug('activity ip touch skipped uid=%s path=%s err=%s', uid, p, e)
         today = _today_iso()
         with DAILY_ACTIVITY_TOUCH_LOCK:
             if DAILY_ACTIVITY_TOUCH_CACHE.get(uid) == today:
@@ -18833,7 +18936,8 @@ class ManageHandler(BaseHTTPRequestHandler):
         torrents  = REGISTRATION_DB.list_torrents(user_id=user['id'], page=page, per_page=per_page)
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
-        history   = REGISTRATION_DB.get_login_history(user['id'], 5)
+        history   = REGISTRATION_DB.get_login_history(user['id'], 20)
+        activity_history = REGISTRATION_DB.get_activity_history(user['id'], 20)
         allowlist = REGISTRATION_DB.get_ip_allowlist(user['id'])
         ledger    = REGISTRATION_DB.get_points_ledger(user['id'], 50)
         topup_orders = REGISTRATION_DB.list_topup_orders(user_id=user['id'], limit=100)
@@ -18842,8 +18946,9 @@ class ManageHandler(BaseHTTPRequestHandler):
         msg      = urllib.parse.unquote(qs.get('msg', [''])[0])
         msg_type = qs.get('msg_type', ['error'])[0]
         self._send_html(_render_user_detail(user, user, torrents, history, is_super,
+                                            activity_history=activity_history,
                                             allowlist=allowlist, is_own_profile=True,
-                                            current_ip=(self.client_address[0] if self.client_address else ''),
+                                            current_ip=self._client_ip_info()[0],
                                             page=page, total_pages=total_pages,
                                             total=total, base_url='/manage/profile',
                                             ledger=ledger, bounty_data=bounty_data, topup_orders=topup_orders,
@@ -21138,13 +21243,15 @@ class ManageHandler(BaseHTTPRequestHandler):
         torrents = REGISTRATION_DB.list_torrents(user_id=target['id'], page=page, per_page=per_page)
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
-        history   = REGISTRATION_DB.get_login_history(target['id'], 5)
+        history   = REGISTRATION_DB.get_login_history(target['id'], 20)
+        activity_history = REGISTRATION_DB.get_activity_history(target['id'], 20)
         allowlist = REGISTRATION_DB.get_ip_allowlist(target['id'])
         topup_orders = REGISTRATION_DB.list_topup_orders(user_id=target['id'], limit=100)
         base_url  = f'/manage/admin/user/{username}'
         self._send_html(_render_user_detail(viewer, target, torrents, history, is_super,
+                                            activity_history=activity_history,
                                             allowlist=allowlist,
-                                            current_ip=(self.client_address[0] if self.client_address else ''),
+                                            current_ip=self._client_ip_info()[0],
                                             page=page, total_pages=total_pages,
                                             total=total, base_url=base_url,
                                             topup_orders=topup_orders,
@@ -28645,6 +28752,7 @@ def _unlock_at_value(target_user) -> str:
 
 
 def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
+                        activity_history=None,
                         allowlist=None, is_own_profile=False, current_ip='',
                         page: int = 1, total_pages: int = 1, total: int = 0, base_url: str = '',
                         ledger=None, bounty_data=None, topup_orders=None,
@@ -28652,6 +28760,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     uname   = target_user['username']
     uname_h = _h(uname)          # HTML-safe for output
     t_role = _user_role(target_user)
+    activity_history = activity_history or []
     role_badge = {
         'super':    '<span class="badge badge-super">SUPER</span>',
         'admin':    '<span class="badge badge-admin">ADMIN</span>',
@@ -28731,7 +28840,7 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
     # ── IP section (superuser only) ───────────────────────────
     ip_html = ''
     if is_super:
-        ip_rows = ''
+        login_ip_rows = ''
         if login_history:
             for h in login_history:
                 ip_h = _h(h['ip_address'])
@@ -28742,9 +28851,9 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                     'background:rgba(245,166,35,0.10);'
                     if is_current else ''
                 )
-                ip_rows += (
+                login_ip_rows += (
                     '<tr style="' + tr_style + '">'
-                    + '<td style="padding:6px 8px"><input type="checkbox" name="ip_check" value="'
+                    + '<td style="padding:6px 8px"><input type="checkbox" name="login_ip_check" value="'
                     + ip_h + '"></td>'
                     + '<td class="hash" style="padding:6px 8px">' + h['logged_in_at'][:16] + '</td>'
                     + '<td class="hash" style="word-break:break-all;padding:6px 8px;font-size:0.78rem">'
@@ -28754,7 +28863,33 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
                     + '</tr>'
                 )
         else:
-            ip_rows = '<tr><td colspan="3" class="empty">No login history yet</td></tr>'
+            login_ip_rows = '<tr><td colspan="3" class="empty">No login history yet</td></tr>'
+
+        activity_ip_rows = ''
+        if activity_history:
+            for h in activity_history:
+                ip_h = _h(h['ip_address'])
+                seen_at = str(h['seen_at'] or '')[:16]
+                is_current = bool(current_ip and h['ip_address'] == current_ip)
+                tr_style = (
+                    'border:1px solid rgba(245,166,35,0.45);'
+                    'box-shadow:inset 0 0 0 1px rgba(245,166,35,0.2);'
+                    'background:rgba(245,166,35,0.10);'
+                    if is_current else ''
+                )
+                activity_ip_rows += (
+                    '<tr style="' + tr_style + '">'
+                    + '<td style="padding:6px 8px"><input type="checkbox" name="activity_ip_check" value="'
+                    + ip_h + '"></td>'
+                    + '<td class="hash" style="padding:6px 8px">' + seen_at + '</td>'
+                    + '<td class="hash" style="word-break:break-all;padding:6px 8px;font-size:0.78rem">'
+                    + ip_h
+                    + (' <span class="pill" style="margin-left:8px">Current</span>' if is_current else '')
+                    + '</td>'
+                    + '</tr>'
+                )
+        else:
+            activity_ip_rows = '<tr><td colspan="3" class="empty">No activity history yet</td></tr>'
 
         allowlist = allowlist or (REGISTRATION_DB.get_ip_allowlist(target_user['id']) if REGISTRATION_DB else [])
         al_rows = ''
@@ -28776,20 +28911,21 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
 
         ip_lock_js = (
             '<script>(function(){'
-            + 'var ipLockBtn=document.getElementById("ip-lock-selected-btn");'
-            + 'if(!ipLockBtn)return;'
-            + 'function doIpLock(){'
-            + 'var cbs=document.querySelectorAll(\'input[name="ip_check"]:checked\');'
+            + 'function doIpLock(formId, checkName){'
+            + 'var cbs=document.querySelectorAll(\'input[name="\' + checkName + \'"]:checked\');'
             + 'if(!cbs.length){alert("Select at least one IP.");return;}'
             + 'var ips=Array.from(cbs).map(function(c){return c.value;}).join(",");'
-            + 'var f=document.getElementById("ip-lock-form");'
+            + 'var f=document.getElementById(formId);if(!f)return;'
             + 'var old=f.querySelector(\'input[name="selected_ips"]\');if(old){old.remove();}'
             + 'var h=document.createElement("input");h.type="hidden";h.name="selected_ips";h.value=ips;f.appendChild(h);'
             + 'if(!f.querySelector(\'input[name="_csrf"]\')){'
             + 'var m=document.cookie.match(/(?:^|;[ \\t]*)wkcsrf=([^;]+)/);'
             + 'var c=document.createElement("input");c.type="hidden";c.name="_csrf";c.value=(m?m[1]:"");f.appendChild(c);}'
             + 'f.submit();}'
-            + 'ipLockBtn.addEventListener("click",doIpLock);'
+            + 'var loginBtn=document.getElementById("ip-lock-login-selected-btn");'
+            + 'if(loginBtn){loginBtn.addEventListener("click",function(){doIpLock("ip-lock-login-form","login_ip_check");});}'
+            + 'var activityBtn=document.getElementById("ip-lock-activity-selected-btn");'
+            + 'if(activityBtn){activityBtn.addEventListener("click",function(){doIpLock("ip-lock-activity-form","activity_ip_check");});}'
             + '})();'
             + '</script>'
         )
@@ -28808,18 +28944,32 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             '<div class="two-col">'
             + '<div class="card" style="overflow:hidden">'
             + '<div class="card-title">Recent Login IPs</div>'
-            + '<form id="ip-lock-form" method="POST" action="/manage/admin/ip-lock">'
+            + '<form id="ip-lock-login-form" method="POST" action="/manage/admin/ip-lock">'
             + '<input type="hidden" name="user_id" value="' + str(target_user['id']) + '">'
             + '<div style="overflow-x:auto"><table style="table-layout:fixed;width:100%;border-collapse:collapse">'
             + '<tr><th scope="col" style="width:28px;padding:6px 8px"></th>'
             + '<th scope="col" style="width:36%;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">TIME</th>'
             + '<th scope="col" style="padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">IP ADDRESS</th></tr>'
-            + ip_rows
+            + login_ip_rows
             + '</table></div>'
             + '<div style="margin-top:12px">'
-            + '<button type="button" id="ip-lock-selected-btn" class="btn btn-sm btn-primary">&#128274; IP Lock Selected</button>'
+            + '<button type="button" id="ip-lock-login-selected-btn" class="btn btn-sm btn-primary">&#128274; IP Lock Selected</button>'
             + '</div></form></div>'
             + '<div class="card" style="overflow:hidden">'
+            + '<div class="card-title">Recent Activity IPs</div>'
+            + '<form id="ip-lock-activity-form" method="POST" action="/manage/admin/ip-lock">'
+            + '<input type="hidden" name="user_id" value="' + str(target_user['id']) + '">'
+            + '<div style="overflow-x:auto"><table style="table-layout:fixed;width:100%;border-collapse:collapse">'
+            + '<tr><th scope="col" style="width:28px;padding:6px 8px"></th>'
+            + '<th scope="col" style="width:36%;padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">TIME</th>'
+            + '<th scope="col" style="padding:6px 8px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.1em;color:var(--muted);text-align:left">IP ADDRESS</th></tr>'
+            + activity_ip_rows
+            + '</table></div>'
+            + '<div style="margin-top:12px">'
+            + '<button type="button" id="ip-lock-activity-selected-btn" class="btn btn-sm btn-primary">&#128274; IP Lock Selected</button>'
+            + '</div></form></div>'
+            + '</div>'
+            + '<div class="card" style="overflow:hidden;margin-top:14px">'
             + '<div class="card-title">IP Allowlist</div>'
             + '<div style="overflow-x:auto"><table style="table-layout:fixed;width:100%;border-collapse:collapse">'
             + '<colgroup><col style="width:62%"><col style="width:26%"><col style="width:120px"></colgroup>'
@@ -28832,7 +28982,6 @@ def _render_user_detail(viewer, target_user, torrents, login_history, is_super,
             + '</table></div>'
             + '<div style="overflow:hidden">'
             + clear_btn
-            + '</div>'
             + '</div>'
             + '</div>'
             + ip_lock_js
