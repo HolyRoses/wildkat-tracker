@@ -6345,25 +6345,36 @@ class RegistrationDB:
         return len(rows)
 
     def record_login_ip(self, user_id: int, ip: str):
-        self._record_user_ip_history(
-            user_id=user_id,
-            ip=ip,
-            table='login_history',
-            time_col='logged_in_at',
-            cap=20,
-        )
+        # C-02 hardening: normalize/validate login IP before write.
+        norm_ip = self._normalize_ip_for_storage(ip)
+        if not norm_ip:
+            return
+        self._append_login_history(int(user_id), norm_ip, cap=20)
 
-    def _record_user_ip_history(self, user_id: int, ip: str, table: str, time_col: str, cap: int = 20) -> None:
+    def _append_login_history(self, user_id: int, ip: str, cap: int = 20) -> None:
         ts = self._ts()
         c = self._conn()
         c.execute(
-            f'INSERT INTO {table} (user_id,ip_address,{time_col}) VALUES (?,?,?)',
+            'INSERT INTO login_history (user_id,ip_address,logged_in_at) VALUES (?,?,?)',
             (int(user_id), str(ip or ''), ts)
         )
-        # Keep only newest N rows per user.
         c.execute(
-            f'DELETE FROM {table} WHERE user_id=? AND id NOT IN '
-            f'(SELECT id FROM {table} WHERE user_id=? ORDER BY id DESC LIMIT ?)',
+            'DELETE FROM login_history WHERE user_id=? AND id NOT IN '
+            '(SELECT id FROM login_history WHERE user_id=? ORDER BY id DESC LIMIT ?)',
+            (int(user_id), int(user_id), max(1, int(cap)))
+        )
+        c.commit()
+
+    def _append_activity_history(self, user_id: int, ip: str, cap: int = 20) -> None:
+        ts = self._ts()
+        c = self._conn()
+        c.execute(
+            'INSERT INTO user_activity_ip_history (user_id,ip_address,seen_at) VALUES (?,?,?)',
+            (int(user_id), str(ip or ''), ts)
+        )
+        c.execute(
+            'DELETE FROM user_activity_ip_history WHERE user_id=? AND id NOT IN '
+            '(SELECT id FROM user_activity_ip_history WHERE user_id=? ORDER BY id DESC LIMIT ?)',
             (int(user_id), int(user_id), max(1, int(cap)))
         )
         c.commit()
@@ -6373,12 +6384,8 @@ class RegistrationDB:
 
         Returns True when a write happened, False when skipped.
         """
-        txt_ip = str(ip or '').strip()
+        txt_ip = self._normalize_ip_for_storage(ip)
         if not txt_ip:
-            return False
-        try:
-            txt_ip = str(ipaddress.ip_address(txt_ip))
-        except Exception:
             return False
         c = self._conn()
         row = c.execute(
@@ -6404,16 +6411,8 @@ class RegistrationDB:
             'UPDATE users SET last_activity_ip=?, last_activity_ip_at=? WHERE id=?',
             (txt_ip, ts, int(user_id))
         )
-        c.execute(
-            'INSERT INTO user_activity_ip_history (user_id,ip_address,seen_at) VALUES (?,?,?)',
-            (int(user_id), txt_ip, ts)
-        )
-        c.execute(
-            'DELETE FROM user_activity_ip_history WHERE user_id=? AND id NOT IN '
-            '(SELECT id FROM user_activity_ip_history WHERE user_id=? ORDER BY id DESC LIMIT 20)',
-            (int(user_id), int(user_id))
-        )
         c.commit()
+        self._append_activity_history(int(user_id), txt_ip, cap=20)
         return True
 
     def get_login_history(self, user_id: int, limit: int = 5) -> list:
@@ -12277,8 +12276,18 @@ class RegistrationDB:
         if len(allow_ids) == 1 and not observed_ids:
             uid = allow_ids[0]
             return uid, 'possible', f'ip matched ip_allowlist for user_id={uid}'
-        # ambiguous multi-user mapping
-        return None, 'none', f'ip mapping ambiguous login_ids={login_ids} activity_ids={activity_ids} allow_ids={allow_ids}'
+        # C-03 policy note:
+        # We currently allow activity-history-only attribution as 'possible'.
+        # A future policy patch may require at least one login_history match for
+        # higher-confidence security attribution in shared-IP environments.
+        #
+        # C-04 hardening: persist only counts (not raw user-id lists) in event evidence.
+        log.debug('security attribution ambiguous ip=%s login_ids=%s activity_ids=%s allow_ids=%s',
+                  ip, login_ids, activity_ids, allow_ids)
+        return None, 'none', (
+            f'ip mapping ambiguous login_count={len(login_ids)} '
+            f'activity_count={len(activity_ids)} allow_count={len(allow_ids)}'
+        )
 
     def security_create_event(self, *, source_ip: str, source_origin: str,
                               trigger_type: str, severity: str, confidence: float,
