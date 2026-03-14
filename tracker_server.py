@@ -47,6 +47,7 @@ import io
 import json
 import logging
 import os
+import posixpath
 import re
 import random
 import shlex
@@ -140,6 +141,8 @@ WILD_INTAKE_DEFAULT_WORKER_CONCURRENCY = 5
 WILD_INTAKE_DEFAULT_MAX_QUEUE = 20
 WILD_INTAKE_DEFAULT_RETRY_BASE_SECONDS = 15 * 60
 WILD_INTAKE_DEFAULT_RETRY_MAX_SECONDS = 7 * 24 * 60 * 60
+WILD_INTAKE_ANNOUNCE_HASH_DEBOUNCE_SECONDS = 10
+WILD_INTAKE_ANNOUNCE_NEW_HASH_PER_IP_WINDOW_SECONDS = 60
 ACCOUNT_DELETE_CHALLENGE_TTL_MINUTES = 5
 WEBAUTHN_CHALLENGE_TTL_SECONDS = 300
 TFA_CHALLENGE_TTL_SECONDS = 300
@@ -882,6 +885,15 @@ class PeerRegistry:
             torrent_count = sum(1 for peers in self._torrents.values() if peers)
             peer_count = sum(len(peers) for peers in self._torrents.values())
             return torrent_count, peer_count
+
+    def evict_info_hash(self, ih_hex: str) -> None:
+        """Remove a swarm entirely from in-memory peer/download caches."""
+        ih = str(ih_hex or '').strip().upper()
+        if not ih:
+            return
+        with self._lock:
+            self._torrents.pop(ih, None)
+            self._downloaded.pop(ih, None)
 
 
 # Module-level shared registry (shared by all handler threads + UDP thread)
@@ -2415,6 +2427,12 @@ class RegistrationDB:
         self._restore_gen  = 0   # incremented on every restore; forces conn reopen
         self._last_seen_lock = threading.Lock()
         self._last_seen_cache = {}
+        self._wild_announce_gate_lock = threading.Lock()
+        self._wild_announce_hash_seen: dict[str, float] = {}
+        self._wild_announce_ip_seen: dict[str, tuple[str, float]] = {}
+        self._wild_owner_warn_lock = threading.Lock()
+        self._wild_owner_warn_at = 0.0
+        self._wild_owner_warn_msg = ''
         self._tfa_fernet = _build_tfa_fernet()
         if (os.getenv('WK_TFA_SECRET_KEY', '') or '').strip() and not self._tfa_fernet:
             err = _TFA_FERNET_INIT_ERROR or 'WK_TFA_SECRET_KEY is set but invalid'
@@ -2456,6 +2474,65 @@ class RegistrationDB:
             c.rollback()
         except Exception:
             pass
+
+    @staticmethod
+    def _normalize_ip_for_storage(raw: str) -> str:
+        txt = str(raw or '').strip()
+        if not txt:
+            return ''
+        try:
+            return ipaddress.ip_address(txt).compressed
+        except Exception:
+            return ''
+
+    def _wild_intake_announce_gate(self, info_hash: str, source_ip: str) -> tuple[bool, str]:
+        """In-memory debounce/rate-limit for announce-driven wild intake.
+
+        - Debounce duplicate hash attempts for a short window.
+        - Limit each source IP to one *new* hash submission per minute.
+        """
+        ih = str(info_hash or '').strip().upper()
+        ip = self._normalize_ip_for_storage(source_ip)
+        if not ih or not ip:
+            return False, 'invalid source ip'
+        now_ts = time.time()
+        hash_ttl = float(WILD_INTAKE_ANNOUNCE_HASH_DEBOUNCE_SECONDS * 3)
+        ip_ttl = float(WILD_INTAKE_ANNOUNCE_NEW_HASH_PER_IP_WINDOW_SECONDS * 3)
+        with self._wild_announce_gate_lock:
+            # Prune stale entries to keep memory bounded.
+            stale_hashes = [k for k, ts in self._wild_announce_hash_seen.items() if (now_ts - float(ts)) > hash_ttl]
+            for k in stale_hashes:
+                self._wild_announce_hash_seen.pop(k, None)
+            stale_ips = [k for k, v in self._wild_announce_ip_seen.items() if (now_ts - float(v[1])) > ip_ttl]
+            for k in stale_ips:
+                self._wild_announce_ip_seen.pop(k, None)
+
+            last_hash_ts = float(self._wild_announce_hash_seen.get(ih, 0.0) or 0.0)
+            if last_hash_ts > 0 and (now_ts - last_hash_ts) < float(WILD_INTAKE_ANNOUNCE_HASH_DEBOUNCE_SECONDS):
+                return False, 'debounced'
+
+            last = self._wild_announce_ip_seen.get(ip)
+            if last:
+                prev_ih, prev_ts = str(last[0] or ''), float(last[1] or 0.0)
+                if prev_ih != ih and (now_ts - prev_ts) < float(WILD_INTAKE_ANNOUNCE_NEW_HASH_PER_IP_WINDOW_SECONDS):
+                    return False, 'rate_limited'
+
+            self._wild_announce_hash_seen[ih] = now_ts
+            self._wild_announce_ip_seen[ip] = (ih, now_ts)
+        return True, ''
+
+    def _warn_wild_owner_invalid_once(self, msg: str, min_interval_sec: int = 60) -> None:
+        txt = str(msg or '').strip()[:240]
+        if not txt:
+            return
+        now_ts = time.time()
+        with self._wild_owner_warn_lock:
+            recent_same = (txt == self._wild_owner_warn_msg and (now_ts - float(self._wild_owner_warn_at)) < float(max(1, min_interval_sec)))
+            if recent_same:
+                return
+            self._wild_owner_warn_msg = txt
+            self._wild_owner_warn_at = now_ts
+        log.warning('wild intake disabled path: %s', txt)
 
     def _init_schema(self):
         c = self._conn()
@@ -5452,9 +5529,11 @@ class RegistrationDB:
     def _validate_wild_intake_owner(self, cfg: dict):
         owner_name = str(cfg.get('owner_user') or '').strip()
         if not owner_name:
+            self._warn_wild_owner_invalid_once('wild intake owner account is not configured')
             return None, 'wild intake owner account is not configured'
         owner = self.get_user(owner_name)
         if not owner or int(owner['is_disabled'] or 0) == 1:
+            self._warn_wild_owner_invalid_once(f'wild intake owner account is invalid: {owner_name}')
             return None, f'wild intake owner account is invalid: {owner_name}'
         return owner, ''
 
@@ -5479,7 +5558,18 @@ class RegistrationDB:
         rbt = str(requested_by_type or 'announce').strip().lower()
         if rbt not in ('announce', 'manual', 'report'):
             rbt = 'announce'
-        rbv = str(requested_by_value or '')[:255]
+        if rbt == 'announce':
+            # Privacy note (F14): we intentionally store normalized source IP for
+            # operator forensics/correlation. Hashing is acknowledged and deferred
+            # by current product decision; revisit if policy changes.
+            rbv = self._normalize_ip_for_storage(requested_by_value)
+            if not rbv:
+                return False, 'invalid source ip'
+            gate_ok, gate_reason = self._wild_intake_announce_gate(ih, rbv)
+            if not gate_ok:
+                return False, gate_reason
+        else:
+            rbv = _sanitize_log_text(str(requested_by_value or ''))[:255]
         for attempt in range(8):
             try:
                 c = self._conn()
@@ -5523,7 +5613,7 @@ class RegistrationDB:
                         c.execute('COMMIT')
                         return False, 'cooldown'
                 active = c.execute(
-                    "SELECT COUNT(*) AS n FROM magnet_jobs WHERE status IN ('queued','running')"
+                    "SELECT COUNT(*) AS n FROM magnet_jobs WHERE submission_source='wild_intake' AND status IN ('queued','running')"
                 ).fetchone()
                 if int((active['n'] if active else 0) or 0) >= int(cfg.get('max_queue') or WILD_INTAKE_DEFAULT_MAX_QUEUE):
                     c.execute('COMMIT')
@@ -5619,7 +5709,7 @@ class RegistrationDB:
                     c.execute('ROLLBACK')
                     return False, f'Per-user queue limit reached ({int(cfg["max_user_running"])}).', 0, info_hash
                 global_active = c.execute(
-                    "SELECT COUNT(*) AS n FROM magnet_jobs WHERE status IN ('queued','running')"
+                    "SELECT COUNT(*) AS n FROM magnet_jobs WHERE submission_source='user' AND status IN ('queued','running')"
                 ).fetchone()
                 if int((global_active['n'] if global_active else 0) or 0) >= int(cfg['max_global_running']):
                     c.execute('ROLLBACK')
@@ -5653,7 +5743,8 @@ class RegistrationDB:
                 c = self._conn()
                 # Avoid unnecessary IMMEDIATE transactions while idle.
                 queued = c.execute(
-                    "SELECT id FROM magnet_jobs WHERE status='queued' ORDER BY id ASC LIMIT 1"
+                    "SELECT id FROM magnet_jobs WHERE status='queued' "
+                    "ORDER BY CASE WHEN submission_source='user' THEN 0 ELSE 1 END, id ASC LIMIT 1"
                 ).fetchone()
                 if not queued:
                     return None
@@ -5667,7 +5758,7 @@ class RegistrationDB:
                 row = c.execute(
                     '''SELECT * FROM magnet_jobs
                        WHERE status='queued'
-                       ORDER BY id ASC
+                       ORDER BY CASE WHEN submission_source='user' THEN 0 ELSE 1 END, id ASC
                        LIMIT 1'''
                 ).fetchone()
                 if not row:
@@ -5851,21 +5942,21 @@ class RegistrationDB:
 
     def list_wild_intake_reports(self, limit: int = 50, offset: int = 0,
                                  q_status: str = '', q_search: str = '') -> tuple[list, int]:
-        clauses: list[str] = []
-        params: list[Any] = []
         status = (q_status or '').strip().lower()
-        if status in ('suppressed', 'allowed'):
-            clauses.append('s.status=?')
-            params.append(status)
+        status_filter = status if status in ('suppressed', 'allowed') else ''
         q = (q_search or '').strip()
-        if q:
-            q_like = f'%{q}%'
-            q_ih = f'%{q.upper()}%'
-            clauses.append(
-                "(s.info_hash LIKE ? OR s.added_name LIKE ? OR COALESCE(t.name,'') LIKE ? OR COALESCE(s.suppress_reason,'') LIKE ?)"
-            )
-            params.extend([q_ih, q_like, q_like, q_like])
-        where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        q_like = f'%{q}%' if q else ''
+        q_ih = f'%{q.upper()}%' if q else ''
+        # F7 hardening: keep SQL structure static and only vary bound parameters.
+        where = (
+            "WHERE (?='' OR s.status=?) "
+            "AND (?='' OR (s.info_hash LIKE ? OR s.added_name LIKE ? "
+            "OR COALESCE(t.name,'') LIKE ? OR COALESCE(s.suppress_reason,'') LIKE ?))"
+        )
+        params: list[Any] = [
+            status_filter, status_filter,
+            q, q_ih, q_like, q_like, q_like,
+        ]
         rows = self._conn().execute(
             '''SELECT s.*,
                       t.name AS torrent_name,
@@ -5962,6 +6053,8 @@ class RegistrationDB:
                     c.execute('DELETE FROM torrent_report_actions WHERE report_id IN (SELECT id FROM torrent_reports WHERE info_hash=?)', (ih,))
                     c.execute('DELETE FROM torrent_reports WHERE info_hash=?', (ih,))
                     c.execute('DELETE FROM torrents WHERE info_hash=?', (ih,))
+                    # Keep in-memory tracker state aligned with DB suppression.
+                    REGISTRY.evict_info_hash(ih)
                     action_type = 'delete_suppress'
                     c.execute(
                         '''UPDATE wild_intake_hash_state
@@ -10277,7 +10370,7 @@ class RegistrationDB:
                       ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
                     (value, *facet_params, *exclude_t_params, per_page, offset)
                 ).fetchall()
-            tail = (f' AND {facet_sql}' if facet_sql else '')
+            tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
             return self._conn().execute(
                 '''SELECT t.* FROM torrents t
                    JOIN torrent_metadata_links l
@@ -10286,7 +10379,7 @@ class RegistrationDB:
                     AND l.provider='imdb' AND LOWER(l.external_id)=?
                   ''' + tail + '''
                   ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                (user_id, value, *facet_params, per_page, offset)
+                (user_id, value, *facet_params, *exclude_t_params, per_page, offset)
             ).fetchall()
         if mode == 'tvmaze':
             if user_id is None:
@@ -10300,7 +10393,7 @@ class RegistrationDB:
                       ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
                     (value, *facet_params, *exclude_t_params, per_page, offset)
                 ).fetchall()
-            tail = (f' AND {facet_sql}' if facet_sql else '')
+            tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
             return self._conn().execute(
                 '''SELECT t.* FROM torrents t
                    JOIN torrent_metadata_links l
@@ -10309,7 +10402,7 @@ class RegistrationDB:
                     AND l.provider='tvmaze' AND l.external_id=?
                   ''' + tail + '''
                   ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                (user_id, value, *facet_params, per_page, offset)
+                (user_id, value, *facet_params, *exclude_t_params, per_page, offset)
             ).fetchall()
         if mode == 'steam':
             if user_id is None:
@@ -10323,7 +10416,7 @@ class RegistrationDB:
                       ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
                     (value, *facet_params, *exclude_t_params, per_page, offset)
                 ).fetchall()
-            tail = (f' AND {facet_sql}' if facet_sql else '')
+            tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
             return self._conn().execute(
                 '''SELECT t.* FROM torrents t
                    JOIN torrent_metadata_links l
@@ -10332,7 +10425,7 @@ class RegistrationDB:
                     AND l.provider='steam' AND l.external_id=?
                   ''' + tail + '''
                   ORDER BY t.registered_at DESC LIMIT ? OFFSET ?''',
-                (user_id, value, *facet_params, per_page, offset)
+                (user_id, value, *facet_params, *exclude_t_params, per_page, offset)
             ).fetchall()
         if user_id is None:
             facet_tail = (f' AND ({facet_sql_plain})' if facet_sql_plain else '') + exclude_plain_sql
@@ -10342,12 +10435,12 @@ class RegistrationDB:
                 'ORDER BY registered_at DESC LIMIT ? OFFSET ?',
                 (*params, *facet_params_plain, *exclude_plain_params, per_page, offset)
             ).fetchall()
-        facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
+        facet_tail = (f' AND ({facet_sql_plain})' if facet_sql_plain else '') + exclude_plain_sql
         return self._conn().execute(
             f'SELECT * FROM torrents WHERE uploaded_by_id=? AND ({where}) '
             f'{facet_tail} '
             'ORDER BY registered_at DESC LIMIT ? OFFSET ?',
-            (user_id, *params, *facet_params_plain, per_page, offset)
+            (user_id, *params, *facet_params_plain, *exclude_plain_params, per_page, offset)
         ).fetchall()
 
     def count_search_torrents(self, query: str, user_id: int | None = None,
@@ -10369,14 +10462,14 @@ class RegistrationDB:
                       WHERE l.status='active' AND l.provider='imdb' AND LOWER(l.external_id)=?''' + tail,
                     (value, *facet_params, *exclude_t_params)
                 ).fetchone()[0]
-            tail = (f' AND {facet_sql}' if facet_sql else '')
+            tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
             return self._conn().execute(
                 '''SELECT COUNT(*) FROM torrents t
                    JOIN torrent_metadata_links l
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
                     AND l.provider='imdb' AND LOWER(l.external_id)=?''' + tail,
-                (user_id, value, *facet_params)
+                (user_id, value, *facet_params, *exclude_t_params)
             ).fetchone()[0]
         if mode == 'tvmaze':
             if user_id is None:
@@ -10388,14 +10481,14 @@ class RegistrationDB:
                       WHERE l.status='active' AND l.provider='tvmaze' AND l.external_id=?''' + tail,
                     (value, *facet_params, *exclude_t_params)
                 ).fetchone()[0]
-            tail = (f' AND {facet_sql}' if facet_sql else '')
+            tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
             return self._conn().execute(
                 '''SELECT COUNT(*) FROM torrents t
                    JOIN torrent_metadata_links l
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
                     AND l.provider='tvmaze' AND l.external_id=?''' + tail,
-                (user_id, value, *facet_params)
+                (user_id, value, *facet_params, *exclude_t_params)
             ).fetchone()[0]
         if mode == 'steam':
             if user_id is None:
@@ -10407,14 +10500,14 @@ class RegistrationDB:
                       WHERE l.status='active' AND l.provider='steam' AND l.external_id=?''' + tail,
                     (value, *facet_params, *exclude_t_params)
                 ).fetchone()[0]
-            tail = (f' AND {facet_sql}' if facet_sql else '')
+            tail = (f' AND {facet_sql}' if facet_sql else '') + exclude_t_sql
             return self._conn().execute(
                 '''SELECT COUNT(*) FROM torrents t
                    JOIN torrent_metadata_links l
                      ON l.info_hash=t.info_hash
                   WHERE t.uploaded_by_id=? AND l.status='active'
                     AND l.provider='steam' AND l.external_id=?''' + tail,
-                (user_id, value, *facet_params)
+                (user_id, value, *facet_params, *exclude_t_params)
             ).fetchone()[0]
         if user_id is None:
             facet_tail = (f' AND ({facet_sql_plain})' if facet_sql_plain else '') + exclude_plain_sql
@@ -10422,10 +10515,10 @@ class RegistrationDB:
                 f'SELECT COUNT(*) FROM torrents WHERE {where}{facet_tail}',
                 (*params, *facet_params_plain, *exclude_plain_params)
             ).fetchone()[0]
-        facet_tail = f' AND ({facet_sql_plain})' if facet_sql_plain else ''
+        facet_tail = (f' AND ({facet_sql_plain})' if facet_sql_plain else '') + exclude_plain_sql
         return self._conn().execute(
             f'SELECT COUNT(*) FROM torrents WHERE uploaded_by_id=? AND ({where}){facet_tail}',
-            (user_id, *params, *facet_params_plain)
+            (user_id, *params, *facet_params_plain, *exclude_plain_params)
         ).fetchone()[0]
 
     def count_torrents(self, user_id: int | None = None,
@@ -10446,13 +10539,18 @@ class RegistrationDB:
                     (*facet_params, *exclude_params)
                 ).fetchone()[0]
             return self._conn().execute('SELECT COUNT(*) FROM torrents').fetchone()[0]
+        where_parts = ['uploaded_by_id=?']
+        query_params: list[Any] = [user_id]
         if facet_sql:
-            return self._conn().execute(
-                f'SELECT COUNT(*) FROM torrents WHERE uploaded_by_id=? AND ({facet_sql})',
-                (user_id, *facet_params)
-            ).fetchone()[0]
+            where_parts.append(f'({facet_sql})')
+            query_params.extend(facet_params)
+        if exclude_sql:
+            where_parts.append(exclude_sql[5:])  # strip leading " AND "
+            query_params.extend(exclude_params)
+        where = ' AND '.join(where_parts)
         return self._conn().execute(
-            'SELECT COUNT(*) FROM torrents WHERE uploaded_by_id=?', (user_id,)
+            f'SELECT COUNT(*) FROM torrents WHERE {where}',
+            tuple(query_params)
         ).fetchone()[0]
 
     def list_torrents(self, user_id: int | None = None,
@@ -10478,14 +10576,18 @@ class RegistrationDB:
                 return self._conn().execute(
                     'SELECT * FROM torrents ORDER BY registered_at DESC'
                 ).fetchall()
+            where_parts = ['uploaded_by_id=?']
+            query_params: list[Any] = [user_id]
             if facet_sql:
-                return self._conn().execute(
-                    f'SELECT * FROM torrents WHERE uploaded_by_id=? AND ({facet_sql}) ORDER BY registered_at DESC',
-                    (user_id, *facet_params)
-                ).fetchall()
+                where_parts.append(f'({facet_sql})')
+                query_params.extend(facet_params)
+            if exclude_sql:
+                where_parts.append(exclude_sql[5:])  # strip leading " AND "
+                query_params.extend(exclude_params)
+            where = ' AND '.join(where_parts)
             return self._conn().execute(
-                'SELECT * FROM torrents WHERE uploaded_by_id=? ORDER BY registered_at DESC',
-                (user_id,)
+                f'SELECT * FROM torrents WHERE {where} ORDER BY registered_at DESC',
+                tuple(query_params)
             ).fetchall()
         offset = (max(1, page) - 1) * per_page
         if user_id is None:
@@ -10504,14 +10606,19 @@ class RegistrationDB:
                 'SELECT * FROM torrents ORDER BY registered_at DESC LIMIT ? OFFSET ?',
                 (per_page, offset)
             ).fetchall()
+        where_parts = ['uploaded_by_id=?']
+        query_params: list[Any] = [user_id]
         if facet_sql:
-            return self._conn().execute(
-                f'SELECT * FROM torrents WHERE uploaded_by_id=? AND ({facet_sql}) ORDER BY registered_at DESC LIMIT ? OFFSET ?',
-                (user_id, *facet_params, per_page, offset)
-            ).fetchall()
+            where_parts.append(f'({facet_sql})')
+            query_params.extend(facet_params)
+        if exclude_sql:
+            where_parts.append(exclude_sql[5:])  # strip leading " AND "
+            query_params.extend(exclude_params)
+        where = ' AND '.join(where_parts)
+        query_params.extend([per_page, offset])
         return self._conn().execute(
-            'SELECT * FROM torrents WHERE uploaded_by_id=? ORDER BY registered_at DESC LIMIT ? OFFSET ?',
-            (user_id, per_page, offset)
+            f'SELECT * FROM torrents WHERE {where} ORDER BY registered_at DESC LIMIT ? OFFSET ?',
+            tuple(query_params)
         ).fetchall()
 
     def delete_torrent(self, ih: str, actor: str):
@@ -12478,7 +12585,6 @@ class TrackerHTTPHandler(BaseHTTPRequestHandler):
                         requested_by_type='announce',
                         requested_by_value=str(self.client_address[0] if self.client_address else '')
                     )
-                    _start_magnet_workers()
                 except Exception as e:
                     log.debug('wild intake enqueue skipped (non-fatal): ih=%s err=%s', ih_hex, e)
             if not OPEN_TRACKER and not is_reg:
@@ -12837,7 +12943,6 @@ def _handle_udp_packet(sock: socket.socket, data: bytes, addr):
                             requested_by_type='announce',
                             requested_by_value=str(client_ip or '')
                         )
-                        _start_magnet_workers()
                     except Exception as e:
                         log.debug('wild intake enqueue skipped (non-fatal): ih=%s err=%s', ih_hex, e)
                 if not OPEN_TRACKER and not is_reg:
@@ -15043,6 +15148,47 @@ class ManageHandler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _check_csrf(self, fields: dict[str, str]) -> bool:
+        """Session-bound CSRF check for form posts in handlers.
+
+        This is intentionally redundant with the global POST gate in do_POST for
+        defense in depth and to keep security-sensitive handlers self-contained.
+        """
+        token = self._current_valid_session_token()
+        if not token:
+            return False
+        submitted = (self.headers.get('X-CSRF-Token', '') or '').strip()
+        if not submitted:
+            submitted = (fields.get('_csrf', '') or '').strip()
+        expected = _csrf_token(token)
+        return bool(submitted and hmac.compare_digest(expected, submitted))
+
+    def _safe_manage_redirect(self, raw: str, fallback: str = '/manage/dashboard',
+                              allowed_prefixes: tuple[str, ...] = ('/manage/',)) -> str:
+        """Return a normalized safe in-app redirect target.
+
+        Rejects absolute URLs and dot-segment traversal tricks by normalizing the
+        path before prefix checks.
+        """
+        val = urllib.parse.unquote((raw or '').strip())
+        if not val:
+            return fallback
+        parsed = urllib.parse.urlparse(val)
+        if parsed.scheme or parsed.netloc:
+            return fallback
+        path = parsed.path or ''
+        if not path.startswith('/'):
+            return fallback
+        norm_path = posixpath.normpath(path)
+        if path.endswith('/') and not norm_path.endswith('/'):
+            norm_path += '/'
+        if not any(norm_path.startswith(pfx) for pfx in allowed_prefixes):
+            return fallback
+        if norm_path in ('.', '..', '/'):
+            return fallback
+        query = parsed.query or ''
+        return f'{norm_path}?{query}' if query else norm_path
+
     def _send_json_with_session(self, data: dict, session_token: str, code: int = 200):
         body = json.dumps(data).encode('utf-8')
         self.send_response(code)
@@ -15578,11 +15724,11 @@ class ManageHandler(BaseHTTPRequestHandler):
             blocked_ids = [int(r['id']) for r in blocked_rows if int(r['id'] or 0) > 0]
         total = REGISTRATION_DB.count_torrents(
             user_id=uid, facets=facets,
-            exclude_uploader_ids=blocked_ids if uid is None else None
+            exclude_uploader_ids=blocked_ids
         )
         torrents = REGISTRATION_DB.list_torrents(
             user_id=uid, page=page, per_page=per_page, facets=facets,
-            exclude_uploader_ids=blocked_ids if uid is None else None
+            exclude_uploader_ids=blocked_ids
         )
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
@@ -16066,12 +16212,18 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage/dashboard')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
+        if not self._check_csrf(fields):
+            return self._redirect('/manage?msg=csrf')
         info_hash = (fields.get('info_hash', '') or '').strip().upper()
         action = (fields.get('action', '') or '').strip().lower()
         note = (fields.get('note', '') or '').strip()
         reason = (fields.get('reason', '') or '').strip()
         from_report_id = (fields.get('from_report_id', '') or '').strip()
-        back = urllib.parse.unquote((fields.get('back', '') or '').strip())
+        back = self._safe_manage_redirect(
+            fields.get('back', ''),
+            fallback='/manage/admin?tab=wild-intake',
+            allowed_prefixes=('/manage/admin',)
+        )
         ok, msg = REGISTRATION_DB.apply_wild_intake_action(
             info_hash, int(user['id']), user['username'],
             action, note=note, reason=reason
@@ -18610,20 +18762,20 @@ class ManageHandler(BaseHTTPRequestHandler):
         if query:
             total = REGISTRATION_DB.count_search_torrents(
                 query, user_id=uid, facets=facets,
-                exclude_uploader_ids=blocked_ids if uid is None else None
+                exclude_uploader_ids=blocked_ids
             )
             torrents = REGISTRATION_DB.search_torrents(
                 query, user_id=uid, page=page, per_page=per_page, facets=facets,
-                exclude_uploader_ids=blocked_ids if uid is None else None
+                exclude_uploader_ids=blocked_ids
             )
         else:
             total = REGISTRATION_DB.count_torrents(
                 user_id=uid, facets=facets,
-                exclude_uploader_ids=blocked_ids if uid is None else None
+                exclude_uploader_ids=blocked_ids
             )
             torrents = REGISTRATION_DB.list_torrents(
                 user_id=uid, page=page, per_page=per_page, facets=facets,
-                exclude_uploader_ids=blocked_ids if uid is None else None
+                exclude_uploader_ids=blocked_ids
             )
         total_pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, total_pages)
@@ -19913,8 +20065,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
-        target_username = fields.get('username', '').strip()
-        referer = fields.get('referer', '').strip()
+        if not self._check_csrf(fields):
+            return self._redirect('/manage?msg=csrf')
+        target_username = fields.get('username', '').strip()[:64]
+        referer = self._safe_manage_redirect(fields.get('referer', ''), fallback='/manage/following')
         target = REGISTRATION_DB.get_user(target_username) if target_username else None
         if not target:
             return self._redirect('/manage/following?msg=User+not+found.&msg_type=error')
@@ -19931,8 +20085,10 @@ class ManageHandler(BaseHTTPRequestHandler):
             return self._redirect('/manage')
         body = self._read_body()
         fields, _ = _parse_multipart(self.headers, body)
-        target_username = fields.get('username', '').strip()
-        referer = fields.get('referer', '').strip()
+        if not self._check_csrf(fields):
+            return self._redirect('/manage?msg=csrf')
+        target_username = fields.get('username', '').strip()[:64]
+        referer = self._safe_manage_redirect(fields.get('referer', ''), fallback='/manage/following')
         target = REGISTRATION_DB.get_user(target_username) if target_username else None
         if not target:
             return self._redirect('/manage/following?msg=User+not+found.&msg_type=error')
@@ -23720,7 +23876,7 @@ def _render_admin_report_detail(user, report: dict, actions: list, moderators: l
         wild_toggle = (
             '<form method="POST" action="/manage/admin/wild-intake/action" style="display:inline">'
             f'<input type="hidden" name="info_hash" value="{info_hash}">'
-            f'<input type="hidden" name="action" value="{wild_action}">'
+            f'<input type="hidden" name="action" value="{_h(wild_action)}">'
             f'<input type="hidden" name="reason" value="from_torrent_report">'
             f'<input type="hidden" name="from_report_id" value="{report_id}">'
             f'<input type="hidden" name="_csrf" value="{_h(csrf)}">'
